@@ -3,6 +3,11 @@
 //! (symlinks/junctions are neither indexed nor descended, so the walk stays
 //! acyclic on every platform).
 //!
+//! On Windows every root is traversed through its `\\?\`-verbatim form so
+//! the walk is immune to the 260-char MAX_PATH limit on hosts without
+//! LongPathsEnabled; user-visible paths (exclusion matching, dirs-table
+//! segments) keep their ordinary spelling.
+//!
 //! Threading shape: jwalk's worker threads only read directories, prune
 //! excluded/reparse-point children and prefetch metadata into each entry's
 //! `client_state`; they never touch [`Store`] (which is `&mut`, not `Sync`).
@@ -48,6 +53,10 @@ pub struct ScanStats {
 /// [`ScanStats::errors`] and never abort the scan; store errors are
 /// returned. `progress` receives the files-done count after every
 /// [`PROGRESS_BATCH`] records and once at the end.
+///
+/// On Windows, traversal uses the `\\?\`-verbatim form of each root (see
+/// [`traversal_root`]) while exclusion matching and the `dirs` table keep
+/// the ordinary, non-verbatim spelling.
 pub fn scan(store: &mut Store, opts: &ScanOptions, progress: &dyn Fn(u64)) -> Result<ScanStats> {
     let matcher = build_matcher(&opts.exclusions)?;
     let roots = effective_roots(&opts.roots);
@@ -58,6 +67,9 @@ pub fn scan(store: &mut Store, opts: &ScanOptions, progress: &dyn Fn(u64)) -> Re
 
     for root in &roots {
         let root_path = PathBuf::from(root);
+        // Traversal form (verbatim on Windows, identical elsewhere);
+        // user-visible spelling below stays non-verbatim.
+        let walk_root = traversal_root(&root_path);
         let root_segment = root_segment(&root_path);
 
         // The root entry itself is never indexed. A reparse-point root
@@ -67,17 +79,17 @@ pub fn scan(store: &mut Store, opts: &ScanOptions, progress: &dyn Fn(u64)) -> Re
         if excluded(&matcher, &root_path, &root_path) {
             continue;
         }
-        if is_reparse_point(&root_path) {
+        if is_reparse_point(&walk_root) {
             stats.errors += 1;
             continue;
         }
 
-        let walker = WalkDirGeneric::<((), Option<Metadata>)>::new(root_path.clone())
+        let walker = WalkDirGeneric::<((), Option<Metadata>)>::new(walk_root.clone())
             .follow_links(false)
             .min_depth(1)
             .process_read_dir({
                 let matcher = matcher.clone();
-                let walker_root = root_path.clone();
+                let walker_root = walk_root.clone();
                 move |_depth, _path, _read_dir_state, children| {
                     // Prune excluded subtrees and reparse points. Removing a
                     // directory here also stops jwalk from descending into
@@ -115,7 +127,7 @@ pub fn scan(store: &mut Store, opts: &ScanOptions, progress: &dyn Fn(u64)) -> Re
             }
 
             let path = entry.path();
-            let rel = match path.strip_prefix(&root_path) {
+            let rel = match path.strip_prefix(&walk_root) {
                 Ok(rel) => rel,
                 Err(_) => {
                     stats.errors += 1;
@@ -224,15 +236,19 @@ fn build_matcher(patterns: &[String]) -> Result<GlobSet> {
 /// forward-slash absolute path, the forward-slash path relative to the scan
 /// root, and each individual relative path segment (so a bare
 /// `node_modules` pattern prunes directories of that name at any depth).
+/// Both paths are reduced to their ordinary (non-verbatim) spelling first,
+/// since patterns are written against paths like `C:/...`, never `\\?\...`.
 fn excluded(matcher: &GlobSet, abs: &Path, root: &Path) -> bool {
     if matcher.is_empty() {
         return false;
     }
+    let abs = strip_verbatim_prefix(abs);
+    let root = strip_verbatim_prefix(root);
     let abs_str = abs.to_string_lossy().replace('\\', "/");
     if matcher.is_match(&abs_str) {
         return true;
     }
-    let Ok(rel) = abs.strip_prefix(root) else {
+    let Ok(rel) = abs.strip_prefix(&root) else {
         return false;
     };
     let rel_str = rel.to_string_lossy().replace('\\', "/");
@@ -246,18 +262,69 @@ fn excluded(matcher: &GlobSet, abs: &Path, root: &Path) -> bool {
 /// The single `dirs`-table segment representing the scan root itself:
 /// entries directly under the root live in this directory row. Uses the
 /// final path component when there is one (`C:\data` -> `data`), otherwise
-/// the trimmed root string (`C:\` -> `C:`, `/` -> `/`).
+/// the trimmed root string (`C:\` -> `C:`, `/` -> `/`); verbatim prefixes
+/// are stripped first so segments stay clean (`C:`, not `\\?\C:`).
+///
+/// Callers should pass non-overlapping roots: two roots sharing a final
+/// path component (e.g. `C:\a` and `D:\a`) merge into the same `dirs`
+/// branch.
 fn root_segment(root: &Path) -> String {
-    if let Some(name) = root.file_name() {
+    let clean = strip_verbatim_prefix(root);
+    if let Some(name) = clean.file_name() {
         return name.to_string_lossy().into_owned();
     }
-    let full = root.to_string_lossy();
+    let full = clean.to_string_lossy();
     let trimmed = full.trim_end_matches(['/', '\\']);
     if trimmed.is_empty() {
         full.into_owned()
     } else {
         trimmed.to_owned()
     }
+}
+
+/// Traversal form of a scan root: on Windows the `\\?\`-verbatim path
+/// (`\\?\C:\...`, UNC `\\server\share\...` -> `\\?\UNC\server\share\...`)
+/// so directory reads and stats are not bound by the 260-char MAX_PATH
+/// limit on hosts without LongPathsEnabled. Already-verbatim and relative
+/// roots are returned unchanged (verbatim paths must be absolute).
+#[cfg(windows)]
+fn traversal_root(root: &Path) -> PathBuf {
+    let original = root.to_string_lossy();
+    if original.starts_with(r"\\?\") || !root.is_absolute() {
+        return root.to_path_buf();
+    }
+    // The verbatim prefix turns off Win32 path malleability, so spell the
+    // path with backslashes explicitly.
+    let normalized = original.replace('/', r"\");
+    if let Some(rest) = normalized.strip_prefix(r"\\") {
+        PathBuf::from(format!(r"\\?\UNC\{rest}"))
+    } else {
+        PathBuf::from(format!(r"\\?\{normalized}"))
+    }
+}
+
+#[cfg(not(windows))]
+fn traversal_root(root: &Path) -> PathBuf {
+    root.to_path_buf()
+}
+
+/// Removes a `\\?\` / `\\?\UNC\` verbatim prefix, yielding the ordinary
+/// path spelling used for glob matching and `dirs`-table segments.
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest.to_owned())
+    } else {
+        path.to_path_buf()
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 /// Unix-epoch seconds for a stat timestamp; 0 when unavailable (pre-epoch
@@ -383,7 +450,7 @@ mod tests {
     /// exceed 260 chars and use reserved device names (`CON`, `NUL`) via
     /// plain `std::fs`; unix needs no translation.
     #[cfg(windows)]
-    fn verbatim(path: &Path) -> PathBuf {
+    fn longpath_form(path: &Path) -> PathBuf {
         let s = path.to_string_lossy();
         if s.starts_with("\\\\?\\") {
             path.to_path_buf()
@@ -392,14 +459,19 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
-    fn scan_root_for(plain: &Path) -> PathBuf {
-        verbatim(plain)
+    #[cfg(not(windows))]
+    fn longpath_form(path: &Path) -> PathBuf {
+        path.to_path_buf()
     }
 
-    #[cfg(not(windows))]
-    fn scan_root_for(plain: &Path) -> PathBuf {
-        plain.to_path_buf()
+    /// A six-level chain whose total path length exceeds 260 characters
+    /// (each level ~64 chars).
+    fn deep_chain(root: &Path) -> PathBuf {
+        let mut deep = root.to_path_buf();
+        for i in 0..6 {
+            deep = deep.join(format!("lvl{i}_{}", "d".repeat(58)));
+        }
+        deep
     }
 
     #[test]
@@ -510,9 +582,10 @@ mod tests {
     #[test]
     fn scan_handles_unicode_longpaths_reserved() {
         let (tmp, db, mut store) = test_store();
-        // Windows: scan through the \\?\ verbatim form so the >260-char deep
-        // chain and the reserved names CON/NUL are addressable.
-        let root = scan_root_for(&tmp.path().join("u"));
+        // This fixture scans through an explicitly verbatim root (kept to
+        // cover user-supplied `\\?\` roots); the plain-root long-path case
+        // has its own test below.
+        let root = longpath_form(&tmp.path().join("u"));
 
         fs::create_dir_all(root.join("文档")).unwrap();
         fs::write(root.join("文档").join("报告.docx"), b"d").unwrap();
@@ -522,10 +595,7 @@ mod tests {
         fs::write(root.join("NUL"), b"n").unwrap();
 
         // Deep chain whose total path exceeds 260 characters.
-        let mut deep = root.clone();
-        for i in 0..6 {
-            deep = deep.join(format!("lvl{i}_{}", "d".repeat(58)));
-        }
+        let deep = deep_chain(&root);
         fs::create_dir_all(&deep).unwrap();
         let deep_file = deep.join("deep.txt");
         fs::write(&deep_file, b"deep").unwrap();
@@ -549,6 +619,40 @@ mod tests {
         for expected in ["报告.docx", "emoji🎊.txt", "CON", "NUL", "deep.txt"] {
             assert!(names.contains(&expected), "{expected} must be recorded");
         }
+    }
+
+    /// Regression: a plain (non-verbatim) root — the form `fixed_volumes()`
+    /// supplies — must still index paths deeper than 260 chars. The scan
+    /// normalizes the root to its verbatim form for traversal, so this
+    /// holds even on hosts without LongPathsEnabled (fixture creation goes
+    /// through the verbatim form for the same reason).
+    #[test]
+    fn scan_long_path_under_plain_root() {
+        let (tmp, db, mut store) = test_store();
+        let plain_root = tmp.path().join("plain");
+
+        let deep = deep_chain(&longpath_form(&plain_root));
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("deep.txt"), b"deep").unwrap();
+
+        let plain_deep_file = deep_chain(&plain_root).join("deep.txt");
+        assert!(
+            plain_deep_file.as_os_str().len() > 260,
+            "fixture must exceed MAX_PATH, got {}",
+            plain_deep_file.as_os_str().len()
+        );
+
+        let stats = scan(&mut store, &opts_for(&plain_root), &|_| {}).unwrap();
+
+        assert_eq!(stats.errors, 0, "the deep path must not be an error");
+        assert_eq!(stats.files, 1, "only deep.txt exists");
+        assert_eq!(stats.dirs, 6, "the six chain levels");
+
+        let rows = all_rows(&db);
+        assert!(
+            rows.iter().any(|r| r.0 == "deep.txt"),
+            "the >260-char path under a plain root must be recorded"
+        );
     }
 
     #[cfg(windows)]
