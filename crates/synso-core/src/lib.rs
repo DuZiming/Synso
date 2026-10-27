@@ -4,10 +4,14 @@
 //! so the scanner/engine layers built on it remain embeddable and testable.
 
 pub mod model;
+pub mod scanner;
 pub mod store;
+pub mod volumes;
 
 pub use model::{FileId, FileRecord};
+pub use scanner::{is_placeholder_attr, scan, ScanOptions, ScanStats};
 pub use store::Store;
+pub use volumes::{fixed_volumes, VolumeInfo};
 
 /// Error type for all synso-core operations.
 #[derive(Debug, thiserror::Error)]

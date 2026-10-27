@@ -10,4 +10,12 @@ rust-version = "1.83"
 [workspace.dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
-tempfile = "3"
+# Pinned (`=`) where a newer release raised its MSRV above the workspace's
+# 1.83: globset 0.4.20 declares 1.88, junction 2.1.0 declares 1.85, and
+# tempfile 3.24+ pulls getrandom 0.4 (edition 2024, needs cargo 1.85).
+jwalk = "0.8.1"
+globset = "=0.4.15"
+sysinfo = { version = "0.36", default-features = false, features = ["disk"] }
+windows = { version = "0.62", features = ["Win32_Storage_FileSystem"] }
+junction = "=2.0.0"
+tempfile = "=3.23.0"
