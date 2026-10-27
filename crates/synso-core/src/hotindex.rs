@@ -1,8 +1,9 @@
 //! Hot index: the in-memory mirror of the store that search runs against
 //! (Task 4). The engine bulk-loads it from SQLite at startup and swaps in a
-//! fresh copy after every completed scan — wholesale rebuild is the v1
-//! correctness story; live incremental updates arrive with the filesystem
-//! watcher (Task 8).
+//! fresh copy after every completed scan — wholesale rebuild is the rescan
+//! correctness story; between scans, the filesystem watcher (Task 8) applies
+//! incremental [`HotIndex::upsert_slot`] / [`HotIndex::remove_by_dir_name`]
+//! edits, so a live index never needs a per-batch reload.
 //!
 //! Shape: an interned directory tree keyed by the database's `dirs` row
 //! ids (hot-index dir ids and store dir ids are the same numbers), plus
@@ -15,7 +16,7 @@
 //! dir names) so the memory budget test (Task 20) has a concrete number
 //! to assert against.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::MAIN_SEPARATOR;
 
 use crate::model::{FileId, FileRecord};
@@ -35,6 +36,20 @@ struct DirEntry {
 pub struct HotIndex {
     /// Interned directory tree, keyed by the store's `dirs` row ids.
     dirs: HashMap<FileId, DirEntry>,
+    /// Secondary index over `dirs`: (parent id, name) -> dir id, EXACT-case
+    /// like the store's `UNIQUE(parent, name)`. Lets incremental removals
+    /// resolve a `dirs`-table segment chain (root segment, ..., containing
+    /// dir) without scanning the tree. Exact — not lowercased — because on
+    /// case-sensitive filesystems `A.txt` and `a.txt` are distinct real
+    /// files, and OS events report names in their stored casing everywhere.
+    dir_by_parent_name: HashMap<(Option<FileId>, String), FileId>,
+    /// Secondary index: `files` row id -> slot, for incremental upserts of
+    /// rows that already hold a slot (same id = update in place).
+    slot_by_id: HashMap<FileId, usize>,
+    /// Secondary index: (containing dir id, name) -> slot, EXACT-case (see
+    /// `dir_by_parent_name`), for incremental removals that know a path but
+    /// not a rowid.
+    slot_by_parent_name: HashMap<(FileId, String), usize>,
     /// Name arena, lowercased for case-insensitive matching.
     names_lower: Vec<String>,
     /// Name arena preserving the original spelling (display, rebuilds).
@@ -88,6 +103,7 @@ impl HotIndex {
         };
         for (id, parent, name) in store.all_dirs()? {
             index.interned_bytes += name.len() as u64;
+            index.dir_by_parent_name.insert((parent, name.clone()), id);
             index.dirs.insert(id, DirEntry { parent, name });
         }
         for (id, ext) in store.all_extensions()? {
@@ -99,8 +115,8 @@ impl HotIndex {
         Ok(index)
     }
 
-    /// Appends one `files` row's columns to the arenas (load-time only
-    /// today; incremental pushes arrive with the watcher in Task 8).
+    /// Appends one `files` row's columns to the arenas and secondary
+    /// indexes (whole-table load and incremental watcher pushes).
     fn push(&mut self, rec: FileRecord) {
         let lower = rec.name.to_lowercase();
         self.interned_bytes +=
@@ -110,6 +126,10 @@ impl HotIndex {
         } else {
             self.file_count += 1;
         }
+        let slot = self.names_lower.len();
+        self.slot_by_id.insert(rec.id, slot);
+        self.slot_by_parent_name
+            .insert((rec.parent, rec.name.clone()), slot);
         self.names_lower.push(lower);
         self.names_orig.push(rec.name);
         self.py_fulls.push(rec.py_full);
@@ -120,6 +140,239 @@ impl HotIndex {
         self.mtimes.push(rec.mtime);
         self.ext_ids.push(rec.ext_id);
         self.is_dirs.push(rec.is_dir);
+    }
+
+    /// Incremental upsert (watcher path, Task 8). `rec` must come straight
+    /// from [`Store::upsert_file`], so `id`, `parent`, `ext_id` and both
+    /// pinyin keys hold the stored values. Interns the row's ancestor
+    /// `dirs` chain (path reconstruction) and extension text from `store`
+    /// on demand, then updates the existing slot when the row id already
+    /// holds one, or appends a new slot otherwise. Store errors abort this
+    /// row's hot update (logged by the caller); the store itself stays
+    /// authoritative and the next wholesale reload resyncs.
+    pub fn upsert_slot(&mut self, store: &Store, rec: &FileRecord) -> Result<()> {
+        // Ancestor chain first, so the new/updated slot's paths resolve.
+        for (id, parent, name) in store.dir_ancestors(rec.parent)? {
+            if !self.dirs.contains_key(&id) {
+                self.interned_bytes += name.len() as u64;
+                self.dir_by_parent_name.insert((parent, name.clone()), id);
+                self.dirs.insert(id, DirEntry { parent, name });
+            }
+        }
+        if rec.ext_id != 0 && !self.exts.contains_key(&rec.ext_id) {
+            if let Some(text) = store.ext_text_of(rec.ext_id)? {
+                self.exts.insert(rec.ext_id, text);
+            }
+        }
+        if let Some(&slot) = self.slot_by_id.get(&rec.id) {
+            self.update_slot(slot, rec);
+        } else {
+            self.push(rec.clone());
+        }
+        Ok(())
+    }
+
+    /// Updates an existing slot in place (same `files` row id), keeping
+    /// counters, byte budget and secondary indexes coherent.
+    fn update_slot(&mut self, slot: usize, rec: &FileRecord) {
+        let lower = rec.name.to_lowercase();
+        let old_bytes = (self.names_lower[slot].len()
+            + self.names_orig[slot].len()
+            + self.py_fulls[slot].len()
+            + self.py_inits[slot].len()) as u64;
+        let new_bytes =
+            (lower.len() + rec.name.len() + rec.py_full.len() + rec.py_init.len()) as u64;
+        self.interned_bytes = self.interned_bytes.saturating_sub(old_bytes) + new_bytes;
+        if self.is_dirs[slot] != rec.is_dir {
+            self.is_dirs[slot] = rec.is_dir;
+            if rec.is_dir {
+                self.dir_count += 1;
+                self.file_count = self.file_count.saturating_sub(1);
+            } else {
+                self.file_count += 1;
+                self.dir_count = self.dir_count.saturating_sub(1);
+            }
+        }
+        let old_key = (self.parents[slot], self.names_orig[slot].clone());
+        self.names_lower[slot] = lower;
+        self.names_orig[slot] = rec.name.clone();
+        self.py_fulls[slot] = rec.py_full.clone();
+        self.py_inits[slot] = rec.py_init.clone();
+        self.sizes[slot] = rec.size;
+        self.mtimes[slot] = rec.mtime;
+        self.ext_ids[slot] = rec.ext_id;
+        self.parents[slot] = rec.parent;
+        let new_key = (rec.parent, rec.name.clone());
+        if old_key != new_key {
+            self.slot_by_parent_name.remove(&old_key);
+        }
+        self.slot_by_parent_name.insert(new_key, slot);
+    }
+
+    /// Incremental removal (watcher path, Task 8): deletes the slot whose
+    /// containing dir chain equals `segments` (the same spelling upsert
+    /// uses: root segment first) and whose name matches exactly (event
+    /// spellings carry stored casing; a drifted casing simply matches
+    /// nothing and self-heals at the next rescan). When `segments + [name]`
+    /// resolves to an interned `dirs` row (the removed entry was a
+    /// directory), that subtree's `dirs` rows AND slots are dropped too, so
+    /// `dir_tree_len` and `interned_bytes` stay honest. Returns the removed
+    /// row id, or `None` when nothing matched (a normal outcome: the row
+    /// may never have been indexed).
+    pub fn remove_by_dir_name(&mut self, segments: &[&str], name: &str) -> Option<FileId> {
+        let parent_id = self.resolve_dir(segments)?;
+        let removed = self.remove_slot(parent_id, name);
+        let mut with_name: Vec<&str> = segments.to_vec();
+        with_name.push(name);
+        if let Some(subtree_root) = self.resolve_dir(&with_name) {
+            self.purge_dir_rows(subtree_root);
+        }
+        removed
+    }
+
+    /// Resolves a `dirs`-table segment chain (root segment first) to its
+    /// dir id, exactly; `None` as soon as a link is missing.
+    fn resolve_dir(&self, segments: &[&str]) -> Option<FileId> {
+        let mut parent: Option<FileId> = None;
+        let mut current: Option<FileId> = None;
+        for segment in segments {
+            let id = *self
+                .dir_by_parent_name
+                .get(&(parent, segment.to_string()))?;
+            parent = Some(id);
+            current = Some(id);
+        }
+        current
+    }
+
+    /// Removes `root_id` and every `dirs` row whose ancestor chain crosses
+    /// it from the interned tree, and sweeps every SLOT under the doomed
+    /// subtree along with them. The sweep is load-bearing for convergence:
+    /// a batch removes paths in sorted order, so a deleted directory's
+    /// children are visited AFTER the dir rows are gone and their own
+    /// `remove_by_dir_name` chain no longer resolves — without the sweep
+    /// their slots would linger as phantoms. Per-entry budgets make a
+    /// corrupt parent cycle terminate. Called only from
+    /// [`HotIndex::remove_by_dir_name`].
+    fn purge_dir_rows(&mut self, root_id: FileId) {
+        let doomed: Vec<FileId> = self
+            .dirs
+            .iter()
+            .filter(|(id, entry)| {
+                if **id == root_id {
+                    return true;
+                }
+                // A chain longer than the node count implies a cycle.
+                let mut budget = self.dirs.len() + 1;
+                let mut parent = entry.parent;
+                loop {
+                    match parent {
+                        None => return false,
+                        Some(p) if p == root_id => return true,
+                        Some(p) => {
+                            budget -= 1;
+                            if budget == 0 {
+                                return false;
+                            }
+                            parent = self.dirs.get(&p).and_then(|e| e.parent);
+                        }
+                    }
+                }
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if doomed.is_empty() {
+            return;
+        }
+        // Victim slots: those whose DIRECT parent is a doomed dir row (a
+        // slot's parent is always one level up, so membership in the doomed
+        // set is the exact subtree test). Removed in descending slot order:
+        // swap-remove relocates only the last slot, so lower-index victims
+        // keep their indices while higher ones are processed first.
+        let doomed_set: HashSet<FileId> = doomed.iter().copied().collect();
+        let mut victims: Vec<usize> = (0..self.parents.len())
+            .filter(|&slot| doomed_set.contains(&self.parents[slot]))
+            .collect();
+        victims.sort_unstable_by(|a, b| b.cmp(a));
+        for slot in victims {
+            self.remove_slot_at(slot);
+        }
+        for id in doomed {
+            if let Some(entry) = self.dirs.remove(&id) {
+                self.interned_bytes = self.interned_bytes.saturating_sub(entry.name.len() as u64);
+                self.dir_by_parent_name
+                    .remove(&(entry.parent, entry.name.clone()));
+            }
+        }
+    }
+
+    /// Swap-removes the slot keyed by `(parent_id, name)` (exact name); see
+    /// [`HotIndex::remove_slot_at`] for the mechanics.
+    fn remove_slot(&mut self, parent_id: FileId, name: &str) -> Option<FileId> {
+        let &slot = self
+            .slot_by_parent_name
+            .get(&(parent_id, name.to_string()))?;
+        Some(self.remove_slot_at(slot))
+    }
+
+    /// Swap-removes the slot at `slot`, keeping every arena, counter, byte
+    /// budget and secondary index consistent — the last slot moves into the
+    /// hole and its index entries are repointed. Returns the removed row id.
+    fn remove_slot_at(&mut self, slot: usize) -> FileId {
+        let removed_id = self.ids[slot];
+        let last = self.names_lower.len() - 1;
+        let key = (self.parents[slot], self.names_orig[slot].clone());
+
+        if self.is_dirs[slot] {
+            self.dir_count = self.dir_count.saturating_sub(1);
+        } else {
+            self.file_count = self.file_count.saturating_sub(1);
+        }
+        self.interned_bytes = self.interned_bytes.saturating_sub(
+            (self.names_lower[slot].len()
+                + self.names_orig[slot].len()
+                + self.py_fulls[slot].len()
+                + self.py_inits[slot].len()) as u64,
+        );
+
+        // Bookkeeping for the slot that moves into the hole (if any).
+        let moved = if slot != last {
+            Some((
+                self.ids[last],
+                (self.parents[last], self.names_orig[last].clone()),
+            ))
+        } else {
+            None
+        };
+
+        self.names_lower.swap(slot, last);
+        self.names_lower.pop();
+        self.names_orig.swap(slot, last);
+        self.names_orig.pop();
+        self.py_fulls.swap(slot, last);
+        self.py_fulls.pop();
+        self.py_inits.swap(slot, last);
+        self.py_inits.pop();
+        self.ids.swap(slot, last);
+        self.ids.pop();
+        self.parents.swap(slot, last);
+        self.parents.pop();
+        self.sizes.swap(slot, last);
+        self.sizes.pop();
+        self.mtimes.swap(slot, last);
+        self.mtimes.pop();
+        self.ext_ids.swap(slot, last);
+        self.ext_ids.pop();
+        self.is_dirs.swap(slot, last);
+        self.is_dirs.pop();
+
+        self.slot_by_id.remove(&removed_id);
+        self.slot_by_parent_name.remove(&key);
+        if let Some((moved_id, moved_key)) = moved {
+            self.slot_by_id.insert(moved_id, slot);
+            self.slot_by_parent_name.insert(moved_key, slot);
+        }
+        removed_id
     }
 
     /// Non-directory entries.
@@ -445,5 +698,156 @@ mod tests {
         assert_eq!(hot.ext_of(alpha.ext_id), "txt");
         assert_eq!(hot.ext_of(memo.ext_id), "md");
         assert_eq!(hot.ext_of(0), "");
+    }
+
+    /// Full incremental round-trip: upsert a brand-new row (new dir chain
+    /// and ext interned along the way), re-upsert it (same id, update in
+    /// place), then remove it — arenas, counters, indexes and paths stay
+    /// consistent throughout.
+    #[test]
+    fn incremental_upsert_and_remove_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
+
+        let mut seed = rec("seed.txt", false);
+        store.upsert_file(&["docs"], &mut seed).unwrap();
+        let mut hot = HotIndex::load(&store).unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(hot.file_count(), 1);
+        let bytes_before = hot.interned_bytes();
+
+        // New file in a brand-new subdirectory chain docs/inner.
+        let mut fresh = rec("Fresh.TXT", false);
+        store.upsert_file(&["docs", "inner"], &mut fresh).unwrap();
+        hot.upsert_slot(&store, &fresh).unwrap();
+
+        assert_eq!(hot.file_count(), 2);
+        assert_eq!(hot.slot_count(), 2);
+        assert_eq!(hot.dir_tree_len(), 2, "docs and docs/inner interned");
+        assert!(hot.interned_bytes() > bytes_before);
+        let fresh_slot = hot
+            .slot_by_id
+            .get(&fresh.id)
+            .copied()
+            .expect("test may index");
+        assert_eq!(
+            hot.path_of(fresh_slot),
+            format!("docs{sep}inner{sep}Fresh.TXT")
+        );
+        assert_eq!(hot.name_lower(fresh_slot), "fresh.txt");
+        assert_eq!(hot.ext_of(fresh.ext_id), "txt", "ext interned on demand");
+
+        // Re-upsert same (dir, name): same row id, same slot, new size —
+        // no duplicate slot, no counter drift.
+        let mut updated = rec("Fresh.TXT", false);
+        updated.size = 99;
+        store.upsert_file(&["docs", "inner"], &mut updated).unwrap();
+        assert_eq!(updated.id, fresh.id);
+        hot.upsert_slot(&store, &updated).unwrap();
+        assert_eq!(hot.file_count(), 2);
+        assert_eq!(hot.slot_count(), 2);
+        assert_eq!(hot.size(hot.slot_by_id[&fresh.id]), 99);
+
+        // Remove the file by its path spelling (case-insensitive): slot
+        // gone, seed untouched, dir rows stay (still referenced).
+        // Remove the file by its exact stored spelling; a drifted casing
+        // would benignly match nothing (see remove_by_dir_name docs).
+        assert_eq!(
+            hot.remove_by_dir_name(&["docs", "inner"], "Fresh.TXT"),
+            Some(fresh.id)
+        );
+        assert_eq!(hot.file_count(), 1);
+        assert_eq!(hot.slot_count(), 1);
+        assert_eq!(hot.name_lower(0), "seed.txt");
+        assert_eq!(hot.dir_tree_len(), 2);
+        // Removing something never indexed is a benign None.
+        assert_eq!(hot.remove_by_dir_name(&["docs", "inner"], "nope.txt"), None);
+        assert_eq!(hot.file_count(), 1);
+
+        // Remove a whole directory: its dir rows are purged from the tree.
+        let mut sub = rec("inner", true);
+        store.upsert_file(&["docs"], &mut sub).unwrap();
+        hot.upsert_slot(&store, &sub).unwrap();
+        assert_eq!(hot.dir_count(), 1);
+        assert_eq!(
+            hot.remove_by_dir_name(&["docs"], "inner"),
+            Some(sub.id),
+            "the dir-entry slot goes by its parent chain"
+        );
+        assert_eq!(hot.dir_count(), 0);
+        assert_eq!(hot.dir_tree_len(), 1, "only docs remains interned");
+    }
+
+    /// Removing a directory entry sweeps the slots of everything under it:
+    /// a deleted directory's children are processed after the dir rows are
+    /// gone, so the purge (not the children's own removals) must claim
+    /// their slots. This is the storm-convergence invariant.
+    #[test]
+    fn purging_a_dir_sweeps_child_slots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
+
+        // docs/{a.txt, sub(dir entry)/{b.txt, deep/{c.txt}}}
+        let mut a = rec("a.txt", false);
+        store.upsert_file(&["docs"], &mut a).unwrap();
+        let mut sub = rec("sub", true);
+        store.upsert_file(&["docs"], &mut sub).unwrap();
+        let mut b = rec("b.txt", false);
+        store.upsert_file(&["docs", "sub"], &mut b).unwrap();
+        let mut c = rec("c.txt", false);
+        store.upsert_file(&["docs", "sub", "deep"], &mut c).unwrap();
+
+        let mut hot = HotIndex::load(&store).unwrap();
+        assert_eq!(hot.file_count(), 3);
+        assert_eq!(hot.dir_count(), 1);
+        assert_eq!(hot.dir_tree_len(), 3);
+
+        assert_eq!(hot.remove_by_dir_name(&["docs"], "sub"), Some(sub.id));
+        assert_eq!(
+            hot.file_count(),
+            1,
+            "b.txt and the nested c.txt go with the subtree"
+        );
+        assert_eq!(hot.dir_count(), 0);
+        assert_eq!(hot.slot_count(), 1);
+        assert_eq!(hot.name_lower(0), "a.txt", "the sibling outside survives");
+        assert_eq!(hot.dir_tree_len(), 1, "only docs remains interned");
+        // The swept slots left no dangling index entries behind.
+        assert!(!hot.slot_by_id.contains_key(&b.id));
+        assert!(!hot.slot_by_id.contains_key(&c.id));
+    }
+
+    /// Swap-remove keeps the secondary indexes pointing at the right slots
+    /// when a middle slot is removed and the tail moves into its place.
+    #[test]
+    fn swap_remove_keeps_indexes_consistent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
+
+        let mut ids = Vec::new();
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            let mut r = rec(name, false);
+            store.upsert_file(&["docs"], &mut r).unwrap();
+            ids.push(r.id);
+        }
+        let mut hot = HotIndex::load(&store).unwrap();
+        let bytes_before = hot.interned_bytes();
+
+        // Remove the SECOND slot (a middle one): the tail (d.txt) moves.
+        assert_eq!(hot.remove_by_dir_name(&["docs"], "b.txt"), Some(ids[1]));
+        assert_eq!(hot.file_count(), 3);
+        assert_eq!(hot.slot_count(), 3);
+        assert!(hot.interned_bytes() < bytes_before);
+
+        // Every remaining id resolves to a slot whose name matches, and
+        // every remaining name resolves to a slot whose id matches.
+        for (name, id) in [("a.txt", ids[0]), ("c.txt", ids[2]), ("d.txt", ids[3])] {
+            let slot = hot.slot_by_id[&id];
+            assert_eq!(hot.name_original(slot), name);
+            assert_eq!(hot.file_id(slot), id);
+            let key_slot = hot.slot_by_parent_name[&(hot.parent_dir(slot), name.to_string())];
+            assert_eq!(key_slot, slot);
+        }
+        assert!(!hot.slot_by_id.contains_key(&ids[1]));
     }
 }

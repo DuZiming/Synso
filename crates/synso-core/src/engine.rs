@@ -30,6 +30,13 @@
 //! `Vec`). Locks are therefore taken poison-tolerantly (see
 //! [`lock_unpoisoned`]), which also keeps this crate free of
 //! `unwrap`/`expect` in library code.
+//!
+//! Live updates (Task 8): [`Engine::start_watcher`] starts the filesystem
+//! watcher (see [`crate::watcher`]) on the effective scan roots. Its
+//! debounced batches apply under the same store mutex with the same
+//! store -> hot ordering as a scan, so watcher edits and scan reloads
+//! serialize; events that arrive while a scan holds the mutex queue in the
+//! watcher's channel and apply right after — nothing is dropped.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,6 +52,7 @@ use crate::model::{FileId, ParsedQuery};
 use crate::query::{self, SearchResult};
 use crate::scanner::{self, effective_roots, root_segment, ScanOptions};
 use crate::store::Store;
+use crate::watcher::Watcher;
 use crate::Result;
 
 /// What the engine scans and what it skips. Empty `volumes` means "all
@@ -86,6 +94,11 @@ pub enum EngineEvent {
     /// store error without returning partial counts — and `message`
     /// carries the cause.
     ScanFailed { errors: u64, message: String },
+    /// The filesystem watcher applied a debounced batch of store + hot-index
+    /// updates (Task 8). Pure UI refresh hint: the index is already
+    /// consistent when this fires, so subscribers can just re-query. Carries
+    /// no payload — polls of `stats()`/`search()` are the source of truth.
+    FsChanged,
     /// Reserved for Task 9.
     DedupProgress {
         phase: DedupPhase,
@@ -113,6 +126,12 @@ pub struct Engine {
     subscribers: Arc<Mutex<Vec<Sender<EngineEvent>>>>,
     scan_opts: ScanOptions,
     scanning: Arc<AtomicBool>,
+    /// Database location, kept so the watcher (Task 8) can filter out the
+    /// store's own writes.
+    db_path: std::path::PathBuf,
+    /// Started lazily by [`Engine::start_watcher`]; dropping the engine
+    /// drops the handle, which stops and joins the debounce thread.
+    watcher: Mutex<Option<Watcher>>,
 }
 
 impl Engine {
@@ -131,6 +150,8 @@ impl Engine {
                 exclusions: opts.exclusions,
             },
             scanning: Arc::new(AtomicBool::new(false)),
+            db_path: db_path.to_path_buf(),
+            watcher: Mutex::new(None),
         };
         if let Err(err) = thread::Builder::new()
             .name("synso-hot-load".into())
@@ -178,6 +199,32 @@ impl Engine {
             eprintln!("synso: failed to spawn the scan thread: {err}");
             self.scanning.store(false, Ordering::Release);
         }
+    }
+
+    /// Starts the filesystem watcher (see [`crate::watcher`]): recursive
+    /// `notify` watches on the effective scan roots, events merged into
+    /// 500ms quiet-window batches, each batch applied incrementally to the
+    /// store and the hot index, then [`EngineEvent::FsChanged`]
+    /// broadcast. A watcher already running makes this a no-op. The
+    /// watcher is NOT started by [`Engine::open`] on purpose: scans,
+    /// searches and events stay fully deterministic for embedders that
+    /// never need live updates.
+    pub fn start_watcher(&self) -> Result<()> {
+        let mut slot = lock_unpoisoned(&self.watcher);
+        if slot.is_some() {
+            return Ok(());
+        }
+        let roots = effective_roots(&self.scan_opts.roots);
+        let watcher = Watcher::start(
+            &roots,
+            &self.scan_opts.exclusions,
+            &self.db_path,
+            Arc::clone(&self.store),
+            Arc::clone(&self.hot),
+            Arc::clone(&self.subscribers),
+        )?;
+        *slot = Some(watcher);
+        Ok(())
     }
 
     /// Snapshot of hot-index state.
@@ -293,7 +340,9 @@ impl Engine {
 }
 
 /// Sends `event` to every live subscriber, dropping disconnected ones.
-fn broadcast(subscribers: &Arc<Mutex<Vec<Sender<EngineEvent>>>>, event: EngineEvent) {
+/// `pub(crate)`: the watcher (Task 8) broadcasts [`EngineEvent::FsChanged`]
+/// through the same list.
+pub(crate) fn broadcast(subscribers: &Arc<Mutex<Vec<Sender<EngineEvent>>>>, event: EngineEvent) {
     lock_unpoisoned(subscribers).retain(|sender| sender.send(event.clone()).is_ok());
 }
 

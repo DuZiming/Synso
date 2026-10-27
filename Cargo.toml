@@ -16,6 +16,10 @@ crossbeam-channel = "0.5"
 # tempfile 3.24+ pulls getrandom 0.4 (edition 2024, needs cargo 1.85).
 jwalk = "0.8.1"
 globset = "=0.4.15"
+# Pinned: notify 8.2.1 raised its MSRV to 1.85 (> our 1.83); 8.2.0 declares
+# 1.77. Its transitive notify-types is locked to 2.0.0 for the same reason
+# (2.1.0 declares 1.85).
+notify = "=8.2.0"
 pinyin = "0.11"
 sysinfo = { version = "0.36", default-features = false, features = ["disk"] }
 windows = { version = "0.62", features = ["Win32_Storage_FileSystem"] }

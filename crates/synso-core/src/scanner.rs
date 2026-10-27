@@ -225,7 +225,9 @@ pub fn effective_roots(roots: &[String]) -> Vec<String> {
 }
 
 /// Compiles the exclusion patterns; empty patterns list matches nothing.
-fn build_matcher(patterns: &[String]) -> Result<GlobSet> {
+/// `pub(crate)`: the watcher (Task 8) compiles the same matcher so events
+/// under excluded paths are ignored exactly like the scan prunes them.
+pub(crate) fn build_matcher(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSet::builder();
     for pattern in patterns {
         let glob = Glob::new(pattern).map_err(|err| {
@@ -244,7 +246,9 @@ fn build_matcher(patterns: &[String]) -> Result<GlobSet> {
 /// `node_modules` pattern prunes directories of that name at any depth).
 /// Both paths are reduced to their ordinary (non-verbatim) spelling first,
 /// since patterns are written against paths like `C:/...`, never `\\?\...`.
-fn excluded(matcher: &GlobSet, abs: &Path, root: &Path) -> bool {
+///
+/// `pub(crate)`: the watcher (Task 8) applies the same test to event paths.
+pub(crate) fn excluded(matcher: &GlobSet, abs: &Path, root: &Path) -> bool {
     if matcher.is_empty() {
         return false;
     }
@@ -338,7 +342,8 @@ fn strip_verbatim_prefix(path: &Path) -> PathBuf {
 
 /// Unix-epoch seconds for a stat timestamp; 0 when unavailable (pre-epoch
 /// times or unsupported fields, e.g. `created` on some Linux filesystems).
-fn unix_secs(t: std::io::Result<std::time::SystemTime>) -> i64 {
+/// `pub(crate)`: the watcher (Task 8) stats fresh records the same way.
+pub(crate) fn unix_secs(t: std::io::Result<std::time::SystemTime>) -> i64 {
     t.ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |duration| duration.as_secs() as i64)

@@ -12,6 +12,7 @@ pub mod query;
 pub mod scanner;
 pub mod store;
 pub mod volumes;
+pub mod watcher;
 
 pub use collections::{Collection, MemberHit};
 pub use engine::{DedupPhase, Engine, EngineEvent, EngineOptions, EngineStats};
@@ -22,6 +23,7 @@ pub use query::{parse_query, Hit, SearchResult};
 pub use scanner::{is_placeholder_attr, scan, ScanOptions, ScanStats};
 pub use store::Store;
 pub use volumes::{fixed_volumes, VolumeInfo};
+pub use watcher::Watcher;
 
 /// Error type for all synso-core operations.
 #[derive(Debug, thiserror::Error)]

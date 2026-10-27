@@ -141,6 +141,77 @@ impl Store {
         Ok(files)
     }
 
+    /// Deletes the `files` row located by its containing directory segments
+    /// and entry name — the watcher's removal path (Task 8), which only ever
+    /// knows a path, never a rowid (rowids churn under it between events).
+    /// The comparison is exact (BINARY, like the `UNIQUE(dir, name)`
+    /// constraint): OS events report names in their stored casing on every
+    /// platform, so a mismatch cannot occur for real events, and a drifted
+    /// spelling leaves store and hot index CONSISTENTLY stale until the
+    /// next rescan rather than diverging. Returns the number of rows
+    /// deleted (`Ok(0)` when the row is already gone, which is a normal
+    /// outcome for create-then-delete inside one batch).
+    pub fn delete_file_by_path(&mut self, dir_path: &[&str], name: &str) -> Result<u64> {
+        let Some(dir_id) = find_dir(&self.conn, dir_path)? else {
+            return Ok(0);
+        };
+        let deleted = self.conn.execute(
+            "DELETE FROM files WHERE dir = ?1 AND name = ?2",
+            params![dir_id, name],
+        )?;
+        Ok(deleted as u64)
+    }
+
+    /// The `dirs` rows from `id` up to (and including) its root ancestor,
+    /// root-first: `[(id, parent, name), ..., (root_id, None, root_name)]`.
+    /// Empty for an unknown `id`. The watcher (Task 8) uses this to intern
+    /// a freshly upserted row's ancestor chain into the hot index. A
+    /// visited-set guard keeps a corrupt parent cycle (impossible via this
+    /// API, possible via a hand-edited database) from looping.
+    pub fn dir_ancestors(&self, id: FileId) -> Result<Vec<(FileId, Option<FileId>, String)>> {
+        let mut chain: Vec<(FileId, Option<FileId>, String)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut current = Some(id);
+        while let Some(node) = current {
+            if !seen.insert(node) {
+                break;
+            }
+            let row: Option<(Option<FileId>, String)> = self
+                .conn
+                .query_row(
+                    "SELECT parent, name FROM dirs WHERE id = ?1",
+                    params![node],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((parent, name)) = row else {
+                break;
+            };
+            current = parent;
+            chain.push((node, parent, name));
+        }
+        chain.reverse();
+        Ok(chain)
+    }
+
+    /// The `extensions` text for `id`, or `None` for the sentinel 0 / an
+    /// unknown id. The watcher interns new ext ids into the hot index
+    /// through this.
+    pub fn ext_text_of(&self, id: i64) -> Result<Option<String>> {
+        if id == 0 {
+            return Ok(None);
+        }
+        let text: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT ext FROM extensions WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(text)
+    }
+
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         let value: Option<String> = self
             .conn
