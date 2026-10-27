@@ -11,7 +11,23 @@
 //! hot index is always swapped while the store mutex is held, so a scan's
 //! fresh reload can never be overwritten by a stale loader snapshot. One
 //! scan at a time: [`Engine::start_full_scan`] is a no-op while a scan is
-//! running.
+//! running; the slot is released by a drop guard, so even a panicked scan
+//! cannot wedge the engine.
+//!
+//! Failure semantics: a scan that aborts with a store error emits
+//! [`EngineEvent::ScanFailed`] instead of `ScanFinished` and does NOT swap
+//! the hot index — searches keep the last known-good snapshot while the
+//! store stays partial (its roots were already purged and only partially
+//! re-walked); the store self-heals on the next successful rescan, which
+//! purges and rebuilds each root from disk truth.
+//!
+//! Lock poisoning: every engine lock guards data whose invariants survive
+//! a panic — the SQLite store (each upsert commits atomically, so a
+//! half-finished scan leaves committed batches the next rescan reconciles),
+//! the hot index (a rebuildable cache) and the subscriber list (a plain
+//! `Vec`). Locks are therefore taken poison-tolerantly (see
+//! [`lock_unpoisoned`]), which also keeps this crate free of
+//! `unwrap`/`expect` in library code.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,6 +73,13 @@ pub enum EngineEvent {
     /// Emitted after a scan finished AND the hot index was reloaded from
     /// the store, so subscribers can trust `stats()` from this point on.
     ScanFinished { files: u64, dirs: u64 },
+    /// A scan aborted with a store error; no `ScanFinished` follows. The
+    /// hot index was NOT swapped (searches keep the last known-good
+    /// snapshot) and the store stays partial until the next successful
+    /// rescan. `errors` is 0 for now — the walker aborts on the first
+    /// store error without returning partial counts — and `message`
+    /// carries the cause.
+    ScanFailed { errors: u64, message: String },
     /// Reserved for Task 9.
     DedupProgress {
         phase: DedupPhase,
@@ -116,15 +139,17 @@ impl Engine {
     /// subscribing are not delivered.
     pub fn subscribe(&self) -> Receiver<EngineEvent> {
         let (tx, rx) = unbounded();
-        self.subscribers.lock().unwrap().push(tx);
+        lock_unpoisoned(&self.subscribers).push(tx);
         rx
     }
 
     /// Starts a full scan on a background thread. One scan at a time:
     /// calling this while a scan is running is a no-op. Per root, the
     /// root's index subtree is purged before the walk (rescan
-    /// reconciliation); when the scan finishes, the hot index is reloaded
-    /// wholesale from the store and `ScanFinished` is emitted.
+    /// reconciliation). On success the hot index is reloaded wholesale
+    /// from the store and `ScanFinished` is emitted; on failure
+    /// `ScanFailed` is emitted instead and the hot index keeps serving the
+    /// last known-good snapshot.
     pub fn start_full_scan(&self) {
         // Claim the scan slot first: the compare-exchange makes a
         // concurrent second call a no-op.
@@ -151,7 +176,7 @@ impl Engine {
 
     /// Snapshot of hot-index state.
     pub fn stats(&self) -> EngineStats {
-        let hot = self.hot.read().unwrap();
+        let hot = read_unpoisoned(&self.hot);
         EngineStats {
             files: hot.file_count(),
             dirs: hot.dir_count(),
@@ -163,14 +188,46 @@ impl Engine {
 
 /// Sends `event` to every live subscriber, dropping disconnected ones.
 fn broadcast(subscribers: &Arc<Mutex<Vec<Sender<EngineEvent>>>>, event: EngineEvent) {
-    subscribers
+    lock_unpoisoned(subscribers).retain(|sender| sender.send(event.clone()).is_ok());
+}
+
+/// Poison-tolerant locking for the engine's three locks (see the module
+/// docs for why each lock's invariants survive a panic). Also the reason
+/// this crate has no `unwrap`/`expect` in library code.
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
         .lock()
-        .unwrap()
-        .retain(|sender| sender.send(event.clone()).is_ok());
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `lock_unpoisoned`, for read sides of the hot-index RwLock.
+fn read_unpoisoned<T>(rwlock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    rwlock
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// `lock_unpoisoned`, for write sides of the hot-index RwLock.
+fn write_unpoisoned<T>(rwlock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    rwlock
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Releases the one-scan-at-a-time flag on ANY exit from a scan cycle —
+/// normal return or panic unwind — so a failed or panicked scan can never
+/// leave `start_full_scan` a silent no-op forever.
+struct ScanSlot<'a>(&'a AtomicBool);
+
+impl Drop for ScanSlot<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 /// One full scan cycle on its own thread: purge each root's subtree, walk,
-/// reload the hot index, broadcast `ScanFinished`, release the scan slot.
+/// reload the hot index, broadcast the outcome. The scan slot is released
+/// by [`ScanSlot`] on every exit path, panic included.
 fn scan_cycle(
     store: Arc<Mutex<Store>>,
     hot: Arc<RwLock<HotIndex>>,
@@ -178,25 +235,39 @@ fn scan_cycle(
     scanning: Arc<AtomicBool>,
     opts: ScanOptions,
 ) {
-    let (files, dirs) = {
-        let mut guard = store.lock().unwrap();
+    let _slot = ScanSlot(&scanning);
+    let outcome = {
+        let mut guard = lock_unpoisoned(&store);
         purge_root_subtrees(&mut guard, &opts);
-        let counts = match scanner::scan(&mut guard, &opts, &|done| {
+        scanner::scan(&mut guard, &opts, &|done| {
             broadcast(&subscribers, EngineEvent::ScanProgress { done, total: 0 });
-        }) {
-            Ok(stats) => (stats.files, stats.dirs),
-            Err(err) => {
-                eprintln!("synso: full scan failed: {err}");
-                (0, 0)
-            }
-        };
-        // Reload while still holding the store lock (see module docs), so
-        // subscribers that react to ScanFinished already see fresh stats.
-        reload_hot_index_locked(&guard, &hot);
-        counts
+        })
+        .map(|stats| {
+            // Success only: swap in the fresh snapshot while still holding
+            // the store lock (see module docs), so subscribers reacting to
+            // ScanFinished already see fresh stats. On failure the hot
+            // index keeps serving the last known-good snapshot.
+            reload_hot_index_locked(&guard, &hot);
+            (stats.files, stats.dirs)
+        })
     };
-    broadcast(&subscribers, EngineEvent::ScanFinished { files, dirs });
-    scanning.store(false, Ordering::Release);
+    match outcome {
+        Ok((files, dirs)) => {
+            broadcast(&subscribers, EngineEvent::ScanFinished { files, dirs });
+        }
+        // The failure description travels in the event (no ScanFinished is
+        // emitted); nothing else to do — the store stays partial until the
+        // next successful rescan rebuilds it.
+        Err(err) => {
+            broadcast(
+                &subscribers,
+                EngineEvent::ScanFailed {
+                    errors: 0,
+                    message: err.to_string(),
+                },
+            );
+        }
+    }
 }
 
 /// Rescan reconciliation: delete each root's whole index subtree before
@@ -216,13 +287,13 @@ fn purge_root_subtrees(store: &mut Store, opts: &ScanOptions) {
 /// Loads a fresh hot index from the store and swaps it in, under the store
 /// mutex (callers already holding it use [`reload_hot_index_locked`]).
 fn reload_hot_index(store: &Arc<Mutex<Store>>, hot: &Arc<RwLock<HotIndex>>) {
-    let guard = store.lock().unwrap();
+    let guard = lock_unpoisoned(store);
     reload_hot_index_locked(&guard, hot);
 }
 
 fn reload_hot_index_locked(store: &Store, hot: &Arc<RwLock<HotIndex>>) {
     match HotIndex::load(store) {
-        Ok(loaded) => *hot.write().unwrap() = loaded,
+        Ok(loaded) => *write_unpoisoned(hot) = loaded,
         Err(err) => eprintln!("synso: hot-index load failed: {err}"),
     }
 }
@@ -245,15 +316,19 @@ mod tests {
         root
     }
 
-    fn engine_opts(root: &Path) -> EngineOptions {
-        EngineOptions {
-            volumes: vec![root.to_string_lossy().into_owned()],
-            exclusions: Vec::new(),
-        }
+    fn open_engine(db: &Path, root: &Path) -> Engine {
+        open_engine_with(db, root, Vec::new())
     }
 
-    fn open_engine(db: &Path, root: &Path) -> Engine {
-        Engine::open(db, engine_opts(root)).unwrap()
+    fn open_engine_with(db: &Path, root: &Path, exclusions: Vec<String>) -> Engine {
+        Engine::open(
+            db,
+            EngineOptions {
+                volumes: vec![root.to_string_lossy().into_owned()],
+                exclusions,
+            },
+        )
+        .unwrap()
     }
 
     /// Polls until the initial hot-index load completed.
@@ -280,6 +355,21 @@ mod tests {
                 }
                 EngineEvent::ScanFinished { files, dirs } => return (progress, files, dirs),
                 other => panic!("unexpected event: {other:?}"),
+            }
+        }
+    }
+
+    /// Receives events until `ScanFailed`, asserting no `ScanFinished` ever
+    /// arrives; returns the failure message.
+    fn wait_scan_failed(rx: &Receiver<EngineEvent>) -> String {
+        loop {
+            let event = rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("an event arrives before the timeout");
+            match event {
+                EngineEvent::ScanProgress { .. } => continue,
+                EngineEvent::ScanFailed { message, .. } => return message,
+                other => panic!("expected ScanFailed, got {other:?}"),
             }
         }
     }
@@ -391,5 +481,106 @@ mod tests {
         for kept in ["notes.txt", "final.pdf", "docs"] {
             assert!(names.contains(&kept.to_string()), "{kept} must survive");
         }
+    }
+
+    #[test]
+    fn failed_scan_emits_scan_failed_and_keeps_last_known_good() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = write_fixture(tmp.path());
+
+        // A healthy scan first, so the database holds a good snapshot.
+        {
+            let engine = open_engine(&db_path, &root);
+            let rx = engine.subscribe();
+            engine.start_full_scan();
+            let (_progress, files, _dirs) = wait_scan_finished(&rx);
+            assert_eq!(files, 3);
+        }
+
+        // "[" is an invalid glob: the scan fails right after the per-root
+        // purge (which already committed) and before any walk.
+        let engine = open_engine_with(&db_path, &root, vec!["[".to_string()]);
+        wait_warm(&engine); // the initial load serves the good snapshot
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        let message = wait_scan_failed(&rx);
+        assert!(!message.is_empty(), "the cause travels in the event");
+
+        // stats() still works and keeps serving the last-known-good
+        // snapshot (the hot index was NOT swapped)...
+        let stats = engine.stats();
+        assert_eq!(stats.files, 3);
+        assert!(stats.warm);
+        // ...even though the store is now partial: purged, never re-walked.
+        let store = Store::open(&db_path).unwrap();
+        assert_eq!(
+            store.all_files().unwrap().len(),
+            0,
+            "the store stays partial until a successful rescan"
+        );
+
+        // The scan slot was released on the failure path: a second scan
+        // runs again instead of being a silent no-op (it fails again for
+        // the same reason, which still proves the slot came free).
+        engine.start_full_scan();
+        wait_scan_failed(&rx);
+
+        // A good engine self-heals the partial store with one rescan.
+        drop(engine);
+        let healed = open_engine(&db_path, &root);
+        let rx2 = healed.subscribe();
+        healed.start_full_scan();
+        let (_progress, files, dirs) = wait_scan_finished(&rx2);
+        assert_eq!((files, dirs), (3, 2));
+        assert_eq!(healed.stats().files, 3);
+    }
+
+    #[test]
+    fn poisoned_locks_keep_engine_usable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = write_fixture(tmp.path());
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        let (_progress, files, _dirs) = wait_scan_finished(&rx);
+        assert_eq!(files, 3);
+
+        // Panic while holding each of the engine's three locks, poisoning
+        // it. (The panic output below is expected.)
+        let store = Arc::clone(&engine.store);
+        std::thread::spawn(move || {
+            let _guard = store.lock().unwrap();
+            panic!("poison the store mutex");
+        })
+        .join()
+        .unwrap_err();
+
+        let hot = Arc::clone(&engine.hot);
+        std::thread::spawn(move || {
+            let _guard = hot.write().unwrap();
+            panic!("poison the hot-index lock");
+        })
+        .join()
+        .unwrap_err();
+
+        let subscribers = Arc::clone(&engine.subscribers);
+        std::thread::spawn(move || {
+            let _guard = subscribers.lock().unwrap();
+            panic!("poison the subscriber list");
+        })
+        .join()
+        .unwrap_err();
+
+        // Every public path still works across the poisoned locks: none of
+        // these may panic, and a full scan cycle runs to completion.
+        let _rx2 = engine.subscribe();
+        assert_eq!(engine.stats().files, 3);
+        engine.start_full_scan();
+        let (_progress, files, dirs) = wait_scan_finished(&rx);
+        assert_eq!((files, dirs), (3, 2));
+        assert_eq!(engine.stats().files, 3);
     }
 }
