@@ -41,7 +41,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender};
 
 use crate::collections::{self, Collection, MemberHit};
 use crate::hotindex::HotIndex;
-use crate::model::FileId;
+use crate::model::{FileId, ParsedQuery};
 use crate::query::{self, SearchResult};
 use crate::scanner::{self, effective_roots, root_segment, ScanOptions};
 use crate::store::Store;
@@ -192,16 +192,56 @@ impl Engine {
     }
 
     /// Case-insensitive substring search over the hot index's name arena
-    /// (see [`crate::query`] for the full contract). Ranking: prefix >
-    /// word-start > substring, a within-class boost for mtimes within the
-    /// last 30 days, then shorter path, then lexicographic path; an empty
-    /// `text` lists the most recent entries by mtime (ties: path asc).
-    /// `hits` covers `[offset, offset + limit)` of that ordering, `total`
-    /// is the full match count. A cold index returns an empty result —
-    /// this never panics.
+    /// (see [`crate::query`] for the full contract). `text` is first
+    /// parsed by [`crate::query::parse_query`]: Everything-style modifier
+    /// tokens (`ext:` / `size:` / `path:` / `coll:`) become dimension
+    /// filters applied before ranking, and the remaining words are free
+    /// text that must ALL match. Ranking: prefix > word-start >
+    /// substring, a within-class boost for mtimes within the last 30
+    /// days, then shorter path, then lexicographic path; an empty `text`
+    /// lists the most recent entries by mtime (ties: path asc). `hits`
+    /// covers `[offset, offset + limit)` of that ordering, `total` is the
+    /// full match count. A cold index returns an empty result — this
+    /// never panics.
     pub fn search(&self, text: &str, offset: u32, limit: u32) -> SearchResult {
+        let parsed = query::parse_query(text);
+        self.search_parsed(&parsed, offset, limit)
+    }
+
+    /// [`Engine::search`] over an already-parsed query (see
+    /// [`crate::query::parse_query`]). The parsed dimension filters
+    /// (`ext:` / `size:` / `path:` / `coll:`) apply as fast predicates
+    /// BEFORE ranking and classification; ranking itself is unchanged.
+    /// `q.collections` resolves against the store: a file must be an ALIVE
+    /// member of every named collection, an unknown name filters the result
+    /// to empty (not an error), and a store error is logged and yields an
+    /// empty result (search is never fatal).
+    pub fn search_parsed(&self, q: &ParsedQuery, offset: u32, limit: u32) -> SearchResult {
+        // Resolve the coll: filter against the store before touching the
+        // hot index (membership rows live only there). The store guard is
+        // released before the hot read; the engine's locks never nest.
+        let coll_members = if q.collections.is_empty() {
+            None
+        } else {
+            let store = lock_unpoisoned(&self.store);
+            match collections::alive_member_intersection(&store, &q.collections) {
+                // Ok(None) = an unknown collection name: no results, not
+                // an error — and NOT "no filter", hence the early return.
+                Ok(members) => match members {
+                    Some(members) => Some(members),
+                    None => return SearchResult::default(),
+                },
+                Err(err) => {
+                    eprintln!(
+                        "synso: resolving collection filter {:?} failed: {err}",
+                        q.collections
+                    );
+                    return SearchResult::default();
+                }
+            }
+        };
         let hot = read_unpoisoned(&self.hot);
-        query::run(&hot, text, offset, limit, unix_now())
+        query::run_parsed(&hot, q, coll_members.as_ref(), offset, limit, unix_now())
     }
 
     /// Creates a virtual collection. A duplicate name is

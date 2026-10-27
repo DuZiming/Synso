@@ -163,6 +163,19 @@ impl HotIndex {
         self.exts.get(&ext_id).map_or("", String::as_str)
     }
 
+    /// The interned ext id whose extension text equals `ext` (compare in
+    /// the interned spelling: lowercased, no leading dot — see
+    /// [`HotIndex::ext_of`]). `None` when no `extensions` row carries that
+    /// text. Extension texts are UNIQUE, so at most one id matches; the
+    /// `ext:` search filter uses this to turn its string compare into an
+    /// integer one.
+    pub fn ext_id_of(&self, ext: &str) -> Option<FileId> {
+        self.exts
+            .iter()
+            .find(|(_, text)| text.as_str() == ext)
+            .map(|(id, _)| *id)
+    }
+
     /// Original-case dir names from the root segment down to `slot`'s
     /// containing directory, root first ([`HotIndex::path_of`] appends the
     /// entry's own name to this chain).

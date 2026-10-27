@@ -27,6 +27,7 @@
 //! every successful scan cycle (after the hot-index reload); the Task 8
 //! watcher will call it too, so it must stay callable on its own.
 
+use std::collections::HashSet;
 use std::path::{Path, MAIN_SEPARATOR};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -254,6 +255,44 @@ pub fn members(store: &Store, id: i64) -> Result<Vec<MemberHit>> {
         hits.push(MemberHit { hit, alive });
     }
     Ok(hits)
+}
+
+/// The `files` row ids that are ALIVE members of EVERY named collection —
+/// the execution set of the `coll:` search filter
+/// ([`crate::engine::Engine::search_parsed`]). `Ok(None)` when any name
+/// matches no collection: an unknown name filters the query to no results
+/// rather than erroring. `names` must be non-empty (an empty list means
+/// "no collection filter"; callers skip this call entirely).
+pub fn alive_member_intersection(
+    store: &Store,
+    names: &[String],
+) -> Result<Option<HashSet<FileId>>> {
+    let conn = store.conn();
+    let mut intersection: Option<HashSet<FileId>> = None;
+    for name in names {
+        let coll_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM collections WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(coll_id) = coll_id else {
+            return Ok(None);
+        };
+        let mut members = conn.prepare(
+            "SELECT file_id FROM collection_members
+             WHERE coll_id = ?1 AND alive = 1",
+        )?;
+        let alive: HashSet<FileId> = members
+            .query_map(params![coll_id], |row| row.get(0))?
+            .collect::<std::result::Result<HashSet<_>, _>>()?;
+        intersection = Some(match intersection {
+            None => alive,
+            Some(prev) => prev.intersection(&alive).copied().collect(),
+        });
+    }
+    Ok(intersection)
 }
 
 /// Tombstone + rebind pass (see module docs). Runs in one transaction.

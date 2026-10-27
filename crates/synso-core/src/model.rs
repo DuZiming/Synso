@@ -1,4 +1,5 @@
-//! Data model: one indexed filesystem entry.
+//! Data model: one indexed filesystem entry, plus the parsed query shape
+//! the search path filters on.
 
 /// Row id in the `files`/`dirs` tables. `0` means "not yet stored".
 pub type FileId = i64;
@@ -34,4 +35,34 @@ pub struct FileRecord {
     /// First-letter pinyin key ("bg.docx"), same generation rule as
     /// [`FileRecord::py_full`]. Also store-assigned.
     pub py_init: String,
+}
+
+/// Parsed form of one search query string: the free-text words plus the
+/// Everything-style dimension filters [`crate::query::parse_query`]
+/// recognized along the way. Pure data — parsing does no I/O; execution
+/// (filtering) happens in [`crate::engine::Engine::search_parsed`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParsedQuery {
+    /// The free-text tokens that were NOT modifiers, joined by single
+    /// spaces, original spelling. Multiple words must ALL match (AND),
+    /// each an independent case-insensitive substring hit; empty text
+    /// lists the most recent entries instead.
+    pub text: String,
+    /// `ext:pdf` — exact extension match. Lowercased, no leading dot (the
+    /// spelling the store interns). Single value in v1; a repeated token
+    /// wins with its last occurrence.
+    pub ext: Option<String>,
+    /// Inclusive lower size bound in bytes (`size:>1mb` stores 1 MiB + 1,
+    /// since `>` is strict). Repeated size tokens combine into the
+    /// tightest bounds.
+    pub min_size: Option<u64>,
+    /// Inclusive upper size bound in bytes (`size:<1mb` stores 1 MiB - 1).
+    pub max_size: Option<u64>,
+    /// `path:proj` — case-insensitive SUBSTRING match on the full
+    /// reconstructed path (the field name keeps the brief's spelling;
+    /// the semantics are substring, not prefix). Last occurrence wins.
+    pub path_prefix: Option<String>,
+    /// `coll:工作` — repeatable. The file must be an ALIVE member of EVERY
+    /// named collection; an unknown name filters to no results.
+    pub collections: Vec<String>,
 }
