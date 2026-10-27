@@ -436,6 +436,7 @@ version = "0.1.0"
 name = "synso-core"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "globset",
  "junction",
  "jwalk",

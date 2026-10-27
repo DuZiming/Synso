@@ -3,11 +3,15 @@
 //! This crate must stay UI-free and dependency-light (never depend on tauri)
 //! so the scanner/engine layers built on it remain embeddable and testable.
 
+pub mod engine;
+pub mod hotindex;
 pub mod model;
 pub mod scanner;
 pub mod store;
 pub mod volumes;
 
+pub use engine::{DedupPhase, Engine, EngineEvent, EngineOptions, EngineStats};
+pub use hotindex::HotIndex;
 pub use model::{FileId, FileRecord};
 pub use scanner::{is_placeholder_attr, scan, ScanOptions, ScanStats};
 pub use store::Store;

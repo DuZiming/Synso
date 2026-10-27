@@ -90,6 +90,39 @@ impl Store {
         Ok(())
     }
 
+    /// Deletes the directory resolved from `dir_path`, every descendant
+    /// directory row, and every `files` row under them. Returns the number
+    /// of `files` rows deleted (directory entries are stored as `files`
+    /// rows too, so they are included in the count); `Ok(0)` when
+    /// `dir_path` resolves to no existing directory, which is what lets a
+    /// rescan purge a root on a fresh database. Rescans call this per root
+    /// before walking it so files deleted while the app was closed do not
+    /// linger in the index.
+    pub fn delete_subtree(&mut self, dir_path: &[&str]) -> Result<u64> {
+        let Some(dir_id) = find_dir(&self.conn, dir_path)? else {
+            return Ok(0);
+        };
+        // A recursive CTE collects the subtree ids inside SQLite, so each
+        // delete is a single statement not bound by any host-parameter
+        // limit; UNION (not UNION ALL) keeps a corrupted parent cycle from
+        // looping forever.
+        const SUBTREE: &str = "\
+             WITH RECURSIVE subtree(id) AS (\
+                 SELECT id FROM dirs WHERE id = ?1 \
+                 UNION \
+                 SELECT child.id FROM dirs AS child \
+                 JOIN subtree ON child.parent = subtree.id)";
+        let files = self.conn.execute(
+            &format!("{SUBTREE} DELETE FROM files WHERE dir IN (SELECT id FROM subtree)"),
+            params![dir_id],
+        )? as u64;
+        self.conn.execute(
+            &format!("{SUBTREE} DELETE FROM dirs WHERE id IN (SELECT id FROM subtree)"),
+            params![dir_id],
+        )?;
+        Ok(files)
+    }
+
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         let value: Option<String> = self
             .conn
@@ -100,6 +133,43 @@ impl Store {
             )
             .optional()?;
         Ok(value)
+    }
+
+    /// Every `dirs` row as `(id, parent, name)`, id-ordered. Read source
+    /// for the hot index's interned directory tree.
+    pub fn all_dirs(&self) -> Result<Vec<(FileId, Option<FileId>, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, parent, name FROM dirs ORDER BY id")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Every `files` row as a [`FileRecord`] with `id`, `parent` and
+    /// `ext_id` filled from the database, id-ordered. Read source for the
+    /// hot index's whole-table load.
+    pub fn all_files(&self) -> Result<Vec<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, dir, name, size, mtime, ctime, atime, ext_id, is_dir, hash_first, hash_full
+             FROM files ORDER BY id",
+        )?;
+        // u64 columns round-trip the same bit-preserving casts upsert used.
+        let rows = stmt.query_map([], |row| {
+            Ok(FileRecord {
+                id: row.get(0)?,
+                parent: row.get(1)?,
+                name: row.get(2)?,
+                size: row.get::<_, i64>(3)? as u64,
+                mtime: row.get(4)?,
+                ctime: row.get(5)?,
+                atime: row.get(6)?,
+                ext_id: row.get(7)?,
+                is_dir: row.get::<_, i64>(8)? != 0,
+                hash_first: row.get::<_, Option<i64>>(9)?.map(|h| h as u64),
+                hash_full: row.get::<_, Option<i64>>(10)?.map(|h| h as u64),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn set_meta(&self, key: &str, val: &str) -> Result<()> {
@@ -163,6 +233,38 @@ fn resolve_dir(conn: &Connection, segments: &[&str]) -> Result<FileId> {
             }
         };
         parent = Some(dir_id);
+    }
+    Ok(dir_id)
+}
+
+/// Like [`resolve_dir`] but never creates rows: resolves `segments` in
+/// `dirs` and returns the final dir id, or `None` as soon as a segment is
+/// missing. Empty segments are a caller error, mirroring `resolve_dir`.
+fn find_dir(conn: &Connection, segments: &[&str]) -> Result<Option<FileId>> {
+    if segments.is_empty() {
+        return Err(SynsoError::BadQuery(
+            "dir_path must have at least one segment".into(),
+        ));
+    }
+    let mut parent: Option<FileId> = None;
+    let mut dir_id: Option<FileId> = None;
+    for segment in segments {
+        if segment.is_empty() {
+            return Err(SynsoError::BadQuery(
+                "dir_path segments must be non-empty".into(),
+            ));
+        }
+        dir_id = conn
+            .query_row(
+                "SELECT id FROM dirs WHERE parent IS ?1 AND name = ?2",
+                params![parent, *segment],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match dir_id {
+            Some(id) => parent = Some(id),
+            None => return Ok(None),
+        }
     }
     Ok(dir_id)
 }
@@ -343,6 +445,63 @@ mod tests {
         assert!(matches!(
             store.delete_file(record.id),
             Err(SynsoError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn delete_subtree_removes_descendants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
+
+        // Tree: a/{fa}, a/b/{fb, sub(dir entry)}, a/b/c/{fc}; sibling z/{fz}.
+        // "sub" is a files row with is_dir = 1 (the scanner records walked
+        // directories that way) but has no dirs row of its own.
+        for (dir_path, name, is_dir) in [
+            (vec!["a"], "fa.txt", false),
+            (vec!["a", "b"], "fb.txt", false),
+            (vec!["a", "b", "c"], "fc.txt", false),
+            (vec!["a", "b"], "sub", true),
+            (vec!["z"], "fz.txt", false),
+        ] {
+            let mut record = rec(name, 1);
+            record.is_dir = is_dir;
+            store.upsert_file(&dir_path, &mut record).unwrap();
+        }
+
+        let deleted = store.delete_subtree(&["a"]).unwrap();
+        assert_eq!(
+            deleted, 4,
+            "fa.txt, fb.txt, fc.txt and the dir-entry row sub are removed"
+        );
+
+        let remaining_files: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining_files, 1, "only fz.txt survives");
+        let remaining_dirs: Vec<String> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT name FROM dirs ORDER BY name")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            remaining_dirs,
+            vec!["z".to_string()],
+            "a, a/b, a/b/c dir rows are gone; sub never had one"
+        );
+
+        // A path that resolves to nothing deletes nothing and is not an
+        // error (fresh databases have no root-segment row yet).
+        assert_eq!(store.delete_subtree(&["missing"]).unwrap(), 0);
+        // Empty segment lists are a caller error, same as upsert_file.
+        assert!(matches!(
+            store.delete_subtree(&[]),
+            Err(SynsoError::BadQuery(_))
         ));
     }
 

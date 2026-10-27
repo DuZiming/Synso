@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 rusqlite.workspace = true
 thiserror.workspace = true
+crossbeam-channel.workspace = true
 jwalk.workspace = true
 globset.workspace = true
 sysinfo.workspace = true

@@ -207,7 +207,9 @@ fn flush_batch(store: &mut Store, batch: &mut Vec<(Vec<String>, FileRecord)>) ->
 }
 
 /// `opts.roots`, or the mount points of all fixed volumes when empty.
-fn effective_roots(roots: &[String]) -> Vec<String> {
+/// Public so the engine resolves the exact same effective roots when it
+/// purges each root's index subtree before a rescan.
+pub fn effective_roots(roots: &[String]) -> Vec<String> {
     if roots.is_empty() {
         crate::volumes::fixed_volumes()
             .into_iter()
@@ -268,7 +270,10 @@ fn excluded(matcher: &GlobSet, abs: &Path, root: &Path) -> bool {
 /// Callers should pass non-overlapping roots: two roots sharing a final
 /// path component (e.g. `C:\a` and `D:\a`) merge into the same `dirs`
 /// branch.
-fn root_segment(root: &Path) -> String {
+///
+/// Public because the engine reuses this to compute the subtree it purges
+/// from the index before rescanning a root (`delete_subtree(&[segment])`).
+pub fn root_segment(root: &Path) -> String {
     let clean = strip_verbatim_prefix(root);
     if let Some(name) = clean.file_name() {
         return name.to_string_lossy().into_owned();

@@ -10,6 +10,7 @@ rust-version = "1.83"
 [workspace.dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
+crossbeam-channel = "0.5"
 # Pinned (`=`) where a newer release raised its MSRV above the workspace's
 # 1.83: globset 0.4.20 declares 1.88, junction 2.1.0 declares 1.85, and
 # tempfile 3.24+ pulls getrandom 0.4 (edition 2024, needs cargo 1.85).
