@@ -1,0 +1,13 @@
+[package]
+name = "synso-core"
+description = "Synso core: file-index data model and SQLite store (embeddable, no UI deps)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

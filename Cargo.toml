@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/synso-core", "crates/synso-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+
+[workspace.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "2"
+tempfile = "3"

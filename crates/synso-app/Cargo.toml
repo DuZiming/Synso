@@ -1,0 +1,6 @@
+[package]
+name = "synso-app"
+description = "Synso desktop application crate (placeholder, replaced in Task 13)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true

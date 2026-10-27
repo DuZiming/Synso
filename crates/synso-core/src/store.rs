@@ -1,0 +1,377 @@
+//! SQLite-backed store for the file index.
+
+use std::path::Path;
+
+use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::{FileId, FileRecord, Result, SynsoError};
+
+/// Schema of `user_version` 1, verbatim from the design. Later schema steps
+/// add their own constants and bump [`SCHEMA_VERSION`].
+const SCHEMA_V1_SQL: &str = "\
+CREATE TABLE dirs(id INTEGER PRIMARY KEY, parent INTEGER, name TEXT, UNIQUE(parent,name));
+CREATE TABLE files(id INTEGER PRIMARY KEY, dir INTEGER NOT NULL, name TEXT NOT NULL,
+  size INTEGER NOT NULL, mtime INTEGER, ctime INTEGER, atime INTEGER, ext_id INTEGER NOT NULL,
+  is_dir INTEGER NOT NULL, hash_first INTEGER, hash_full INTEGER, UNIQUE(dir,name));
+CREATE TABLE extensions(id INTEGER PRIMARY KEY, ext TEXT UNIQUE);
+CREATE TABLE collections(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+CREATE TABLE collection_members(coll_id INTEGER, file_id INTEGER, snap_name TEXT, snap_size INTEGER,
+  alive INTEGER NOT NULL DEFAULT 1, PRIMARY KEY(coll_id,file_id));
+CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+";
+
+/// Current schema version, stored in `PRAGMA user_version`.
+const SCHEMA_VERSION: i64 = 1;
+
+/// Persistent index store over a single SQLite database file.
+pub struct Store {
+    conn: Connection,
+}
+
+impl Store {
+    /// Opens (creating if needed) the database at `path` and brings its
+    /// schema up to [`SCHEMA_VERSION`].
+    pub fn open(path: &Path) -> Result<Store> {
+        let conn = Connection::open(path)?;
+        migrate(&conn)?;
+        Ok(Store { conn })
+    }
+
+    /// Inserts `rec` under the directory built from `dir_path` segments
+    /// (e.g. `["Users", "a", "docs"]` for `Users/a/docs`), or updates the
+    /// existing `(dir, name)` row. On success `rec.id`, `rec.parent` and
+    /// `rec.ext_id` hold the values actually stored.
+    pub fn upsert_file(&mut self, dir_path: &[&str], rec: &mut FileRecord) -> Result<()> {
+        let dir_id = resolve_dir(&self.conn, dir_path)?;
+        let ext_id = intern_extension(&self.conn, &rec.name)?;
+        // u64 columns (size, hashes) are stored as SQLite's signed 64-bit
+        // integers via a bit-preserving cast.
+        let id: FileId = self.conn.query_row(
+            "INSERT INTO files(dir, name, size, mtime, ctime, atime, ext_id, is_dir, hash_first, hash_full)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(dir, name) DO UPDATE SET
+               size = excluded.size,
+               mtime = excluded.mtime,
+               ctime = excluded.ctime,
+               atime = excluded.atime,
+               ext_id = excluded.ext_id,
+               is_dir = excluded.is_dir,
+               hash_first = excluded.hash_first,
+               hash_full = excluded.hash_full
+             RETURNING id",
+            params![
+                dir_id,
+                rec.name,
+                rec.size as i64,
+                rec.mtime,
+                rec.ctime,
+                rec.atime,
+                ext_id,
+                rec.is_dir,
+                rec.hash_first.map(|h| h as i64),
+                rec.hash_full.map(|h| h as i64),
+            ],
+            |row| row.get(0),
+        )?;
+        rec.id = id;
+        rec.parent = dir_id;
+        rec.ext_id = ext_id;
+        Ok(())
+    }
+
+    /// Deletes the `files` row `id`; `Err(NotFound)` if it does not exist.
+    pub fn delete_file(&mut self, id: FileId) -> Result<()> {
+        let deleted = self
+            .conn
+            .execute("DELETE FROM files WHERE id = ?1", params![id])?;
+        if deleted == 0 {
+            return Err(SynsoError::NotFound);
+        }
+        Ok(())
+    }
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let value: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(value)
+    }
+
+    pub fn set_meta(&self, key: &str, val: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, val],
+        )?;
+        Ok(())
+    }
+}
+
+/// Applies pending schema migrations and records the resulting version in
+/// `PRAGMA user_version`. Reopening an already-migrated database is a no-op;
+/// a database written by a newer schema version is left untouched.
+fn migrate(conn: &Connection) -> Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version >= SCHEMA_VERSION {
+        return Ok(());
+    }
+    if version < 1 {
+        conn.execute_batch(SCHEMA_V1_SQL)?;
+    }
+    // Later schema steps append `if version < 2 { ... }` blocks here.
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    Ok(())
+}
+
+/// Resolves `segments` in `dirs`, creating missing levels (each segment's
+/// parent is the previous one; the first segment's parent is NULL), and
+/// returns the final dir id.
+fn resolve_dir(conn: &Connection, segments: &[&str]) -> Result<FileId> {
+    if segments.is_empty() {
+        return Err(SynsoError::BadQuery(
+            "dir_path must have at least one segment".into(),
+        ));
+    }
+    let mut parent: Option<FileId> = None;
+    let mut dir_id: FileId = 0;
+    for segment in segments {
+        if segment.is_empty() {
+            return Err(SynsoError::BadQuery(
+                "dir_path segments must be non-empty".into(),
+            ));
+        }
+        let existing: Option<FileId> = conn
+            .query_row(
+                "SELECT id FROM dirs WHERE parent IS ?1 AND name = ?2",
+                params![parent, segment],
+                |row| row.get(0),
+            )
+            .optional()?;
+        dir_id = match existing {
+            Some(id) => id,
+            None => {
+                conn.execute(
+                    "INSERT INTO dirs(parent, name) VALUES (?1, ?2)",
+                    params![parent, segment],
+                )?;
+                conn.last_insert_rowid()
+            }
+        };
+        parent = Some(dir_id);
+    }
+    Ok(dir_id)
+}
+
+/// Interns `name`'s extension (lowercase, no leading dot) in `extensions`
+/// and returns its row id. A name without an extension maps to the sentinel
+/// `0` (no row is interned for it).
+fn intern_extension(conn: &Connection, name: &str) -> Result<i64> {
+    // Path::extension gives std dotfile semantics (".gitignore" has no ext);
+    // lossy conversion keeps interning on the String ToSql impl.
+    let Some(ext) = Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+    else {
+        return Ok(0);
+    };
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM extensions WHERE ext = ?1",
+            params![ext],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match existing {
+        Some(id) => id,
+        None => {
+            conn.execute("INSERT INTO extensions(ext) VALUES (?1)", params![ext])?;
+            conn.last_insert_rowid()
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::model::FileRecord;
+    use crate::store::Store;
+    use crate::SynsoError;
+    use rusqlite::{params, Connection};
+
+    /// Minimal record builder so each test only states what it cares about.
+    fn rec(name: &str, size: u64) -> FileRecord {
+        FileRecord {
+            id: 0,
+            parent: 0,
+            name: name.to_string(),
+            size,
+            mtime: 1_700_000_000,
+            ctime: 1_700_000_001,
+            atime: 1_700_000_002,
+            ext_id: 0,
+            is_dir: false,
+            hash_first: Some(0x00ff_00ff),
+            hash_full: None,
+        }
+    }
+
+    #[test]
+    fn open_creates_schema_and_migrates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        // First open: schema created, user_version bumped to 1.
+        {
+            let store = Store::open(&db_path).unwrap();
+            let version: i64 = store
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 1);
+        }
+
+        // Second open on the same file: no error, still at 1 (idempotent).
+        let store = Store::open(&db_path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+
+        // Every v1 table exists and starts empty.
+        for table in [
+            "dirs",
+            "files",
+            "extensions",
+            "collections",
+            "collection_members",
+            "meta",
+        ] {
+            let count: i64 = store
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "table {table} should exist and be empty");
+        }
+    }
+
+    #[test]
+    fn upsert_and_reload_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let mut store = Store::open(&db_path).unwrap();
+
+        // a/b/report.docx
+        let mut first = rec("report.docx", 1024);
+        store.upsert_file(&["a", "b"], &mut first).unwrap();
+        assert!(first.id > 0, "upsert must assign the row id into rec.id");
+
+        // Same (dir, name) with a new size: the existing row is updated in place.
+        let mut second = rec("report.docx", 2048);
+        store.upsert_file(&["a", "b"], &mut second).unwrap();
+        assert_eq!(second.id, first.id, "re-upsert must keep the same row");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "row count must still be 1 after re-upsert");
+
+        let (dir, size, hash_first, hash_full): (i64, i64, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT dir, size, hash_first, hash_full FROM files WHERE id = ?1",
+                params![first.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(size, 2048, "size must be updated");
+        assert_eq!(hash_first, Some(0x00ff_00ff_u64 as i64));
+        assert_eq!(hash_full, None);
+
+        // dir_path segments resolved as a -> b with correct parent links.
+        let (dir_a, parent_a): (i64, Option<i64>) = conn
+            .query_row("SELECT id, parent FROM dirs WHERE name = 'a'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        let (dir_b, parent_b): (i64, Option<i64>) = conn
+            .query_row("SELECT id, parent FROM dirs WHERE name = 'b'", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(parent_a, None, "first segment's parent is NULL");
+        assert_eq!(parent_b, Some(dir_a));
+        assert_eq!(dir, dir_b, "file row sits under the final dir id");
+    }
+
+    #[test]
+    fn meta_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let store = Store::open(&db_path).unwrap();
+
+        assert_eq!(store.get_meta("missing").unwrap(), None);
+        store.set_meta("schema", "v1").unwrap();
+        assert_eq!(store.get_meta("schema").unwrap().as_deref(), Some("v1"));
+        // set_meta upserts: the same key is overwritten.
+        store.set_meta("schema", "v2").unwrap();
+        assert_eq!(store.get_meta("schema").unwrap().as_deref(), Some("v2"));
+    }
+
+    #[test]
+    fn delete_file_removes_row_and_errors_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let mut store = Store::open(&db_path).unwrap();
+
+        let mut record = rec("gone.txt", 10);
+        store.upsert_file(&["x"], &mut record).unwrap();
+        store.delete_file(record.id).unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        assert!(matches!(
+            store.delete_file(record.id),
+            Err(SynsoError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn extension_normalization_lowercase_no_dot_and_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let mut store = Store::open(&db_path).unwrap();
+
+        let mut upper = rec("Archive.ZIP", 1);
+        store.upsert_file(&["d"], &mut upper).unwrap();
+        let mut plain = rec("README", 1);
+        store.upsert_file(&["d"], &mut plain).unwrap();
+
+        assert!(upper.ext_id > 0, "dotted extension interns to a real row");
+        assert_eq!(plain.ext_id, 0, "no extension maps to ext_id 0");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let ext: String = conn
+            .query_row(
+                "SELECT ext FROM extensions WHERE id = ?1",
+                params![upper.ext_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ext, "zip", "extension stored lowercase without leading dot");
+        let exts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM extensions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(exts, 1, "no sentinel/empty row is interned for missing ext");
+    }
+}
