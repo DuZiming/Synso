@@ -182,6 +182,10 @@ pub fn scan(store: &mut Store, opts: &ScanOptions, progress: &dyn Fn(u64)) -> Re
                     is_dir,
                     hash_first: None,
                     hash_full: None,
+                    // Pinyin keys are store-assigned at upsert time; the
+                    // scanner never computes them itself.
+                    py_full: String::new(),
+                    py_init: String::new(),
                 },
             ));
 

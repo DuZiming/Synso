@@ -4,6 +4,7 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::pinyin::pinyin_keys;
 use crate::{FileId, FileRecord, Result, SynsoError};
 
 /// Schema of `user_version` 1, verbatim from the design. Later schema steps
@@ -20,8 +21,16 @@ CREATE TABLE collection_members(coll_id INTEGER, file_id INTEGER, snap_name TEXT
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
 ";
 
+/// Schema of `user_version` 2, verbatim from the design: pinyin search keys
+/// on `files`, computed by [`crate::pinyin::pinyin_keys`] at upsert time.
+/// Existing rows are backfilled once during migration.
+const SCHEMA_V2_SQL: &str = "\
+ALTER TABLE files ADD COLUMN py_full TEXT NOT NULL DEFAULT '';
+ALTER TABLE files ADD COLUMN py_init TEXT NOT NULL DEFAULT '';
+";
+
 /// Current schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Persistent index store over a single SQLite database file.
 pub struct Store {
@@ -32,23 +41,26 @@ impl Store {
     /// Opens (creating if needed) the database at `path` and brings its
     /// schema up to [`SCHEMA_VERSION`].
     pub fn open(path: &Path) -> Result<Store> {
-        let conn = Connection::open(path)?;
-        migrate(&conn)?;
+        let mut conn = Connection::open(path)?;
+        migrate(&mut conn)?;
         Ok(Store { conn })
     }
 
     /// Inserts `rec` under the directory built from `dir_path` segments
     /// (e.g. `["Users", "a", "docs"]` for `Users/a/docs`), or updates the
     /// existing `(dir, name)` row. On success `rec.id`, `rec.parent` and
-    /// `rec.ext_id` hold the values actually stored.
+    /// `rec.ext_id` hold the values actually stored, and `rec.py_full` /
+    /// `rec.py_init` hold the pinyin keys computed here from the name —
+    /// the single choke point, so callers never pass pinyin in.
     pub fn upsert_file(&mut self, dir_path: &[&str], rec: &mut FileRecord) -> Result<()> {
         let dir_id = resolve_dir(&self.conn, dir_path)?;
         let ext_id = intern_extension(&self.conn, &rec.name)?;
+        let (py_full, py_init) = pinyin_keys(&rec.name);
         // u64 columns (size, hashes) are stored as SQLite's signed 64-bit
         // integers via a bit-preserving cast.
         let id: FileId = self.conn.query_row(
-            "INSERT INTO files(dir, name, size, mtime, ctime, atime, ext_id, is_dir, hash_first, hash_full)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO files(dir, name, size, mtime, ctime, atime, ext_id, is_dir, hash_first, hash_full, py_full, py_init)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(dir, name) DO UPDATE SET
                size = excluded.size,
                mtime = excluded.mtime,
@@ -57,7 +69,9 @@ impl Store {
                ext_id = excluded.ext_id,
                is_dir = excluded.is_dir,
                hash_first = excluded.hash_first,
-               hash_full = excluded.hash_full
+               hash_full = excluded.hash_full,
+               py_full = excluded.py_full,
+               py_init = excluded.py_init
              RETURNING id",
             params![
                 dir_id,
@@ -70,12 +84,16 @@ impl Store {
                 rec.is_dir,
                 rec.hash_first.map(|h| h as i64),
                 rec.hash_full.map(|h| h as i64),
+                py_full,
+                py_init,
             ],
             |row| row.get(0),
         )?;
         rec.id = id;
         rec.parent = dir_id;
         rec.ext_id = ext_id;
+        rec.py_full = py_full;
+        rec.py_init = py_init;
         Ok(())
     }
 
@@ -145,12 +163,12 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Every `files` row as a [`FileRecord`] with `id`, `parent` and
-    /// `ext_id` filled from the database, id-ordered. Read source for the
-    /// hot index's whole-table load.
+    /// Every `files` row as a [`FileRecord`] with `id`, `parent`,
+    /// `ext_id` and the pinyin keys filled from the database, id-ordered.
+    /// Read source for the hot index's whole-table load.
     pub fn all_files(&self) -> Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, dir, name, size, mtime, ctime, atime, ext_id, is_dir, hash_first, hash_full
+            "SELECT id, dir, name, size, mtime, ctime, atime, ext_id, is_dir, hash_first, hash_full, py_full, py_init
              FROM files ORDER BY id",
         )?;
         // u64 columns round-trip the same bit-preserving casts upsert used.
@@ -167,6 +185,8 @@ impl Store {
                 is_dir: row.get::<_, i64>(8)? != 0,
                 hash_first: row.get::<_, Option<i64>>(9)?.map(|h| h as u64),
                 hash_full: row.get::<_, Option<i64>>(10)?.map(|h| h as u64),
+                py_full: row.get(11)?,
+                py_init: row.get(12)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -194,17 +214,46 @@ impl Store {
 
 /// Applies pending schema migrations and records the resulting version in
 /// `PRAGMA user_version`. Reopening an already-migrated database is a no-op;
-/// a database written by a newer schema version is left untouched.
-fn migrate(conn: &Connection) -> Result<()> {
+/// a database written by a newer schema version is left untouched. The steps
+/// run in one transaction (SQLite DDL is transactional), so a crash
+/// mid-migration cannot leave a half-migrated schema behind.
+fn migrate(conn: &mut Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version >= SCHEMA_VERSION {
         return Ok(());
     }
+    let tx = conn.transaction()?;
     if version < 1 {
-        conn.execute_batch(SCHEMA_V1_SQL)?;
+        tx.execute_batch(SCHEMA_V1_SQL)?;
     }
-    // Later schema steps append `if version < 2 { ... }` blocks here.
-    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    if version < 2 {
+        tx.execute_batch(SCHEMA_V2_SQL)?;
+        backfill_pinyin_keys(&tx)?;
+    }
+    // Later schema steps append `if version < 3 { ... }` blocks here.
+    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// One-time v2 step: recompute the pinyin keys for every row written before
+/// the columns existed. A whole-table pass at open time is the sanctioned
+/// one-time cost.
+fn backfill_pinyin_keys(conn: &Connection) -> Result<()> {
+    // Collect first, update after: keeps the read cursor closed while
+    // writing and mirrors the whole-table loads elsewhere.
+    let rows: Vec<(FileId, String)> = {
+        let mut select = conn.prepare("SELECT id, name FROM files")?;
+        let mapped = select.query_map([], |row| {
+            Ok((row.get::<_, FileId>(0)?, row.get::<_, String>(1)?))
+        })?;
+        mapped.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut update = conn.prepare("UPDATE files SET py_full = ?1, py_init = ?2 WHERE id = ?3")?;
+    for (id, name) in rows {
+        let (py_full, py_init) = pinyin_keys(&name);
+        update.execute(params![py_full, py_init, id])?;
+    }
     Ok(())
 }
 
@@ -309,6 +358,7 @@ fn intern_extension(conn: &Connection, name: &str) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
+    use super::SCHEMA_V1_SQL;
     use crate::model::FileRecord;
     use crate::store::Store;
     use crate::SynsoError;
@@ -328,6 +378,8 @@ mod tests {
             is_dir: false,
             hash_first: Some(0x00ff_00ff),
             hash_full: None,
+            py_full: String::new(),
+            py_init: String::new(),
         }
     }
 
@@ -336,23 +388,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("index.db");
 
-        // First open: schema created, user_version bumped to 1.
+        // First open: schema created, user_version bumped to 2.
         {
             let store = Store::open(&db_path).unwrap();
             let version: i64 = store
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 1);
+            assert_eq!(version, 2);
         }
 
-        // Second open on the same file: no error, still at 1 (idempotent).
+        // Second open on the same file: no error, still at 2 (idempotent).
         let store = Store::open(&db_path).unwrap();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
 
         // Every v1 table exists and starts empty.
         for table in [
@@ -513,6 +565,88 @@ mod tests {
             store.delete_subtree(&[]),
             Err(SynsoError::BadQuery(_))
         ));
+    }
+
+    #[test]
+    fn upsert_persists_pinyin_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
+
+        let mut report = rec("报告.docx", 10);
+        store.upsert_file(&["docs"], &mut report).unwrap();
+        // ... and handed them back on the record, like id/parent/ext_id.
+        assert_eq!(report.py_full, "baogao.docx");
+        assert_eq!(report.py_init, "bg.docx");
+
+        // The upsert choke point computed and persisted both keys from the
+        // name — callers never pass pinyin in.
+        let (py_full, py_init): (String, String) = store
+            .conn
+            .query_row(
+                "SELECT py_full, py_init FROM files WHERE id = ?1",
+                params![report.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(py_full, "baogao.docx");
+        assert_eq!(py_init, "bg.docx");
+    }
+
+    #[test]
+    fn migration_v2_backfills_pinyin_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        // A database frozen at schema v1, with rows written before the
+        // pinyin columns existed.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(SCHEMA_V1_SQL).unwrap();
+            conn.execute_batch(
+                "INSERT INTO dirs(id, parent, name) VALUES (1, NULL, 'docs');
+                 INSERT INTO files(dir, name, size, ext_id, is_dir) VALUES
+                   (1, '报告.docx', 10, 0, 0),
+                   (1, '文件ABC', 10, 0, 0);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+
+        // Opening migrates to v2 and backfills the new columns in place.
+        let store = Store::open(&db_path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        for (name, py_full, py_init) in [
+            ("报告.docx", "baogao.docx", "bg.docx"),
+            ("文件ABC", "wenjianabc", "wjabc"),
+        ] {
+            let (full, init): (String, String) = store
+                .conn
+                .query_row(
+                    "SELECT py_full, py_init FROM files WHERE name = ?1",
+                    params![name],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(full, py_full, "py_full backfilled for {name}");
+            assert_eq!(init, py_init, "py_init backfilled for {name}");
+        }
+
+        // Reopening the migrated database is a no-op and keeps the values.
+        drop(store);
+        let store = Store::open(&db_path).unwrap();
+        let full: String = store
+            .conn
+            .query_row(
+                "SELECT py_full FROM files WHERE name = '报告.docx'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(full, "baogao.docx");
     }
 
     #[test]

@@ -6,6 +6,7 @@
 pub mod engine;
 pub mod hotindex;
 pub mod model;
+pub mod pinyin;
 pub mod query;
 pub mod scanner;
 pub mod store;
@@ -14,6 +15,7 @@ pub mod volumes;
 pub use engine::{DedupPhase, Engine, EngineEvent, EngineOptions, EngineStats};
 pub use hotindex::HotIndex;
 pub use model::{FileId, FileRecord};
+pub use pinyin::pinyin_keys;
 pub use query::{Hit, SearchResult};
 pub use scanner::{is_placeholder_attr, scan, ScanOptions, ScanStats};
 pub use store::Store;

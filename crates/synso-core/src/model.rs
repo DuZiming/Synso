@@ -26,4 +26,12 @@ pub struct FileRecord {
     pub hash_first: Option<u64>,
     /// Whole-file hash, if computed.
     pub hash_full: Option<u64>,
+    /// Full-pinyin search key ("baogao.docx"): Han chars expand to their
+    /// first reading, everything else passes through lowercased. Computed
+    /// and assigned by [`crate::store::Store::upsert_file`]; callers
+    /// constructing records leave it empty.
+    pub py_full: String,
+    /// First-letter pinyin key ("bg.docx"), same generation rule as
+    /// [`FileRecord::py_full`]. Also store-assigned.
+    pub py_init: String,
 }

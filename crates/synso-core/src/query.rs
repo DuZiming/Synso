@@ -3,9 +3,13 @@
 //! within-class recency boost, deterministic path tie-breaks and
 //! limit/offset paging.
 //!
-//! Match target (v1): the lowercased NAME arena only — path matching (the
-//! Task 7 `path:` filter) and pinyin keys (Task 5) arrive later and will
-//! widen WHAT is matched, not how results are ranked or paged.
+//! Match target (v1): the lowercased NAME arena plus the two pinyin key
+//! arenas (`py_full` / `py_init`) — a query hits when it substring-matches
+//! any of the three. Literal name matches keep their prefix/word-start/
+//! substring class; pinyin-only matches always classify as Substring, so
+//! they never outrank a literal match of the same file. Path matching (the
+//! Task 7 `path:` filter) arrives later and will widen WHAT is matched,
+//! not how results are ranked or paged.
 //!
 //! Performance shape: one linear pass collects a small
 //! `(class, recency, path_len, slot)` key per match — never a path string
@@ -103,12 +107,14 @@ struct Scored {
     slot: usize,
 }
 
-/// The substring pass: classify every name-arena hit, rank, return slots in
-/// final order.
+/// The substring pass: classify every name/pinyin hit, rank, return slots
+/// in final order.
 fn match_slots(hot: &HotIndex, query: &str, now: i64) -> Vec<usize> {
     let mut keys: Vec<Scored> = Vec::new();
     for slot in 0..hot.slot_count() {
-        let Some(class) = classify(hot.name_lower(slot), query) else {
+        let Some(class) =
+            classify(hot.name_lower(slot), query).or_else(|| pinyin_class(hot, slot, query))
+        else {
             continue;
         };
         keys.push(Scored {
@@ -229,6 +235,19 @@ fn cmp_segment_with_sep(x: &[u8], y: &[u8], sep: u8) -> Ordering {
     }
 }
 
+/// Pinyin fallback (both sides already lowercased; the query is non-empty
+/// here): a query that misses the literal name but substring-matches
+/// either pinyin key is a [`MatchClass::Substring`] hit — position inside
+/// the key does not matter, so pinyin never outranks a literal match of
+/// the same file (or any other file's literal Prefix/WordStart hit).
+fn pinyin_class(hot: &HotIndex, slot: usize, query: &str) -> Option<MatchClass> {
+    if hot.py_full(slot).contains(query) || hot.py_init(slot).contains(query) {
+        Some(MatchClass::Substring)
+    } else {
+        None
+    }
+}
+
 /// Where `query` (both sides already lowercased) matches inside `name`:
 /// [`MatchClass::Prefix`] for an occurrence at index 0,
 /// [`MatchClass::WordStart`] when some occurrence starts right after a
@@ -290,6 +309,8 @@ mod tests {
                 is_dir: *is_dir,
                 hash_first: None,
                 hash_full: None,
+                py_full: String::new(),
+                py_init: String::new(),
             };
             store.upsert_file(dir_path, &mut rec).unwrap();
         }
@@ -515,6 +536,42 @@ mod tests {
 
         // A query matching nothing is an empty result, not a panic.
         assert_eq!(engine.search("不存在的名字xyz", 0, 10).total, 0);
+    }
+
+    #[test]
+    fn search_pinyin_full_and_initials() {
+        let hot = indexed(&[
+            (&["docs"], "报告.docx", NOW - DAY, false),
+            // A literal "bg" name match; must outrank the pinyin-only hit
+            // even though it is the older file.
+            (&["docs"], "bg.txt", NOW - 90 * DAY, false),
+        ]);
+
+        // The full-pinyin query hits via py_full ("baogao.docx").
+        let res = run(&hot, "baogao", 0, 10, NOW);
+        assert_eq!(res.total, 1);
+        assert_eq!(names(&res), vec!["报告.docx"]);
+
+        // The initials query hits via py_init ("bg.docx") — and the literal
+        // name match keeps its Prefix class, ranking above the pinyin-only
+        // Substring match despite being older.
+        let res = run(&hot, "bg", 0, 10, NOW);
+        assert_eq!(res.total, 2);
+        assert_eq!(names(&res), vec!["bg.txt", "报告.docx"]);
+    }
+
+    #[test]
+    fn search_pinyin_prefix() {
+        let hot = indexed(&[(&["docs"], "年度报告.docx", NOW - DAY, false)]);
+
+        // A pinyin-prefix query ("baog" is the start of "baogao...") is a
+        // substring hit on py_full ("niandubaogao.docx").
+        let res = run(&hot, "baog", 0, 10, NOW);
+        assert_eq!(res.total, 1);
+        assert_eq!(names(&res), vec!["年度报告.docx"]);
+
+        // A query that matches neither the name nor either key stays out.
+        assert_eq!(run(&hot, "gaoz", 0, 10, NOW).total, 0);
     }
 
     #[test]
