@@ -172,6 +172,16 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Every `extensions` row as `(id, ext)`, id-ordered. Read source for
+    /// the hot index's ext-string lookup (`Hit.ext`).
+    pub fn all_extensions(&self) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, ext FROM extensions ORDER BY id")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn set_meta(&self, key: &str, val: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES (?1, ?2)
@@ -518,6 +528,12 @@ mod tests {
 
         assert!(upper.ext_id > 0, "dotted extension interns to a real row");
         assert_eq!(plain.ext_id, 0, "no extension maps to ext_id 0");
+
+        // The whole table reads back id-ordered for the hot-index load.
+        assert_eq!(
+            store.all_extensions().unwrap(),
+            vec![(upper.ext_id, "zip".to_string())]
+        );
 
         let conn = Connection::open(&db_path).unwrap();
         let ext: String = conn

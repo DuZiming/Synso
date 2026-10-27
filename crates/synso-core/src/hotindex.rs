@@ -1,8 +1,8 @@
-//! Hot index: the in-memory mirror of the store that search will run
-//! against (Task 5). The engine bulk-loads it from SQLite at startup and
-//! swaps in a fresh copy after every completed scan — wholesale rebuild is
-//! the v1 correctness story; live incremental updates arrive with the
-//! filesystem watcher (Task 8).
+//! Hot index: the in-memory mirror of the store that search runs against
+//! (Task 4). The engine bulk-loads it from SQLite at startup and swaps in a
+//! fresh copy after every completed scan — wholesale rebuild is the v1
+//! correctness story; live incremental updates arrive with the filesystem
+//! watcher (Task 8).
 //!
 //! Shape: an interned directory tree keyed by the database's `dirs` row
 //! ids (hot-index dir ids and store dir ids are the same numbers), plus
@@ -15,6 +15,7 @@
 //! they are deliberately not built yet.
 
 use std::collections::HashMap;
+use std::path::MAIN_SEPARATOR;
 
 use crate::model::{FileId, FileRecord};
 use crate::store::Store;
@@ -37,6 +38,9 @@ pub struct HotIndex {
     names_lower: Vec<String>,
     /// Name arena preserving the original spelling (display, rebuilds).
     names_orig: Vec<String>,
+    /// `files` row id per slot (search hits expose the store id, which
+    /// later tasks key on; the slot index itself is internal).
+    ids: Vec<FileId>,
     /// Containing directory's `dirs` row id per slot.
     parents: Vec<FileId>,
     /// File size in bytes per slot (0 for directory entries).
@@ -45,6 +49,9 @@ pub struct HotIndex {
     mtimes: Vec<i64>,
     /// Interned extension id per slot (0 = no extension).
     ext_ids: Vec<i64>,
+    /// Extension text per ext id, loaded from the `extensions` table
+    /// (`Hit.ext`); ext id 0 (no extension) has no row.
+    exts: HashMap<FileId, String>,
     /// Directory-entry flag per slot.
     is_dirs: Vec<bool>,
     /// Non-directory slot count, cached for O(1) stats.
@@ -64,8 +71,9 @@ impl HotIndex {
         HotIndex::default()
     }
 
-    /// Loads the full `dirs` and `files` tables from `store` into a fresh,
-    /// warm index. Whole-table read by design (see module docs).
+    /// Loads the full `dirs`, `extensions` and `files` tables from `store`
+    /// into a fresh, warm index. Whole-table read by design (see module
+    /// docs).
     pub fn load(store: &Store) -> Result<HotIndex> {
         let mut index = HotIndex {
             warm: true,
@@ -74,6 +82,9 @@ impl HotIndex {
         for (id, parent, name) in store.all_dirs()? {
             index.interned_bytes += name.len() as u64;
             index.dirs.insert(id, DirEntry { parent, name });
+        }
+        for (id, ext) in store.all_extensions()? {
+            index.exts.insert(id, ext);
         }
         for rec in store.all_files()? {
             index.push(rec);
@@ -93,6 +104,7 @@ impl HotIndex {
         }
         self.names_lower.push(lower);
         self.names_orig.push(rec.name);
+        self.ids.push(rec.id);
         self.parents.push(rec.parent);
         self.sizes.push(rec.size);
         self.mtimes.push(rec.mtime);
@@ -117,12 +129,87 @@ impl HotIndex {
 
     /// The interned dir row for a store `dirs` id: `(parent, name)`, or
     /// `None` when the id is not interned. Path reconstruction for search
-    /// results (Task 5) is the real consumer; tests use it to pin the
+    /// results (Task 4) is the real consumer; tests use it to pin the
     /// parent linkage.
     pub fn dir_row(&self, id: FileId) -> Option<(Option<FileId>, &str)> {
         self.dirs
             .get(&id)
             .map(|entry| (entry.parent, entry.name.as_str()))
+    }
+
+    /// Entry count (files + directory entries): the arena length.
+    pub fn slot_count(&self) -> usize {
+        self.names_lower.len()
+    }
+
+    /// The `files` row id of `slot`.
+    pub fn file_id(&self, slot: usize) -> FileId {
+        self.ids[slot]
+    }
+
+    /// The extension text interned for `ext_id` (from the `extensions`
+    /// table); `""` for the no-extension sentinel 0 and unknown ids.
+    pub fn ext_of(&self, ext_id: FileId) -> &str {
+        self.exts.get(&ext_id).map_or("", String::as_str)
+    }
+
+    /// Original-case dir names from the root segment down to `slot`'s
+    /// containing directory, root first ([`HotIndex::path_of`] appends the
+    /// entry's own name to this chain).
+    pub fn dir_chain(&self, slot: usize) -> Vec<&str> {
+        let mut chain: Vec<&str> = Vec::new();
+        self.walk_chain(slot, |name| chain.push(name));
+        chain.reverse();
+        chain
+    }
+
+    /// Full path of `slot` rebuilt from the interned dir tree: root
+    /// segment, ..., parent dirs, entry name — original spelling, joined
+    /// with `std::path::MAIN_SEPARATOR`. This is the index-relative
+    /// spelling the scanner stores (leading root segment, no drive
+    /// prefix).
+    pub fn path_of(&self, slot: usize) -> String {
+        let mut segments = self.dir_chain(slot);
+        segments.push(self.names_orig[slot].as_str());
+        let bytes =
+            segments.iter().map(|seg| seg.len()).sum::<usize>() + segments.len().saturating_sub(1);
+        let mut path = String::with_capacity(bytes);
+        for (i, segment) in segments.iter().enumerate() {
+            if i > 0 {
+                path.push(MAIN_SEPARATOR);
+            }
+            path.push_str(segment);
+        }
+        path
+    }
+
+    /// Byte length of [`HotIndex::path_of`] for `slot` without building
+    /// the string — the ranking pass needs it for every match.
+    pub fn path_len(&self, slot: usize) -> u64 {
+        let mut len = self.names_orig[slot].len() as u64;
+        self.walk_chain(slot, |name| len += name.len() as u64 + 1); // + separator
+        len
+    }
+
+    /// Shared chain walk: `visit(dir_name)` for every dir from `slot`'s
+    /// parent up to the root, stopping at a missing row, at a root, or
+    /// after `dirs.len() + 1` steps — the tree cannot be deeper than its
+    /// node count, so even a corrupt parent cycle (impossible via the
+    /// store's API) terminates.
+    fn walk_chain<'a, V: FnMut(&'a str)>(&'a self, slot: usize, mut visit: V) {
+        let mut budget = self.dirs.len() + 1;
+        let mut current = self.parents[slot];
+        while budget > 0 {
+            budget -= 1;
+            let Some((parent, name)) = self.dir_row(current) else {
+                break;
+            };
+            visit(name);
+            match parent {
+                Some(id) => current = id,
+                None => break,
+            }
+        }
     }
 
     /// True once the initial full load completed.
@@ -261,5 +348,36 @@ mod tests {
         assert_eq!((cold.file_count(), cold.dir_count()), (0, 0));
         assert_eq!(cold.interned_bytes(), 0);
         assert_eq!(cold.dir_tree_len(), 0);
+    }
+
+    #[test]
+    fn path_reconstruction_and_ext_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
+
+        let mut alpha = rec("Alpha.TXT", false);
+        store.upsert_file(&["docs"], &mut alpha).unwrap();
+        let mut memo = rec("memo.md", false);
+        store.upsert_file(&["docs", "inner"], &mut memo).unwrap();
+
+        let hot = HotIndex::load(&store).unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+
+        // Slots are id-ordered, so the upsert order fixes them here.
+        assert_eq!(hot.slot_count(), 2);
+        assert_eq!(hot.file_id(0), alpha.id, "the files row id travels");
+        assert_eq!(hot.file_id(1), memo.id);
+        // Paths rebuild root -> ... -> parent -> name in original spelling.
+        assert_eq!(hot.path_of(0), format!("docs{sep}Alpha.TXT"));
+        assert_eq!(hot.path_of(1), format!("docs{sep}inner{sep}memo.md"));
+        assert_eq!(hot.dir_chain(1), vec!["docs", "inner"]);
+        assert_eq!(
+            hot.path_len(1),
+            format!("docs{sep}inner{sep}memo.md").len() as u64
+        );
+        // Extension text comes from the extensions table; 0 means "".
+        assert_eq!(hot.ext_of(alpha.ext_id), "txt");
+        assert_eq!(hot.ext_of(memo.ext_id), "md");
+        assert_eq!(hot.ext_of(0), "");
     }
 }

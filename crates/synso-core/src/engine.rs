@@ -33,10 +33,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
 use crate::hotindex::HotIndex;
+use crate::query::{self, SearchResult};
 use crate::scanner::{self, effective_roots, root_segment, ScanOptions};
 use crate::store::Store;
 use crate::Result;
@@ -184,11 +186,32 @@ impl Engine {
             interned_bytes: hot.interned_bytes(),
         }
     }
+
+    /// Case-insensitive substring search over the hot index's name arena
+    /// (see [`crate::query`] for the full contract). Ranking: prefix >
+    /// word-start > substring, a within-class boost for mtimes within the
+    /// last 30 days, then shorter path, then lexicographic path; an empty
+    /// `text` lists the most recent entries by mtime (ties: path asc).
+    /// `hits` covers `[offset, offset + limit)` of that ordering, `total`
+    /// is the full match count. A cold index returns an empty result —
+    /// this never panics.
+    pub fn search(&self, text: &str, offset: u32, limit: u32) -> SearchResult {
+        let hot = read_unpoisoned(&self.hot);
+        query::run(&hot, text, offset, limit, unix_now())
+    }
 }
 
 /// Sends `event` to every live subscriber, dropping disconnected ones.
 fn broadcast(subscribers: &Arc<Mutex<Vec<Sender<EngineEvent>>>>, event: EngineEvent) {
     lock_unpoisoned(subscribers).retain(|sender| sender.send(event.clone()).is_ok());
+}
+
+/// Current Unix-epoch seconds (0 if the clock reads pre-epoch); the query
+/// time the search recency window is measured against.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() as i64)
 }
 
 /// Poison-tolerant locking for the engine's three locks (see the module
