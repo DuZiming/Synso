@@ -210,6 +210,18 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Raw read access for sibling modules in this crate (the collections
+    /// layer runs its SQL through this). Keeps every statement in the crate
+    /// on the one connection `Store` owns.
+    pub(crate) fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// `conn`, for statements that mutate (and `BEGIN`).
+    pub(crate) fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
+    }
 }
 
 /// Applies pending schema migrations and records the resulting version in

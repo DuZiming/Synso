@@ -3,6 +3,7 @@
 //! This crate must stay UI-free and dependency-light (never depend on tauri)
 //! so the scanner/engine layers built on it remain embeddable and testable.
 
+pub mod collections;
 pub mod engine;
 pub mod hotindex;
 pub mod model;
@@ -12,6 +13,7 @@ pub mod scanner;
 pub mod store;
 pub mod volumes;
 
+pub use collections::{Collection, MemberHit};
 pub use engine::{DedupPhase, Engine, EngineEvent, EngineOptions, EngineStats};
 pub use hotindex::HotIndex;
 pub use model::{FileId, FileRecord};
@@ -33,6 +35,10 @@ pub enum SynsoError {
     /// Target row does not exist.
     #[error("not found")]
     NotFound,
+    /// Requested state conflicts with what already exists (e.g. a
+    /// collection name is already taken).
+    #[error("conflict: {0}")]
+    Conflict(String),
     /// Malformed input from the caller.
     #[error("bad query: {0}")]
     BadQuery(String),

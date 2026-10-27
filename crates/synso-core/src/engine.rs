@@ -12,7 +12,9 @@
 //! fresh reload can never be overwritten by a stale loader snapshot. One
 //! scan at a time: [`Engine::start_full_scan`] is a no-op while a scan is
 //! running; the slot is released by a drop guard, so even a panicked scan
-//! cannot wedge the engine.
+//! cannot wedge the engine. A successful scan also runs the collections
+//! reconcile (tombstone + rebind, see [`crate::collections`]) inside the
+//! same store critical section, before `ScanFinished` is emitted.
 //!
 //! Failure semantics: a scan that aborts with a store error emits
 //! [`EngineEvent::ScanFailed`] instead of `ScanFinished` and does NOT swap
@@ -37,7 +39,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
+use crate::collections::{self, Collection, MemberHit};
 use crate::hotindex::HotIndex;
+use crate::model::FileId;
 use crate::query::{self, SearchResult};
 use crate::scanner::{self, effective_roots, root_segment, ScanOptions};
 use crate::store::Store;
@@ -199,6 +203,53 @@ impl Engine {
         let hot = read_unpoisoned(&self.hot);
         query::run(&hot, text, offset, limit, unix_now())
     }
+
+    /// Creates a virtual collection. A duplicate name is
+    /// `Err(SynsoError::Conflict)`. See [`crate::collections`].
+    pub fn coll_create(&self, name: &str) -> Result<Collection> {
+        collections::create(&mut lock_unpoisoned(&self.store), name)
+    }
+
+    /// Renames a collection (`Err(NotFound)` for an unknown id,
+    /// `Err(Conflict)` when the name is taken).
+    pub fn coll_rename(&self, id: i64, name: &str) -> Result<()> {
+        collections::rename(&mut lock_unpoisoned(&self.store), id, name)
+    }
+
+    /// Deletes a collection and every member row it owns.
+    pub fn coll_delete(&self, id: i64) -> Result<()> {
+        collections::delete(&mut lock_unpoisoned(&self.store), id)
+    }
+
+    /// Every collection, id-ordered. A store error is logged and yields an
+    /// empty list (listing is a read-side convenience, never fatal).
+    pub fn coll_list(&self) -> Vec<Collection> {
+        collections::list(&lock_unpoisoned(&self.store)).unwrap_or_else(|err| {
+            eprintln!("synso: listing collections failed: {err}");
+            Vec::new()
+        })
+    }
+
+    /// Adds file OR folder row ids to a collection, snapshotting each
+    /// entry's current name and size (the later rebind key).
+    pub fn coll_add(&self, id: i64, members: &[FileId]) -> Result<()> {
+        collections::add(&mut lock_unpoisoned(&self.store), id, members)
+    }
+
+    /// Removes one member row (alive or tombstoned) from a collection.
+    pub fn coll_remove(&self, id: i64, member: FileId) -> Result<()> {
+        collections::remove(&mut lock_unpoisoned(&self.store), id, member)
+    }
+
+    /// The collection's members, tombstoned ones included (their `hit` is
+    /// synthesized from the snapshot — see [`crate::collections::MemberHit`]).
+    /// A store error is logged and yields an empty list.
+    pub fn coll_members(&self, id: i64) -> Vec<MemberHit> {
+        collections::members(&lock_unpoisoned(&self.store), id).unwrap_or_else(|err| {
+            eprintln!("synso: listing members of collection {id} failed: {err}");
+            Vec::new()
+        })
+    }
 }
 
 /// Sends `event` to every live subscriber, dropping disconnected ones.
@@ -271,6 +322,14 @@ fn scan_cycle(
             // ScanFinished already see fresh stats. On failure the hot
             // index keeps serving the last known-good snapshot.
             reload_hot_index_locked(&guard, &hot);
+            // Collection reconcile (tombstone + rebind, see `collections`)
+            // runs in the same store critical section, after the hot
+            // reload and before ScanFinished, so subscribers see member
+            // state consistent with the fresh index. Best-effort: the scan
+            // itself succeeded, so a reconcile error is logged, not fatal.
+            if let Err(err) = collections::reconcile(&mut guard) {
+                eprintln!("synso: collection reconcile after scan failed: {err}");
+            }
             (stats.files, stats.dirs)
         })
     };
