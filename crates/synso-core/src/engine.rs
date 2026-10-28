@@ -159,7 +159,11 @@ pub struct Engine {
     store: Arc<Mutex<Store>>,
     hot: Arc<RwLock<HotIndex>>,
     subscribers: Arc<Mutex<Vec<Sender<EngineEvent>>>>,
-    scan_opts: ScanOptions,
+    /// What the engine scans and skips. Behind a mutex so
+    /// [`Engine::set_scan_options`] can swap the scope live (the scan
+    /// thread clones it at spawn, so a running scan keeps its own
+    /// snapshot — same discipline as the watcher restart).
+    scan_opts: Mutex<ScanOptions>,
     scanning: Arc<AtomicBool>,
     /// Database location, kept so the watcher (Task 8) can filter out the
     /// store's own writes.
@@ -185,9 +189,13 @@ struct DedupShared {
     book: Mutex<DedupBookkeeping>,
     /// Store access for the snapshot read and short persist batches.
     store: Arc<Mutex<Store>>,
-    /// Effective scan roots (plain spellings), precomputed once at open so
+    /// Effective scan roots (plain spellings), precomputed at open so
     /// path resolution never re-enumerates volumes per hashed file.
-    roots: Vec<String>,
+    /// Behind an RwLock so [`Engine::set_scan_options`] keeps the mapping
+    /// in step with the live scope (a stale entry would leave search hits
+    /// that resolve/open/trash cannot map back to disk); a dedup run
+    /// snapshots it once at start.
+    roots: RwLock<Vec<String>>,
     /// Event fan-out (DedupProgress / DedupFinished).
     subscribers: Arc<Mutex<Vec<Sender<EngineEvent>>>>,
 }
@@ -217,14 +225,14 @@ impl Engine {
                 groups: Arc::new(Vec::new()),
             }),
             store: Arc::clone(&store),
-            roots: effective_roots(&scan_opts.roots),
+            roots: RwLock::new(effective_roots(&scan_opts.roots)),
             subscribers: Arc::clone(&subscribers),
         });
         let engine = Engine {
             store: Arc::clone(&store),
             hot: hot.clone(),
             subscribers,
-            scan_opts,
+            scan_opts: Mutex::new(scan_opts),
             scanning: Arc::new(AtomicBool::new(false)),
             db_path: db_path.to_path_buf(),
             watcher: Mutex::new(None),
@@ -270,7 +278,10 @@ impl Engine {
             let hot = self.hot.clone();
             let subscribers = self.subscribers.clone();
             let scanning = self.scanning.clone();
-            let opts = self.scan_opts.clone();
+            // One snapshot of the LIVE scope (see `set_scan_options`): a
+            // scan already walking keeps its own opts, so a scope swap
+            // mid-scan takes effect on the next scan, not this one.
+            let opts = lock_unpoisoned(&self.scan_opts).clone();
             let dedup = Arc::clone(&self.dedup);
             let autostarted = Arc::clone(&self.dedup_autostarted);
             move || scan_cycle(store, hot, subscribers, scanning, opts, dedup, autostarted)
@@ -301,16 +312,87 @@ impl Engine {
         if slot.is_some() {
             return Ok(());
         }
-        let roots = effective_roots(&self.scan_opts.roots);
+        let (roots, exclusions) = {
+            let opts = lock_unpoisoned(&self.scan_opts);
+            (effective_roots(&opts.roots), opts.exclusions.clone())
+        };
         let watcher = Watcher::start(
             &roots,
-            &self.scan_opts.exclusions,
+            &exclusions,
             &self.db_path,
             Arc::clone(&self.store),
             Arc::clone(&self.hot),
             Arc::clone(&self.subscribers),
         )?;
         *slot = Some(watcher);
+        Ok(())
+    }
+
+    /// Replaces the scan scope LIVE — the engine half of making
+    /// `Settings.volumes` / `Settings.exclusions` real (the app shell's
+    /// settings flow calls this on a scope change; `set_settings` only
+    /// persists). `volumes` empty = all fixed local volumes (the standing
+    /// semantics); `exclusions` are the scan/watcher glob patterns.
+    ///
+    /// Under the store lock: swap the options, purge the index subtrees
+    /// of roots that LEFT the scope (out-of-scope rows must not linger in
+    /// search — the same per-root purge a scan performs for its roots),
+    /// reload the hot index wholesale (the scan's own swap discipline),
+    /// and update the dedup root mapping. A watcher that was running
+    /// restarts on the new roots + matcher; an engine that never started
+    /// one stays watcher-less (the explicit-start contract). A bad
+    /// pattern fails BEFORE any mutation (the matcher compiles first), so
+    /// the caller can surface it and keep the previous scope untouched.
+    ///
+    /// Blocking: the store lock serializes against an in-flight scan's
+    /// whole walk (exactly like a watcher batch), so this returns once
+    /// any running scan finishes; the newly added roots' rows appear on
+    /// the NEXT scan of them. Removed-root rows are gone immediately.
+    pub fn set_scan_options(&self, volumes: Vec<String>, exclusions: Vec<String>) -> Result<()> {
+        let new_opts = ScanOptions {
+            roots: volumes,
+            exclusions,
+        };
+        // Validate before mutating: a bad glob is a caller error.
+        scanner::build_matcher(&new_opts.exclusions)?;
+
+        // Stop the old watcher BEFORE the store lock: its apply thread
+        // takes that lock, so joining while holding it could deadlock.
+        // The taken `Watcher` drops (stop + join) right away, lock-free.
+        let had_watcher = lock_unpoisoned(&self.watcher).take().is_some();
+
+        let removed = {
+            let mut scan_opts = lock_unpoisoned(&self.scan_opts);
+            let old_effective = effective_roots(&scan_opts.roots);
+            let new_effective = effective_roots(&new_opts.roots);
+            let removed: Vec<String> = old_effective
+                .iter()
+                .filter(|root| !new_effective.contains(root))
+                .cloned()
+                .collect();
+            let mut store = lock_unpoisoned(&self.store);
+            for root in &removed {
+                let segment = root_segment(Path::new(root));
+                if let Err(err) = store.delete_subtree(&[segment.as_str()]) {
+                    log::error!("synso: failed to purge the out-of-scope root {root:?}: {err}");
+                }
+            }
+            // Keep the dedup path mapping in step (see DedupShared::roots).
+            *write_unpoisoned(&self.dedup.roots) = new_effective;
+            *scan_opts = new_opts;
+            reload_hot_index_locked(&store, &self.hot);
+            removed
+        };
+        if !removed.is_empty() {
+            log::info!(
+                "synso: scan scope changed; purged {} out-of-scope root(s)",
+                removed.len()
+            );
+        }
+
+        if had_watcher {
+            self.start_watcher()?;
+        }
         Ok(())
     }
 
@@ -500,7 +582,7 @@ impl Engine {
     /// consumers straddle the crate and app layers, like
     /// `crate::scanner::is_placeholder_attr`.
     pub fn resolve_absolute(&self, index_path: &str) -> Option<PathBuf> {
-        dedup::resolve_absolute_path(&self.dedup.roots, index_path)
+        dedup::resolve_absolute_path(&read_unpoisoned(&self.dedup.roots), index_path)
     }
 
     /// The live hot-index hit behind a `files` row id — the id → hit step
@@ -868,7 +950,10 @@ fn dedup_cycle(dedup: Arc<DedupShared>) {
         );
     };
     let reader = dedup::RealFileReader;
-    let outcome = dedup::run_pipeline(&dedup.store, &dedup.roots, &reader, &progress);
+    // One snapshot of the live root mapping for this run (the scope can
+    // change mid-run; the next run picks it up).
+    let roots = read_unpoisoned(&dedup.roots).clone();
+    let outcome = dedup::run_pipeline(&dedup.store, &roots, &reader, &progress);
     let groups = outcome.groups.len() as u64;
     let hashed = outcome.hashed_first + outcome.hashed_full;
     {
@@ -968,6 +1053,145 @@ mod tests {
         let root = write_fixture(tmp.path());
         let engine = open_engine(&tmp.path().join("index.db"), &root);
         assert!(!engine.is_scanning());
+    }
+
+    /// Bounded poll for async side effects (watcher batches).
+    fn wait_until(mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !cond() {
+            assert!(Instant::now() < deadline, "condition never became true");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// THE settings-scope contract (fix round 1 for Task 19): a live
+    /// exclusion swap (a) validates, (b) applies to the NEXT scan —
+    /// excluded files leave search and the hot index, the rest survive —
+    /// and (c) reaches the RESTARTED watcher, whose matcher must honor
+    /// the new patterns without an engine restart.
+    #[test]
+    fn set_scan_options_exclusions_apply_to_next_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = write_fixture(tmp.path());
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        let (_, files, dirs) = wait_scan_finished(&rx);
+        assert_eq!((files, dirs), (3, 2));
+        assert_eq!(engine.search("readme", 0, 10).total, 1);
+
+        // Exclude *.md live, rescan: readme.md is gone, the rest survive.
+        engine
+            .set_scan_options(
+                vec![root.to_string_lossy().into_owned()],
+                vec!["*.md".to_owned()],
+            )
+            .unwrap();
+        engine.start_full_scan();
+        let (_, files, dirs) = wait_scan_finished(&rx);
+        assert_eq!((files, dirs), (2, 2), "readme.md excluded");
+        assert_eq!(
+            engine.search("readme", 0, 10).total,
+            0,
+            "excluded file out of search"
+        );
+        assert_eq!(engine.search("notes.txt", 0, 10).total, 1);
+
+        // Watcher re-registration smoke: the restarted watcher derives
+        // the NEW matcher — a new .md file stays out, a .txt lands.
+        engine.start_watcher().unwrap();
+        fs::write(root.join("later.md"), b"skip").unwrap();
+        fs::write(root.join("later.txt"), b"keep").unwrap();
+        wait_until(|| engine.search("later.txt", 0, 10).total == 1);
+        assert_eq!(
+            engine.search("later.md", 0, 10).total,
+            0,
+            "the restarted watcher honors the exclusion"
+        );
+    }
+
+    /// Dropping a root from the live scope purges its index rows
+    /// SYNCHRONOUSLY — store, hot index and search lose the removed
+    /// root's data without any rescan, the kept root stays intact, and
+    /// the dedup path mapping stops resolving the removed root.
+    #[test]
+    fn set_scan_options_purges_removed_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root_a = write_fixture(tmp.path());
+        let root_b = tmp.path().join("other");
+        fs::create_dir_all(&root_b).unwrap();
+        fs::write(root_b.join("other.txt"), b"other").unwrap();
+
+        let engine = Engine::open(
+            &db_path,
+            EngineOptions {
+                volumes: vec![
+                    root_a.to_string_lossy().into_owned(),
+                    root_b.to_string_lossy().into_owned(),
+                ],
+                exclusions: Vec::new(),
+            },
+        )
+        .unwrap();
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        let (_, files, _) = wait_scan_finished(&rx);
+        assert_eq!(files, 4, "3 fixture + 1 other");
+        assert_eq!(engine.search("other.txt", 0, 10).total, 1);
+
+        // Drop root_b — no rescan needed.
+        engine
+            .set_scan_options(vec![root_a.to_string_lossy().into_owned()], Vec::new())
+            .unwrap();
+        assert_eq!(
+            engine.search("other.txt", 0, 10).total,
+            0,
+            "removed root out of search"
+        );
+        assert_eq!(
+            engine.stats().files,
+            3,
+            "hot index reloaded without the removed root"
+        );
+        assert_eq!(engine.search("readme", 0, 10).total, 1, "kept root intact");
+        let root_b_path = format!("other{}", std::path::MAIN_SEPARATOR);
+        assert_eq!(
+            engine.resolve_absolute(&root_b_path),
+            None,
+            "dedup mapping drops the removed root"
+        );
+
+        // Store-level truth: a fresh engine over the same DB (root_a
+        // scope) reloads exactly the kept rows.
+        let reopened = open_engine(&db_path, &root_a);
+        wait_warm(&reopened);
+        assert_eq!(reopened.stats().files, 3);
+    }
+
+    /// A bad pattern fails BEFORE any mutation: the error surfaces, the
+    /// scope stays as it was, and a subsequent scan indexes everything.
+    #[test]
+    fn set_scan_options_rejects_bad_pattern_without_side_effects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = write_fixture(tmp.path());
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        let err = engine
+            .set_scan_options(
+                vec![root.to_string_lossy().into_owned()],
+                vec!["[bad".to_owned()],
+            )
+            .expect_err("bad glob must fail");
+        assert!(matches!(err, crate::SynsoError::InvalidPattern(_)));
+
+        engine.start_full_scan();
+        let (_, files, _) = wait_scan_finished(&rx);
+        assert_eq!(files, 3, "the scope was left untouched");
     }
 
     /// Fixture tree: `fixture/{readme.md, docs/{notes.txt, final.pdf,

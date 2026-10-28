@@ -11,6 +11,8 @@
 //! convenience, never worth failing a startup over. Writes surface errors
 //! to the caller (`Engine::set_settings`).
 
+use std::path::Path;
+
 use crate::store::Store;
 use crate::Result;
 
@@ -88,6 +90,19 @@ pub fn load(store: &Store) -> Settings {
             })
             .unwrap_or(false),
     }
+}
+
+/// Reads the persisted settings straight from the database at `db_path`
+/// (a throwaway store connection). The startup hook for embedders that
+/// must know the scope BEFORE [`crate::Engine::open`]: the app passes
+/// `Settings.volumes` / `Settings.exclusions` into `EngineOptions`, so
+/// the user's chosen scope drives the FIRST scan instead of the defaults.
+/// A missing database is created (exactly what `Engine::open` would do),
+/// missing fields read as defaults, and a store error is an `Err` — the
+/// engine open right after would fail the same way.
+pub fn load_persisted(db_path: &Path) -> Result<Settings> {
+    let store = Store::open(db_path)?;
+    Ok(load(&store))
 }
 
 /// Writes every field of `settings` to `store` as its `settings.*` meta

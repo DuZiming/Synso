@@ -36,14 +36,31 @@ pub fn settings_get(state: State<'_, AppState>) -> Settings {
 }
 
 /// Persists the user settings; errors surface to the webview as a string.
-/// A changed `lang` re-labels the tray menu live (the tray follows the
-/// language switch; see `tray.rs`).
+/// Two live side effects:
+/// - a changed index scope (volumes/exclusions) is applied to the ENGINE
+///   via `set_scan_options` BEFORE persisting — that call validates the
+///   patterns and swaps the live scope (purging out-of-scope roots), so
+///   a bad glob can never reach the store and the SettingsView's
+///   「需要重新扫描后生效」 note is literally true (the rescan then
+///   reconciles the surviving roots' row-level drift). The scope goes
+///   through `state::effective_scope`, so the dev fixture override
+///   (SYNSO_DEV_ROOT) keeps precedence over the user's volumes exactly
+///   like the startup wiring;
+/// - a changed `lang` re-labels the tray menu live (see `tray.rs`).
 #[tauri::command]
 pub fn settings_set(
     state: State<'_, AppState>,
     app: AppHandle,
     settings: Settings,
 ) -> Result<(), String> {
+    let old = state.engine.settings();
+    if old.volumes != settings.volumes || old.exclusions != settings.exclusions {
+        let (volumes, exclusions) = crate::state::effective_scope(&settings);
+        state
+            .engine
+            .set_scan_options(volumes, exclusions)
+            .map_err(|err| err.to_string())?;
+    }
     state
         .engine
         .set_settings(&settings)

@@ -85,7 +85,7 @@ pub use engine::{DedupPhase, Engine, EngineEvent, EngineOptions, EngineStats};
 pub use model::{FileId, ParsedQuery};
 pub use pinyin::pinyin_keys;
 pub use query::{parse_query, Hit, SearchResult};
-pub use settings::Settings;
+pub use settings::{load_persisted, Settings};
 pub use sizeagg::SizeNode;
 /// The fixed local volumes, under the name the first-run wizard consumes
 /// (`Task 13` facade ruling): a thin re-export of

@@ -8,6 +8,7 @@
     type LangSetting,
   } from "../i18n";
   import {
+    autostartSet,
     listVolumes,
     settingsGet,
     settingsSet,
@@ -55,6 +56,10 @@
 
   let progressDone = $state(0);
   let scanError = $state<string | null>(null);
+  /** The live autostart registration failed — shown in the progress view;
+   * the choice is still persisted (next launch re-aligns), the scan
+   * proceeds either way. */
+  let beginError = $state<string | null>(null);
   let beginning = $state(false);
 
   const checkedCount = $derived(volumes.filter((v) => checked[v.path]).length);
@@ -72,8 +77,21 @@
     // round-trips still lands in the progress view instead of vanishing.
     phase = "scanning";
     scanError = null;
+    beginError = null;
     void (async () => {
+      // Live OS registration (fix round 1: the 「一键关」 promise — an
+      // unchecked box must not wait for the next launch to stop
+      // auto-starting). Failure is surfaced but never blocks the scan;
+      // the choice is persisted either way and the next launch re-aligns.
       try {
+        await autostartSet(autostart);
+      } catch (err) {
+        beginError = String(err);
+      }
+      try {
+        // The scope half of the wizard's choices propagates inside
+        // settings_set (it compares and calls set_scan_options — the
+        // same path the settings view uses), so nothing extra here.
         await settingsSet({
           ...baseSettings,
           lang: $langSetting,
@@ -247,6 +265,9 @@
           <progress aria-label={$t("a11y.scanProgress")} class="bar"></progress>
           <span class="count">{progressDone.toLocaleString()}</span>
         </div>
+        {#if beginError}
+          <p class="error" role="alert">{beginError}</p>
+        {/if}
         {#if scanError}
           <p class="error" role="alert">
             {$t("dashboard.scanFailed")}: {scanError}
