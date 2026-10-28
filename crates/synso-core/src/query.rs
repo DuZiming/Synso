@@ -287,8 +287,16 @@ pub(crate) fn run_parsed(
     // Empty text lists the most recent entries; anything else requires
     // EVERY free-text word to hit the name or a pinyin key (AND).
     let words: Vec<String> = q.text.split_whitespace().map(str::to_lowercase).collect();
-    let ranked = if words.is_empty() {
-        recent_slots(hot, q, ext_id, coll_members, path_needle.as_deref())
+    let (total, ranked) = if words.is_empty() {
+        recent_slots(
+            hot,
+            q,
+            ext_id,
+            coll_members,
+            path_needle.as_deref(),
+            offset,
+            limit,
+        )
     } else {
         match_slots(
             hot,
@@ -298,13 +306,16 @@ pub(crate) fn run_parsed(
             path_needle.as_deref(),
             &words,
             now,
+            offset,
+            limit,
         )
     };
     SearchResult {
-        total: ranked.len() as u64,
+        total,
         hits: page(hot, &ranked, offset, limit),
     }
 }
+
 
 /// The fast-reject chain both ranking modes run per slot BEFORE any
 /// ranking or classification: ext id and size are integer compares,
@@ -366,7 +377,11 @@ struct Scored {
 }
 
 /// The substring pass: filter first, then classify every name/pinyin hit
-/// of ALL free-text words, rank, return slots in final order.
+/// of ALL free-text words, keeping only the best `page_len(offset, limit)`
+/// matches in final rank order (see [`insert_top_k`]). Returns `(total,
+/// ranked_prefix)` — `total` counts every match (the full result size the
+/// UI reports), `ranked_prefix` holds the `[0, offset + limit)` head of
+/// the full ranking, which is all [`page`] can ever materialize.
 fn match_slots(
     hot: &HotIndex,
     q: &ParsedQuery,
@@ -375,8 +390,12 @@ fn match_slots(
     path_needle: Option<&str>,
     words: &[String],
     now: i64,
-) -> Vec<usize> {
-    let mut keys: Vec<Scored> = Vec::new();
+    offset: u32,
+    limit: u32,
+) -> (u64, Vec<usize>) {
+    let page_len = page_len(offset, limit);
+    let mut total = 0u64;
+    let mut top: Vec<Scored> = Vec::new();
     for slot in 0..hot.slot_count() {
         if !passes_filters(hot, q, ext_id, coll_members, path_needle, slot) {
             continue;
@@ -384,16 +403,56 @@ fn match_slots(
         let Some(class) = classify_words(hot, slot, words) else {
             continue;
         };
-        keys.push(Scored {
+        total += 1;
+        insert_top_k(&mut top, page_len, Scored {
             class,
             recent: hot.mtime(slot) >= now - RECENCY_WINDOW_SECS,
             path_len: hot.path_len(slot),
             slot,
-        });
+        }, |a, b| cmp_scored(hot, a, b));
     }
-    keys.sort_by(|a, b| cmp_scored(hot, a, b));
-    keys.into_iter().map(|key| key.slot).collect()
+    (total, top.into_iter().map(|key| key.slot).collect())
 }
+
+/// How many ranked slots [`page`] can ever touch: the run returns the
+/// `[offset, offset + limit)` slice, so selection beyond that head is
+/// discarded work at 1M-match scale.
+fn page_len(offset: u32, limit: u32) -> usize {
+    if limit == 0 {
+        0
+    } else {
+        offset as usize + limit as usize
+    }
+}
+
+/// Inserts `key` into the best-first `top` buffer, keeping at most `k`
+/// entries — the equivalent of a full stable sort of ALL candidates
+/// restricted to the top `k`: a candidate is dropped only when the buffer
+/// is full and ranks `cmp`-worse-or-equal than the current worst (equals
+/// keep the earlier-inserted element, as a stable sort would), and
+/// insertion positions after `partition_point` preserve the sorted order.
+/// With `k` at page size and `n` candidates this is O(n) comparisons for
+/// the common reject path instead of O(n log n) sort comparisons plus the
+/// path-tie string work a 1M-element sort would pay.
+fn insert_top_k<T>(
+    top: &mut Vec<T>,
+    k: usize,
+    key: T,
+    mut cmp: impl FnMut(&T, &T) -> Ordering,
+) {
+    if k == 0 {
+        return;
+    }
+    if top.len() == k {
+        if cmp(&key, top.last().expect("len checked == k > 0")) != Ordering::Less {
+            return;
+        }
+        top.pop();
+    }
+    let pos = top.partition_point(|existing| cmp(existing, &key) == Ordering::Less);
+    top.insert(pos, key);
+}
+
 
 /// Where the free-text words hit `slot`: every word must match (the name
 /// arena first, a pinyin key as fallback — the AND semantics); the slot's
@@ -433,34 +492,40 @@ struct Recent {
 }
 
 /// Every filter-passing slot, newest mtime first (ties: shorter path,
-/// then path ascending) — the empty-query "most recent" mode.
+/// then path ascending) — the empty-query "most recent" mode. Selection
+/// is bounded to the page head, exactly like [`match_slots`].
 fn recent_slots(
     hot: &HotIndex,
     q: &ParsedQuery,
     ext_id: Option<i64>,
     coll_members: Option<&HashSet<FileId>>,
     path_needle: Option<&str>,
-) -> Vec<usize> {
-    let mut keys: Vec<Recent> = Vec::with_capacity(hot.slot_count());
+    offset: u32,
+    limit: u32,
+) -> (u64, Vec<usize>) {
+    let page_len = page_len(offset, limit);
+    let mut total = 0u64;
+    let mut top: Vec<Recent> = Vec::new();
     for slot in 0..hot.slot_count() {
         if !passes_filters(hot, q, ext_id, coll_members, path_needle, slot) {
             continue;
         }
-        keys.push(Recent {
+        total += 1;
+        insert_top_k(&mut top, page_len, Recent {
             mtime: hot.mtime(slot),
             path_len: hot.path_len(slot),
             slot,
+        }, |a, b| {
+            b.mtime
+                .cmp(&a.mtime)
+                .then(a.path_len.cmp(&b.path_len))
+                .then_with(|| cmp_slot_paths(hot, a.slot, b.slot))
+                .then(a.slot.cmp(&b.slot))
         });
     }
-    keys.sort_by(|a, b| {
-        b.mtime
-            .cmp(&a.mtime)
-            .then(a.path_len.cmp(&b.path_len))
-            .then_with(|| cmp_slot_paths(hot, a.slot, b.slot))
-            .then(a.slot.cmp(&b.slot))
-    });
-    keys.into_iter().map(|key| key.slot).collect()
+    (total, top.into_iter().map(|key| key.slot).collect())
 }
+
 
 /// Materializes the `[offset, offset + limit)` slice of the ranked slots.
 /// Hits are the only place full paths are built.
