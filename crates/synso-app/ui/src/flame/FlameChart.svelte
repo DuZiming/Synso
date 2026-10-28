@@ -264,6 +264,11 @@
     resizeObserver?.disconnect();
     chart?.destroy();
     chart = null;
+    // Belt-and-braces for the floating tooltip div: chart.destroy() tears
+    // it down too (library contract), but if the chart was never mounted
+    // (destroy early-returns) the div appended to <body> would leak — one
+    // per compare-toggle otherwise.
+    tooltip?.destroy();
     tooltip = null;
   });
 </script>

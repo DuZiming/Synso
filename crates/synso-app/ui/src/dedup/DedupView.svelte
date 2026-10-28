@@ -418,11 +418,6 @@
       {$t("dedup.filesUnit")}
     </p>
   {/if}
-  {#if deleteError}
-    <p class="error" role="alert">
-      {$t("dedup.deleteFailed")}: {deleteError}
-    </p>
-  {/if}
 </section>
 
 {#if pending}
@@ -441,6 +436,14 @@
       <p class="muted">{$t("dedup.confirmTrash")}</p>
       {#if pending.all}
         <p class="error" role="alert">{$t("dedup.confirmAllHint")}</p>
+      {/if}
+      {#if deleteError}
+        <!-- A failed delete leaves `pending` open: the error must render
+             INSIDE the dialog (fixed overlay, z-index 20), where it is
+             actually visible, not beneath it. -->
+        <p class="error" role="alert">
+          {$t("dedup.deleteFailed")}: {deleteError}
+        </p>
       {/if}
       <footer class="confirm-actions">
         <button
