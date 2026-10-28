@@ -1,35 +1,82 @@
-//! synso-core: embeddable file-index data model and SQLite store.
+//! synso-core: the Synso file-indexing engine as one embeddable facade —
+//! SQLite store, scanner, in-memory hot index, query execution, watcher,
+//! dedup, collections, trash and directory-size aggregation, glued behind
+//! a single entry point.
 //!
-//! This crate must stay UI-free and dependency-light (never depend on tauri)
-//! so the scanner/engine layers built on it remain embeddable and testable.
+//! The crate stays UI-free and dependency-light (never depend on tauri) so
+//! the app layer and future embedders (P2P layer, MCP server) program
+//! against ONE clean surface. Implementation modules are `pub(crate)`;
+//! everything an embedder needs is re-exported here:
+//!
+//! - Engine plumbing: [`Engine`], [`EngineOptions`], [`EngineEvent`],
+//!   [`EngineStats`]
+//! - Query data: [`parse_query`], [`ParsedQuery`], [`SearchResult`], [`Hit`]
+//! - Feature data: [`SizeNode`], [`DedupPhase`], [`DedupState`],
+//!   [`DupeGroup`], [`Collection`], [`MemberHit`], [`FileId`],
+//!   [`VolumeInfo`], [`pinyin_keys`]
+//! - Errors: [`SynsoError`], [`Result`]
+//!
+//! # Example
+//!
+//! Open an engine over a scratch directory, scan it, search it:
+//!
+//! ```no_run
+//! use std::time::Duration;
+//!
+//! use synso_core::{Engine, EngineEvent, EngineOptions};
+//!
+//! let tmp = tempfile::tempdir()?;
+//! let engine = Engine::open(&tmp.path().join("index.db"), EngineOptions::default())?;
+//!
+//! // Subscribe BEFORE scanning so no event is missed.
+//! let events = engine.subscribe();
+//! engine.start_full_scan();
+//! loop {
+//!     match events
+//!         .recv_timeout(Duration::from_secs(60))
+//!         .expect("event channel alive")
+//!     {
+//!         EngineEvent::ScanFinished { files, .. } => {
+//!             println!("indexed {files} files");
+//!             break;
+//!         }
+//!         EngineEvent::ScanFailed { message, .. } => panic!("scan failed: {message}"),
+//!         _ => {}
+//!     }
+//! }
+//!
+//! // Case-insensitive substring search over names and pinyin keys.
+//! let result = engine.search("report", 0, 50);
+//! for hit in &result.hits {
+//!     println!("{} ({} bytes)", hit.path, hit.size);
+//! }
+//!
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
-pub mod collections;
-pub mod dedup;
-pub mod engine;
-pub mod hotindex;
-pub mod model;
-pub mod pinyin;
-pub mod query;
-pub mod scanner;
-pub mod sizeagg;
-pub mod store;
-pub mod trash;
-pub mod volumes;
-pub mod watcher;
+pub(crate) mod collections;
+pub(crate) mod dedup;
+pub(crate) mod engine;
+pub(crate) mod hotindex;
+pub(crate) mod model;
+pub(crate) mod pinyin;
+pub(crate) mod query;
+pub(crate) mod scanner;
+pub(crate) mod sizeagg;
+pub(crate) mod store;
+pub(crate) mod trash;
+pub(crate) mod volumes;
+pub(crate) mod watcher;
 
+// The public facade: the ONLY surface embedders program against.
 pub use collections::{Collection, MemberHit};
 pub use dedup::{DedupState, DupeGroup};
 pub use engine::{DedupPhase, Engine, EngineEvent, EngineOptions, EngineStats};
-pub use hotindex::HotIndex;
-pub use model::{FileId, FileRecord, ParsedQuery};
+pub use model::{FileId, ParsedQuery};
 pub use pinyin::pinyin_keys;
 pub use query::{parse_query, Hit, SearchResult};
-pub use scanner::{is_placeholder_attr, scan, ScanOptions, ScanStats};
 pub use sizeagg::SizeNode;
-pub use store::Store;
-pub use trash::delete_paths_to_trash;
-pub use volumes::{fixed_volumes, VolumeInfo};
-pub use watcher::Watcher;
+pub use volumes::VolumeInfo;
 
 /// Error type for all synso-core operations.
 #[derive(Debug, thiserror::Error)]
@@ -47,9 +94,13 @@ pub enum SynsoError {
     /// collection name is already taken).
     #[error("conflict: {0}")]
     Conflict(String),
-    /// Malformed input from the caller.
+    /// Malformed input from the caller (e.g. a path-segment resolution
+    /// error in the store).
     #[error("bad query: {0}")]
     BadQuery(String),
+    /// A glob/exclusion pattern failed to compile.
+    #[error("invalid pattern: {0}")]
+    InvalidPattern(String),
 }
 
 /// Result alias used across synso-core.

@@ -4,8 +4,9 @@ use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::model::{FileId, FileRecord};
 use crate::pinyin::pinyin_keys;
-use crate::{FileId, FileRecord, Result, SynsoError};
+use crate::{Result, SynsoError};
 
 /// Schema of `user_version` 1, verbatim from the design. Later schema steps
 /// add their own constants and bump [`SCHEMA_VERSION`].
@@ -118,6 +119,10 @@ impl Store {
     }
 
     /// Deletes the `files` row `id`; `Err(NotFound)` if it does not exist.
+    /// No production path removes single rows by id (the watcher deletes by
+    /// path, rescans by subtree) — this stays for the test suite, which
+    /// uses it to simulate files dying between operations.
+    #[allow(dead_code)]
     pub fn delete_file(&mut self, id: FileId) -> Result<()> {
         let deleted = self
             .conn
@@ -265,6 +270,10 @@ impl Store {
         Ok(updated)
     }
 
+    /// Reads one `meta` value. Nothing reads metadata yet (schema version
+    /// lives in `PRAGMA user_version`); the accessor stays for the test
+    /// suite and future meta consumers.
+    #[allow(dead_code)]
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         let value: Option<String> = self
             .conn
@@ -326,6 +335,9 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Upserts one `meta` value. Nothing writes metadata yet; the accessor
+    /// stays for the test suite and future meta consumers.
+    #[allow(dead_code)]
     pub fn set_meta(&self, key: &str, val: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES (?1, ?2)

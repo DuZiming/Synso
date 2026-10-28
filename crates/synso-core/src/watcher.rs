@@ -64,12 +64,13 @@
 //! ping-pong forever), so events for the db file and its journal sidecars
 //! are dropped at absorb time.
 //!
-//! Failure semantics: setup/watch errors are logged (`eprintln!`, the
-//! established engine pattern) and never fatal — a root that cannot be
-//! watched only loses its live updates; a store error on one batch entry
-//! skips that entry and the batch continues. Dropping the [`Watcher`]
-//! handle signals the thread to stop (a final pending batch is still
-//! applied, so the index reflects the last-seen disk state) and joins it.
+//! Failure semantics: setup/watch errors are logged (`log::warn!` /
+//! `log::error!`, the established engine pattern) and never fatal — a root
+//! that cannot be watched only loses its live updates; a store error on one
+//! batch entry skips that entry and the batch continues. Dropping the
+//! [`Watcher`] handle signals the thread to stop (a final pending batch is
+//! still applied, so the index reflects the last-seen disk state) and joins
+//! it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -221,7 +222,7 @@ impl Watcher {
         for root in &roots {
             if let Err(err) = NotifyWatcher::watch(&mut fs_watcher, root, RecursiveMode::Recursive)
             {
-                eprintln!("synso: watching {root:?} failed: {err}");
+                log::warn!("synso: watching {root:?} failed: {err}");
             }
         }
         let mut db_filter = vec![db_path.to_string_lossy().to_lowercase()];
@@ -257,7 +258,7 @@ impl Watcher {
                 thread: Some(thread),
             }),
             Err(err) => {
-                eprintln!("synso: failed to spawn the watcher thread: {err}");
+                log::error!("synso: failed to spawn the watcher thread: {err}");
                 Err(SynsoError::Io(err))
             }
         }
@@ -276,7 +277,7 @@ impl EventHandler for EventForwarder {
             Ok(event) => {
                 let _ = self.tx.send(event);
             }
-            Err(err) => eprintln!("synso: watcher event error: {err}"),
+            Err(err) => log::warn!("synso: watcher event error: {err}"),
         }
     }
 }
@@ -413,7 +414,9 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
                         dir_segments.push(entry.name.clone());
                         let mut hot_row = |store: &Store, walked: &FileRecord| {
                             if let Err(err) = hot.upsert_slot(store, walked) {
-                                eprintln!("synso: watcher hot upsert of {walked:?} failed: {err}");
+                                log::error!(
+                                    "synso: watcher hot upsert of {walked:?} failed: {err}"
+                                );
                             }
                         };
                         match scanner::scan_subtree(
@@ -425,26 +428,28 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
                             &mut hot_row,
                         ) {
                             Ok(sub) if sub.errors > 0 => {
-                                eprintln!("synso: watcher subtree walk of {path:?} skipped {sub:?}")
+                                log::warn!(
+                                    "synso: watcher subtree walk of {path:?} skipped {sub:?}"
+                                )
                             }
                             Ok(_) => {}
                             Err(err) => {
-                                eprintln!("synso: watcher subtree walk of {path:?} failed: {err}")
+                                log::error!("synso: watcher subtree walk of {path:?} failed: {err}")
                             }
                         }
                     }
                     if let Err(err) = hot.upsert_slot(&store, &rec) {
-                        eprintln!("synso: watcher hot upsert of {path:?} failed: {err}");
+                        log::error!("synso: watcher hot upsert of {path:?} failed: {err}");
                     }
                     applied += 1;
                 }
-                Err(err) => eprintln!("synso: watcher upsert of {path:?} failed: {err}"),
+                Err(err) => log::error!("synso: watcher upsert of {path:?} failed: {err}"),
             }
         }
         // Renames already contribute removals through their from-side.
         if !removals.is_empty() {
             if let Err(err) = collections::reconcile(&mut store) {
-                eprintln!("synso: watcher collection reconcile failed: {err}");
+                log::warn!("synso: watcher collection reconcile failed: {err}");
             }
         }
     }
@@ -468,12 +473,12 @@ pub(crate) fn remove_path(
     path: &Path,
 ) {
     if let Err(err) = store.delete_file_by_path(segments, name) {
-        eprintln!("synso: watcher delete of {path:?} failed: {err}");
+        log::error!("synso: watcher delete of {path:?} failed: {err}");
     }
     let mut subtree: Vec<&str> = segments.to_vec();
     subtree.push(name);
     if let Err(err) = store.delete_subtree(&subtree) {
-        eprintln!("synso: watcher subtree delete of {path:?} failed: {err}");
+        log::error!("synso: watcher subtree delete of {path:?} failed: {err}");
     }
     hot.remove_by_dir_name(segments, name);
 }

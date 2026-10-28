@@ -632,7 +632,7 @@ mod tests {
         engine.coll_add(backup.id, &[hit.id]).unwrap();
 
         for coll in [&work, &backup] {
-            let members = engine.coll_members(coll.id);
+            let members = engine.coll_members(coll.id).unwrap();
             assert_eq!(members.len(), 1, "{} holds exactly the one file", coll.name);
             let member = &members[0];
             assert!(member.alive);
@@ -642,14 +642,19 @@ mod tests {
             assert!(member.hit.path.contains("readme.md"));
         }
 
-        let names: Vec<String> = engine.coll_list().into_iter().map(|c| c.name).collect();
+        let names: Vec<String> = engine
+            .coll_list()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
         assert!(names.contains(&"工作".to_string()));
         assert!(names.contains(&"backup".to_string()));
 
         // Removing from one collection leaves the other untouched.
         engine.coll_remove(work.id, hit.id).unwrap();
-        assert!(engine.coll_members(work.id).is_empty());
-        assert_eq!(engine.coll_members(backup.id).len(), 1);
+        assert!(engine.coll_members(work.id).unwrap().is_empty());
+        assert_eq!(engine.coll_members(backup.id).unwrap().len(), 1);
     }
 
     #[test]
@@ -669,7 +674,7 @@ mod tests {
         let coll = engine.coll_create("folders").unwrap();
         engine.coll_add(coll.id, &[folder.id]).unwrap();
 
-        let members = engine.coll_members(coll.id);
+        let members = engine.coll_members(coll.id).unwrap();
         assert_eq!(members.len(), 1);
         let member = &members[0];
         assert!(member.alive);
@@ -691,12 +696,12 @@ mod tests {
         let original = unique_hit(&engine, "data.bin");
         let coll = engine.coll_create("keep").unwrap();
         engine.coll_add(coll.id, &[original.id]).unwrap();
-        assert!(engine.coll_members(coll.id)[0].alive);
+        assert!(engine.coll_members(coll.id).unwrap()[0].alive);
 
         // Disk delete + rescan: the member is tombstoned, not dropped.
         fs::remove_file(root.join("a").join("data.bin")).unwrap();
         scan_once(&engine, &rx);
-        let members = engine.coll_members(coll.id);
+        let members = engine.coll_members(coll.id).unwrap();
         assert_eq!(members.len(), 1, "tombstoned members stay listed");
         let dead = &members[0];
         assert!(!dead.alive);
@@ -713,7 +718,7 @@ mod tests {
         scan_once(&engine, &rx);
         let reborn = unique_hit(&engine, "data.bin");
         assert_ne!(reborn.id, original.id);
-        let members = engine.coll_members(coll.id);
+        let members = engine.coll_members(coll.id).unwrap();
         assert_eq!(members.len(), 1);
         let alive = &members[0];
         assert!(alive.alive, "rebound to the reappeared file");
@@ -741,11 +746,11 @@ mod tests {
 
         let coll = engine.coll_create("doomed").unwrap();
         engine.coll_add(coll.id, &[readme.id, notes.id]).unwrap();
-        assert_eq!(engine.coll_members(coll.id).len(), 2);
+        assert_eq!(engine.coll_members(coll.id).unwrap().len(), 2);
 
         engine.coll_delete(coll.id).unwrap();
-        assert!(engine.coll_list().is_empty());
-        assert!(engine.coll_members(coll.id).is_empty());
+        assert!(engine.coll_list().unwrap().is_empty());
+        assert!(engine.coll_members(coll.id).unwrap().is_empty());
 
         // Both tables are truly empty (explicit DELETE, not an FK pragma).
         let store = Store::open(&db_path).unwrap();
@@ -793,7 +798,7 @@ mod tests {
         );
         scan_once(&engine, &rx);
 
-        let members = engine.coll_members(coll.id);
+        let members = engine.coll_members(coll.id).unwrap();
         assert_eq!(members.len(), 1);
         let member = &members[0];
         assert!(member.alive, "ambiguous rebind still lands somewhere");

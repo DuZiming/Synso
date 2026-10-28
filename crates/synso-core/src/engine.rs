@@ -77,9 +77,8 @@ use crate::Result;
 const DEDUP_AUTOSTART_DELAY: Duration = Duration::from_secs(30);
 
 /// What the engine scans and what it skips. Empty `volumes` means "all
-/// fixed local volumes" (see [`crate::volumes::fixed_volumes`]);
-/// `exclusions` are globset patterns as documented on
-/// [`crate::scanner::ScanOptions`].
+/// fixed local volumes" (`crate::volumes::fixed_volumes`); `exclusions`
+/// are globset patterns as documented on `crate::scanner::ScanOptions`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EngineOptions {
     pub volumes: Vec<String>,
@@ -228,7 +227,7 @@ impl Engine {
             .name("synso-hot-load".into())
             .spawn(move || reload_hot_index(&store, &hot))
         {
-            eprintln!("synso: failed to spawn the hot-index loader: {err}");
+            log::error!("synso: failed to spawn the hot-index loader: {err}");
         }
         Ok(engine)
     }
@@ -269,12 +268,12 @@ impl Engine {
             move || scan_cycle(store, hot, subscribers, scanning, opts, dedup, autostarted)
         });
         if let Err(err) = spawn {
-            eprintln!("synso: failed to spawn the scan thread: {err}");
+            log::error!("synso: failed to spawn the scan thread: {err}");
             self.scanning.store(false, Ordering::Release);
         }
     }
 
-    /// Starts the filesystem watcher (see [`crate::watcher`]): recursive
+    /// Starts the filesystem watcher (see `crate::watcher`): recursive
     /// `notify` watches on the effective scan roots, events merged into
     /// 500ms quiet-window batches, each batch applied incrementally to the
     /// store and the hot index, then [`EngineEvent::FsChanged`]
@@ -312,8 +311,8 @@ impl Engine {
     }
 
     /// Case-insensitive substring search over the hot index's name arena
-    /// (see [`crate::query`] for the full contract). `text` is first
-    /// parsed by [`crate::query::parse_query`]: Everything-style modifier
+    /// (see `crate::query` for the full contract). `text` is first
+    /// parsed by [`crate::parse_query`]: Everything-style modifier
     /// tokens (`ext:` / `size:` / `path:` / `coll:`) become dimension
     /// filters applied before ranking, and the remaining words are free
     /// text that must ALL match. Ranking: prefix > word-start >
@@ -329,7 +328,7 @@ impl Engine {
     }
 
     /// [`Engine::search`] over an already-parsed query (see
-    /// [`crate::query::parse_query`]). The parsed dimension filters
+    /// [`crate::parse_query`]). The parsed dimension filters
     /// (`ext:` / `size:` / `path:` / `coll:`) apply as fast predicates
     /// BEFORE ranking and classification; ranking itself is unchanged.
     /// `q.collections` resolves against the store: a file must be an ALIVE
@@ -352,7 +351,7 @@ impl Engine {
                     None => return SearchResult::default(),
                 },
                 Err(err) => {
-                    eprintln!(
+                    log::error!(
                         "synso: resolving collection filter {:?} failed: {err}",
                         q.collections
                     );
@@ -365,7 +364,7 @@ impl Engine {
     }
 
     /// Creates a virtual collection. A duplicate name is
-    /// `Err(SynsoError::Conflict)`. See [`crate::collections`].
+    /// `Err(SynsoError::Conflict)`. See `crate::collections`.
     pub fn coll_create(&self, name: &str) -> Result<Collection> {
         collections::create(&mut lock_unpoisoned(&self.store), name)
     }
@@ -381,13 +380,10 @@ impl Engine {
         collections::delete(&mut lock_unpoisoned(&self.store), id)
     }
 
-    /// Every collection, id-ordered. A store error is logged and yields an
-    /// empty list (listing is a read-side convenience, never fatal).
-    pub fn coll_list(&self) -> Vec<Collection> {
-        collections::list(&lock_unpoisoned(&self.store)).unwrap_or_else(|err| {
-            eprintln!("synso: listing collections failed: {err}");
-            Vec::new()
-        })
+    /// Every collection, id-ordered (creation order). Store errors surface
+    /// to the caller rather than degrading to an empty list.
+    pub fn coll_list(&self) -> Result<Vec<Collection>> {
+        collections::list(&lock_unpoisoned(&self.store))
     }
 
     /// Adds file OR folder row ids to a collection, snapshotting each
@@ -399,7 +395,7 @@ impl Engine {
     // ---------------- Task 9: dedup state machine ------------------------
 
     /// Starts a dedup run on a background thread; a no-op while one is
-    /// already running. The pipeline (see [`crate::dedup`]) groups by size,
+    /// already running. The pipeline (see `crate::dedup`) groups by size,
     /// hashes first 4 KiB for same-size survivors, then whole files —
     /// persisted hashes are reused, so repeat runs are incremental.
     /// `Idle -> Grouping` happens synchronously here; subscribers receive
@@ -422,7 +418,7 @@ impl Engine {
 
     /// The last completed run's groups, `[offset, offset + limit)` of the
     /// size-descending order, members materialized as search-style
-    /// [`crate::query::Hit`]s from the hot index. Files deleted since the
+    /// [`crate::Hit`]s from the hot index. Files deleted since the
     /// run drop out; a group falling below two surviving members dissolves
     /// (its slot in the ordering disappears, the other groups keep their
     /// relative order).
@@ -464,13 +460,13 @@ impl Engine {
 
     /// The absolute disk path of an index-relative path (root segment
     /// first, `MAIN_SEPARATOR`-joined — the spelling of
-    /// [`crate::query::Hit::path`]), resolved by matching the path's first
+    /// [`crate::Hit::path`]), resolved by matching the path's first
     /// segment against the engine's effective scan roots. `None` when no
     /// root's segment matches. Hashing (Task 9), trash (Task 10) and
     /// reveal (Task 15) all key on this: index paths deliberately carry no
-    /// drive prefix, so the engine owns the root mapping. Public for the
-    /// same reason as [`crate::scanner::is_placeholder_attr`] — its
-    /// consumers straddle crate and app layers.
+    /// drive prefix, so the engine owns the root mapping. Public: its
+    /// consumers straddle the crate and app layers, like
+    /// `crate::scanner::is_placeholder_attr`.
     pub fn resolve_absolute(&self, index_path: &str) -> Option<PathBuf> {
         dedup::resolve_absolute_path(&self.dedup.roots, index_path)
     }
@@ -488,7 +484,7 @@ impl Engine {
     /// the overflow merged into one trailing "(other)" node (which counts
     /// against the budget); `depth` caps how many levels of children are
     /// materialized (0 = none). The UI calls this with (path, 2, 40)-
-    /// shaped arguments. See [`crate::sizeagg`] for the full contract.
+    /// shaped arguments. See `crate::sizeagg` for the full contract.
     ///
     /// Cost: O(dirs + files) time and scratch memory per call — one full
     /// post-order aggregation walk over the hot index under its read
@@ -505,27 +501,24 @@ impl Engine {
     }
 
     /// The collection's members, tombstoned ones included (their `hit` is
-    /// synthesized from the snapshot — see [`crate::collections::MemberHit`]).
-    /// A store error is logged and yields an empty list.
-    pub fn coll_members(&self, id: i64) -> Vec<MemberHit> {
-        collections::members(&lock_unpoisoned(&self.store), id).unwrap_or_else(|err| {
-            eprintln!("synso: listing members of collection {id} failed: {err}");
-            Vec::new()
-        })
+    /// synthesized from the snapshot — see [`MemberHit`]). Store errors
+    /// surface to the caller rather than degrading to an empty list.
+    pub fn coll_members(&self, id: i64) -> Result<Vec<MemberHit>> {
+        collections::members(&lock_unpoisoned(&self.store), id)
     }
 
     // ---------------- Task 10: recycle-bin-only deletion -----------------
 
     /// Moves the entries behind `ids` to the OS trash — Synso's ONLY
-    /// deletion path, and never a permanent delete (see [`crate::trash`]).
+    /// deletion path, and never a permanent delete (see `crate::trash`).
     /// Per id: the live hot-index slot is resolved (a dead or unknown id is
     /// skipped and counted as neither success nor error), the real disk
     /// path comes from [`Engine::resolve_absolute`], and a path already
     /// gone from disk is skipped the same way. Everything else is moved in
-    /// ONE trash batch ([`trash::delete_paths_to_trash`]); each path
+    /// ONE trash batch (`trash::delete_paths_to_trash`); each path
     /// actually gone from disk afterwards is then synced out of the index
     /// with the watcher's removal mechanics
-    /// ([`crate::watcher::remove_path`]: the row located by (dir, name)
+    /// (`crate::watcher::remove_path`: the row located by (dir, name)
     /// plus a subtree purge on the store, the slot removal plus subtree
     /// sweep on the hot index) under one store -> hot lock pair, and — when
     /// at least one path landed — the collections reconcile (tombstone +
@@ -566,7 +559,7 @@ impl Engine {
                     // Already gone from disk: nothing left to trash.
                     Some(_) => None,
                     None => {
-                        eprintln!(
+                        log::warn!(
                             "synso: trash skipped {:?}: no scan root resolves it",
                             candidate.index_path
                         );
@@ -595,7 +588,7 @@ impl Engine {
             let mut hot = write_unpoisoned(&self.hot);
             for entry in &planned {
                 if trash::present(&entry.abs) {
-                    eprintln!(
+                    log::warn!(
                         "synso: trash refused {:?}; its index rows stay until the next rescan",
                         entry.abs
                     );
@@ -610,7 +603,7 @@ impl Engine {
                 // critical section a scan's and a watcher batch's reconcile
                 // use; best-effort, like those.
                 if let Err(err) = collections::reconcile(&mut store) {
-                    eprintln!("synso: collection reconcile after trash failed: {err}");
+                    log::warn!("synso: collection reconcile after trash failed: {err}");
                 }
             }
         }
@@ -720,7 +713,7 @@ fn scan_cycle(
             // state consistent with the fresh index. Best-effort: the scan
             // itself succeeded, so a reconcile error is logged, not fatal.
             if let Err(err) = collections::reconcile(&mut guard) {
-                eprintln!("synso: collection reconcile after scan failed: {err}");
+                log::warn!("synso: collection reconcile after scan failed: {err}");
             }
             (stats.files, stats.dirs)
         })
@@ -788,7 +781,7 @@ fn launch_dedup(dedup: &Arc<DedupShared>) -> bool {
     match spawn {
         Ok(_) => true,
         Err(err) => {
-            eprintln!("synso: failed to spawn the dedup thread: {err}");
+            log::error!("synso: failed to spawn the dedup thread: {err}");
             dedup.running.store(false, Ordering::Release);
             lock_unpoisoned(&dedup.book).state.phase = DedupPhase::Idle;
             false
@@ -849,7 +842,7 @@ fn purge_root_subtrees(store: &mut Store, opts: &ScanOptions) {
     for root in effective_roots(&opts.roots) {
         let segment = root_segment(Path::new(&root));
         if let Err(err) = store.delete_subtree(&[segment.as_str()]) {
-            eprintln!("synso: failed to purge the index subtree of {root:?}: {err}");
+            log::error!("synso: failed to purge the index subtree of {root:?}: {err}");
         }
     }
 }
@@ -864,13 +857,14 @@ fn reload_hot_index(store: &Arc<Mutex<Store>>, hot: &Arc<RwLock<HotIndex>>) {
 fn reload_hot_index_locked(store: &Store, hot: &Arc<RwLock<HotIndex>>) {
     match HotIndex::load(store) {
         Ok(loaded) => *write_unpoisoned(hot) = loaded,
-        Err(err) => eprintln!("synso: hot-index load failed: {err}"),
+        Err(err) => log::error!("synso: hot-index load failed: {err}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SynsoError;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -1154,6 +1148,45 @@ mod tests {
         assert_eq!(engine.stats().files, 3);
     }
 
+    /// Store errors behind the collection reads SURFACE: `coll_list` and
+    /// `coll_members` return `Err` instead of silently degrading to empty
+    /// lists. Dropping the underlying tables on the engine's own connection
+    /// is the cheapest way to force real store errors.
+    #[test]
+    fn coll_reads_surface_store_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = write_fixture(tmp.path());
+
+        let engine = open_engine(&db_path, &root);
+        let coll = engine.coll_create("keep").unwrap();
+        assert_eq!(engine.coll_list().unwrap().len(), 1);
+        assert_eq!(engine.coll_members(coll.id).unwrap().len(), 0);
+
+        // Corrupt the schema out from under the engine's store connection:
+        // both reads must now report the store error to the caller.
+        {
+            let mut store = lock_unpoisoned(&engine.store);
+            store
+                .conn_mut()
+                .execute("DROP TABLE collection_members", [])
+                .unwrap();
+            store
+                .conn_mut()
+                .execute("DROP TABLE collections", [])
+                .unwrap();
+        }
+
+        assert!(
+            matches!(engine.coll_list(), Err(SynsoError::Db(_))),
+            "coll_list surfaces the store error, not an empty list"
+        );
+        assert!(
+            matches!(engine.coll_members(coll.id), Err(SynsoError::Db(_))),
+            "coll_members surfaces the store error, not an empty list"
+        );
+    }
+
     // ------------------- Task 9: dedup pipeline ---------------------------
 
     /// Receives events until `DedupFinished`, returning the finished run's
@@ -1389,7 +1422,7 @@ mod tests {
         // A collection tracks the doomed file so the tombstone is visible.
         let coll = engine.coll_create("purge-test").unwrap();
         engine.coll_add(coll.id, &[doomed_id]).unwrap();
-        assert!(engine.coll_members(coll.id)[0].alive);
+        assert!(engine.coll_members(coll.id).unwrap()[0].alive);
 
         assert_eq!(
             engine.delete_to_trash(&[doomed_id]).unwrap(),
@@ -1410,7 +1443,7 @@ mod tests {
             .iter()
             .all(|rec| rec.name != "doomed.txt"));
         // ...and tombstoned in the collection (alive=0, snapshot kept).
-        let members = engine.coll_members(coll.id);
+        let members = engine.coll_members(coll.id).unwrap();
         assert_eq!(members.len(), 1);
         assert!(!members[0].alive, "the deleted member must be tombstoned");
         assert_eq!(members[0].hit.name, "doomed.txt");

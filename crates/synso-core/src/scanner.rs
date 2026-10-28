@@ -20,8 +20,9 @@ use std::time::UNIX_EPOCH;
 use globset::{Glob, GlobSet};
 use jwalk::WalkDirGeneric;
 
+use crate::model::FileRecord;
 use crate::store::Store;
-use crate::{FileRecord, Result, SynsoError};
+use crate::{Result, SynsoError};
 
 /// Records per progress batch. The progress closure is invoked with the
 /// files-done count after every full batch and once more at the end of the
@@ -383,13 +384,13 @@ pub(crate) fn build_matcher(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSet::builder();
     for pattern in patterns {
         let glob = Glob::new(pattern).map_err(|err| {
-            SynsoError::BadQuery(format!("bad exclusion pattern {pattern:?}: {err}"))
+            SynsoError::InvalidPattern(format!("bad exclusion pattern {pattern:?}: {err}"))
         })?;
         builder.add(glob);
     }
     builder
         .build()
-        .map_err(|err| SynsoError::BadQuery(format!("bad exclusion patterns: {err}")))
+        .map_err(|err| SynsoError::InvalidPattern(format!("bad exclusion patterns: {err}")))
 }
 
 /// Exclusion test for one path: globset patterns are matched against the

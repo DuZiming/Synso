@@ -36,7 +36,7 @@ pub fn delete_paths_to_trash(paths: &[&Path]) -> Result<usize> {
     if let Err(err) = trash::delete_all(paths) {
         // Not fatal: whatever the batch did land is counted below from disk
         // state; the refused paths keep living where they are.
-        eprintln!("synso: batch trash failed: {err}");
+        log::warn!("synso: batch trash failed: {err}");
     }
     Ok(paths
         .iter()
