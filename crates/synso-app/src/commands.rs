@@ -54,8 +54,15 @@ pub async fn settings_get(state: State<'_, AppState>) -> Result<Settings, String
 ///   (SYNSO_DEV_ROOT) keeps precedence over the user's volumes exactly
 ///   like the startup wiring;
 /// - a changed `lang` re-labels the tray menu live (see `tray.rs`).
+///
+/// Async (thread-pool, not the main thread — see `size_tree`): one call
+/// takes the store mutex up to three times (settings read, then
+/// `set_scan_options` — which serializes against an in-flight scan's
+/// whole walk — then the persist), and it is reachable during a scan from
+/// the SettingsView save and the wizard's completion — the exact freeze
+/// class the rest of this file's conversions fix.
 #[tauri::command]
-pub fn settings_set(
+pub async fn settings_set(
     state: State<'_, AppState>,
     app: AppHandle,
     settings: Settings,
@@ -83,10 +90,11 @@ pub fn settings_set(
 /// bad spelling rolls back to the old combo and returns the plugin's
 /// error message for display. On success the new spelling is persisted,
 /// so it survives a restart.
-/// Async (thread-pool, not the main thread — see `size_tree`): the global
-/// shortcut re-registration and the settings read/write below take the
-/// store mutex, which a running scan holds for its whole walk — a sync
-/// command would freeze EVERY window for the scan's duration.
+/// Async (thread-pool, not the main thread — see `size_tree`): the
+/// settings read/write below takes the store mutex, which a running scan
+/// holds for its whole walk — a sync command would freeze EVERY window
+/// for the scan's duration (the shortcut re-registration itself touches
+/// no engine state).
 #[tauri::command]
 pub async fn set_shortcut(
     app: AppHandle,
@@ -105,10 +113,11 @@ pub async fn set_shortcut(
 /// Live autostart toggle (the settings panel's switch): updates the OS
 /// launch-at-startup registration first, then persists
 /// `Settings.autostart` — an OS failure must not persist a lie.
-/// Async (thread-pool, not the main thread — see `size_tree`): the OS
-/// toggle then the settings read/write below take the store mutex, which
-/// a running scan holds for its whole walk — a sync command would freeze
-/// EVERY window for the scan's duration.
+/// Async (thread-pool, not the main thread — see `size_tree`): the
+/// settings read/write below takes the store mutex, which a running scan
+/// holds for its whole walk — a sync command would freeze EVERY window
+/// for the scan's duration (the OS toggle itself touches no engine
+/// state).
 #[tauri::command]
 pub async fn autostart_set(
     app: AppHandle,
@@ -144,9 +153,21 @@ pub fn list_volumes() -> Vec<VolumeInfo> {
 /// parsed inside the engine, exactly as the dashboard path would. On a
 /// cold index the hot side is empty, so this returns an empty page — the
 /// quick window says "warming up" via `engine_stats`'s `warm` flag then.
+///
+/// Async (thread-pool, not the main thread — see `size_tree`): a query
+/// with a `coll:` modifier resolves collection names under the store
+/// mutex, which a running scan holds for its whole walk — typing
+/// `coll:x` during a scan would otherwise freeze EVERY window. Returns a
+/// `Result` because Tauri requires that of async commands with reference
+/// inputs; `Ok` serializes to exactly the `SearchResult` JSON.
 #[tauri::command]
-pub fn search(state: State<'_, AppState>, q: String, offset: u32, limit: u32) -> SearchResult {
-    state.engine.search(&q, offset, limit)
+pub async fn search(
+    state: State<'_, AppState>,
+    q: String,
+    offset: u32,
+    limit: u32,
+) -> Result<SearchResult, String> {
+    Ok(state.engine.search(&q, offset, limit))
 }
 
 /// The engine's own parse of the query, for the quick window's modifier
