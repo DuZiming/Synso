@@ -17,7 +17,7 @@ use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use globset::{Glob, GlobSet};
+use globset::{GlobBuilder, GlobSet};
 use jwalk::WalkDirGeneric;
 
 use crate::model::FileRecord;
@@ -391,14 +391,20 @@ pub fn effective_roots(roots: &[String]) -> Vec<String> {
 }
 
 /// Compiles the exclusion patterns; empty patterns list matches nothing.
+/// On Windows the globs are case-INSENSITIVE — the filesystem is (FOO.TMP
+/// and foo.tmp name the same file), so a user's `*.tmp` must prune every
+/// casing; other platforms keep globset's case-sensitive default.
 /// `pub(crate)`: the watcher (Task 8) compiles the same matcher so events
 /// under excluded paths are ignored exactly like the scan prunes them.
 pub(crate) fn build_matcher(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSet::builder();
     for pattern in patterns {
-        let glob = Glob::new(pattern).map_err(|err| {
-            SynsoError::InvalidPattern(format!("bad exclusion pattern {pattern:?}: {err}"))
-        })?;
+        let glob = GlobBuilder::new(pattern)
+            .case_insensitive(cfg!(windows))
+            .build()
+            .map_err(|err| {
+                SynsoError::InvalidPattern(format!("bad exclusion pattern {pattern:?}: {err}"))
+            })?;
         builder.add(glob);
     }
     builder
@@ -772,6 +778,49 @@ mod tests {
         }
         assert!(names.contains(&"keep.txt"));
         assert!(names.contains(&"ok.rs"));
+    }
+
+    /// The exclusion matcher must honor the HOST filesystem's casing rules:
+    /// Windows (and its users) treat `FOO.TMP` and `foo.tmp` as the same
+    /// name, so an exclusion written as `*.tmp` must prune `FOO.TMP` too;
+    /// case-sensitive platforms keep the plain glob behavior, where the
+    /// differently-cased name survives.
+    #[test]
+    fn scan_exclusions_follow_platform_casing() {
+        let (tmp, db, mut store) = test_store();
+        let root = tmp.path().join("casing");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("FOO.TMP"), b"f").unwrap();
+        fs::write(root.join("keep.txt"), b"k").unwrap();
+
+        let opts = ScanOptions {
+            roots: vec![root.to_string_lossy().into_owned()],
+            exclusions: vec!["*.tmp".into()],
+        };
+        let stats = scan(&mut store, &opts, &|_| {}).unwrap();
+
+        if cfg!(windows) {
+            assert_eq!(
+                stats.files, 1,
+                "FOO.TMP must be excluded case-insensitively on Windows"
+            );
+            let names: Vec<String> = all_rows(&db).into_iter().map(|row| row.0).collect();
+            assert!(
+                !names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case("foo.tmp")),
+                "no casing of foo.tmp may survive on Windows: {names:?}"
+            );
+            assert!(
+                names.iter().any(|name| name == "keep.txt"),
+                "keep.txt must survive on Windows"
+            );
+        } else {
+            assert_eq!(
+                stats.files, 2,
+                "case-sensitive platforms keep the differently-cased name"
+            );
+        }
     }
 
     #[test]
