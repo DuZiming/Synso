@@ -355,11 +355,24 @@ fn flush_subtree_batch(
 }
 
 /// Upserts and clears one buffered batch on the calling thread.
+/// One flush = ONE transaction: the batch's upserts commit atomically
+/// (crash mid-batch loses at most this batch's rows — the engine's
+/// half-finished-scan reconciliation story is batch-granular anyway), and
+/// the journal churn is amortized over the batch instead of paid per file.
+/// Task 20 measurement: per-row autocommit put a 100k-file first scan at
+/// ~113 files/s on this machine — journal create/commit/delete per row,
+/// further taxed by on-access scanning — against the 3300 files/s budget;
+/// the single transaction per 1000-row batch is the fix.
 fn flush_batch(store: &mut Store, batch: &mut Vec<(Vec<String>, FileRecord)>) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let tx = store.conn_mut().transaction()?;
     for (segments, mut rec) in batch.drain(..) {
         let dir_path: Vec<&str> = segments.iter().map(String::as_str).collect();
-        store.upsert_file(&dir_path, &mut rec)?;
+        crate::store::upsert_file_on(&tx, &dir_path, &mut rec)?;
     }
+    tx.commit()?;
     Ok(())
 }
 

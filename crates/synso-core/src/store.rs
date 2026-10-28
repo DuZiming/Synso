@@ -74,48 +74,7 @@ impl Store {
     /// `rec.py_init` hold the pinyin keys computed here from the name —
     /// the single choke point, so callers never pass pinyin in.
     pub fn upsert_file(&mut self, dir_path: &[&str], rec: &mut FileRecord) -> Result<()> {
-        let dir_id = resolve_dir(&self.conn, dir_path)?;
-        let ext_id = intern_extension(&self.conn, &rec.name)?;
-        let (py_full, py_init) = pinyin_keys(&rec.name);
-        // u64 columns (size, hashes) are stored as SQLite's signed 64-bit
-        // integers via a bit-preserving cast.
-        let id: FileId = self.conn.query_row(
-            "INSERT INTO files(dir, name, size, mtime, ctime, atime, ext_id, is_dir, hash_first, hash_full, py_full, py_init)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT(dir, name) DO UPDATE SET
-               size = excluded.size,
-               mtime = excluded.mtime,
-               ctime = excluded.ctime,
-               atime = excluded.atime,
-               ext_id = excluded.ext_id,
-               is_dir = excluded.is_dir,
-               hash_first = excluded.hash_first,
-               hash_full = excluded.hash_full,
-               py_full = excluded.py_full,
-               py_init = excluded.py_init
-             RETURNING id",
-            params![
-                dir_id,
-                rec.name,
-                rec.size as i64,
-                rec.mtime,
-                rec.ctime,
-                rec.atime,
-                ext_id,
-                rec.is_dir,
-                rec.hash_first.map(|h| h as i64),
-                rec.hash_full.map(|h| h as i64),
-                py_full,
-                py_init,
-            ],
-            |row| row.get(0),
-        )?;
-        rec.id = id;
-        rec.parent = dir_id;
-        rec.ext_id = ext_id;
-        rec.py_full = py_full;
-        rec.py_init = py_init;
-        Ok(())
+        upsert_file_on(&self.conn, dir_path, rec)
     }
 
     /// Deletes the `files` row `id`; `Err(NotFound)` if it does not exist.
@@ -405,6 +364,57 @@ fn backfill_pinyin_keys(conn: &Connection) -> Result<()> {
 /// Resolves `segments` in `dirs`, creating missing levels (each segment's
 /// parent is the previous one; the first segment's parent is NULL), and
 /// returns the final dir id.
+/// The row-level half of [`Store::upsert_file`], connection-generic so a
+/// caller can run many upserts inside ONE transaction — the full scan's
+/// batch flush does (Task 20: per-row autocommit made a 100k-file first
+/// scan pay journal-create/commit/delete churn per file, ~10x over the
+/// throughput budget on this machine). `pub(crate)`: the scanner's batch
+/// flush is the transactional caller.
+pub(crate) fn upsert_file_on(conn: &Connection, dir_path: &[&str], rec: &mut FileRecord) -> Result<()> {
+    let dir_id = resolve_dir(conn, dir_path)?;
+    let ext_id = intern_extension(conn, &rec.name)?;
+    let (py_full, py_init) = pinyin_keys(&rec.name);
+    // u64 columns (size, hashes) are stored as SQLite's signed 64-bit
+    // integers via a bit-preserving cast.
+    let id: FileId = conn.query_row(
+        "INSERT INTO files(dir, name, size, mtime, ctime, atime, ext_id, is_dir, hash_first, hash_full, py_full, py_init)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+         ON CONFLICT(dir, name) DO UPDATE SET
+           size = excluded.size,
+           mtime = excluded.mtime,
+           ctime = excluded.ctime,
+           atime = excluded.atime,
+           ext_id = excluded.ext_id,
+           is_dir = excluded.is_dir,
+           hash_first = excluded.hash_first,
+           hash_full = excluded.hash_full,
+           py_full = excluded.py_full,
+           py_init = excluded.py_init
+         RETURNING id",
+        params![
+            dir_id,
+            rec.name,
+            rec.size as i64,
+            rec.mtime,
+            rec.ctime,
+            rec.atime,
+            ext_id,
+            rec.is_dir,
+            rec.hash_first.map(|h| h as i64),
+            rec.hash_full.map(|h| h as i64),
+            py_full,
+            py_init,
+        ],
+        |row| row.get(0),
+    )?;
+    rec.id = id;
+    rec.parent = dir_id;
+    rec.ext_id = ext_id;
+    rec.py_full = py_full;
+    rec.py_init = py_init;
+    Ok(())
+}
+
 fn resolve_dir(conn: &Connection, segments: &[&str]) -> Result<FileId> {
     if segments.is_empty() {
         return Err(SynsoError::BadQuery(
