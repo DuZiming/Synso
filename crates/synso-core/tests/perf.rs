@@ -11,7 +11,7 @@
 //!    (the number `Engine::stats` reports; a 50MB headroom under the
 //!    spec's 300MB line).
 //!
-//! plus `obs_churn_search_latency`, the no-assert observation Task 17
+//! plus `perf_obs_churn_search_latency`, the no-assert observation Task 17
 //! flagged: search latency while a watcher batch applies (reader-vs-writer
 //! lock contention), reported as p50/p95 with and without churn.
 //!
@@ -323,7 +323,7 @@ fn report_churn_phase(label: &str, samples: &[(&'static str, u128)]) {
 /// batch-under-lock stretches of the run.
 #[test]
 #[ignore]
-fn obs_churn_search_latency() {
+fn perf_obs_churn_search_latency() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("fixture");
     for d in 0..3 {
@@ -389,6 +389,10 @@ fn obs_churn_search_latency() {
     report_churn_phase("baseline", &baseline);
     report_churn_phase("churn", &churn);
     // No latency assert: this test OBSERVES lock contention and reports.
+    // The settle pause lets the OS's on-access scanning of the ~8000
+    // churned files drain before the next test in this binary starts
+    // timing (observed: without it, the search test that follows in a
+    // combined run can catch the drain and flake over budget).
 }
 
 /// Like [`sample_engine`], but bounded by wall time instead of rounds.
