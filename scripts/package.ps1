@@ -31,14 +31,20 @@ function Invoke-Step {
 }
 
 # ------------------------------ gates ------------------------------------
-
-Invoke-Step 'cargo fmt --check' $root { cargo fmt --all --check }
-Invoke-Step 'cargo clippy (-D warnings)' $root { cargo clippy --workspace --all-targets -- -D warnings }
-Invoke-Step 'cargo test (workspace)' $root { cargo test --workspace }
+#
+# Frontend BEFORE cargo, mirroring ci.yml's step order: tauri's
+# generate_context! embeds ui/dist, so a fresh checkout without a built
+# frontend fails to compile the app crate (the dist dir must exist at
+# macro expansion) — clippy/test would trip over that before any real
+# gate ran.
 
 Invoke-Step 'svelte-check' $app { npm run check }
 Invoke-Step 'i18n parity check' $app { npm run check:i18n }
 Invoke-Step 'vite build' $app { npm run build }
+
+Invoke-Step 'cargo fmt --check' $root { cargo fmt --all --check }
+Invoke-Step 'cargo clippy (-D warnings)' $root { cargo clippy --workspace --all-targets -- -D warnings }
+Invoke-Step 'cargo test (workspace)' $root { cargo test --workspace }
 
 # ------------------------------ bundle ------------------------------------
 
@@ -49,17 +55,21 @@ Invoke-Step 'tauri build (NSIS)' $app { npm run tauri build }
 $nsisDir = Join-Path $target 'release\bundle\nsis'
 $exe     = Join-Path $target 'release\synso-app.exe'
 
+if (-not (Test-Path $nsisDir)) {
+    throw "packaging failed: no NSIS output directory at $nsisDir"
+}
+$nsisExes = @(Get-ChildItem $nsisDir -Filter *.exe)
+if ($nsisExes.Count -eq 0) {
+    throw "packaging failed: no *.exe produced in $nsisDir"
+}
+
 Write-Host ''
 Write-Host 'Package OK. Artifacts:' -ForegroundColor Green
 if (Test-Path $exe) {
     $size = '{0:N1} MiB' -f ((Get-Item $exe).Length / 1MiB)
     Write-Host "  app exe     : $exe ($size)"
 }
-if (Test-Path $nsisDir) {
-    Get-ChildItem $nsisDir -Filter *.exe | ForEach-Object {
-        $size = '{0:N1} MiB' -f ($_.Length / 1MiB)
-        Write-Host "  NSIS bundle : $($_.FullName) ($size)"
-    }
-} else {
-    Write-Warning "no NSIS output directory at $nsisDir"
+foreach ($bundle in $nsisExes) {
+    $size = '{0:N1} MiB' -f ($bundle.Length / 1MiB)
+    Write-Host "  NSIS bundle : $($bundle.FullName) ($size)"
 }
