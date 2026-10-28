@@ -417,6 +417,33 @@ impl HotIndex {
         self.slot_by_id.get(&id).copied()
     }
 
+    /// Iterates every interned dir row as `(id, parent, name)` (`None`
+    /// parent = root segment). The size aggregation (Task 11) rebuilds
+    /// the tree's adjacency from this.
+    pub(crate) fn all_dir_rows(&self) -> impl Iterator<Item = (FileId, Option<FileId>, &str)> + '_ {
+        self.dirs
+            .iter()
+            .map(|(id, entry)| (*id, entry.parent, entry.name.as_str()))
+    }
+
+    /// The interned dir id of `(parent, name)` (exact name), or `None` —
+    /// one resolution step of [`Self::resolve_dir`], exposed so the size
+    /// aggregation can walk a root path segment by segment and detect a
+    /// FILE at the chain's end.
+    pub(crate) fn dir_child(&self, parent: Option<FileId>, name: &str) -> Option<FileId> {
+        self.dir_by_parent_name
+            .get(&(parent, name.to_string()))
+            .copied()
+    }
+
+    /// The slot stored under `(parent_dir, name)` (exact name), or
+    /// `None`. The size aggregation's file-root resolution uses this.
+    pub(crate) fn slot_in_dir(&self, parent: FileId, name: &str) -> Option<usize> {
+        self.slot_by_parent_name
+            .get(&(parent, name.to_string()))
+            .copied()
+    }
+
     /// The extension text interned for `ext_id` (from the `extensions`
     /// table); `""` for the no-extension sentinel 0 and unknown ids.
     pub fn ext_of(&self, ext_id: FileId) -> &str {

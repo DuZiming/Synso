@@ -65,6 +65,7 @@ use crate::hotindex::HotIndex;
 use crate::model::{FileId, ParsedQuery};
 use crate::query::{self, SearchResult};
 use crate::scanner::{self, effective_roots, root_segment, ScanOptions};
+use crate::sizeagg::{self, SizeNode};
 use crate::store::Store;
 use crate::trash;
 use crate::watcher::{self, Watcher};
@@ -472,6 +473,30 @@ impl Engine {
     /// consumers straddle crate and app layers.
     pub fn resolve_absolute(&self, index_path: &str) -> Option<PathBuf> {
         dedup::resolve_absolute_path(&self.dedup.roots, index_path)
+    }
+
+    // ---------------- Task 11: directory size aggregation ----------------
+
+    /// Directory-size tree for the flame chart (Task 17): the subtree
+    /// behind `root` — an index-relative path in the `Hit::path` spelling
+    /// — with every node's `size` summing its descendant files' bytes and
+    /// `file_count` counting them (files included as leaf nodes). `""` is
+    /// the virtual root: name "(all)", one child per scan-root segment. A
+    /// path that names a FILE yields that file as a leaf; an unknown root
+    /// yields `None`. Each level's `children` are sorted by size
+    /// descending (ties: name ascending) and truncated to `max_children`,
+    /// the overflow merged into one trailing "(other)" node (which counts
+    /// against the budget); `depth` caps how many levels of children are
+    /// materialized (0 = none). The UI calls this with (path, 2, 40)-
+    /// shaped arguments. See [`crate::sizeagg`] for the full contract.
+    ///
+    /// Cost: O(dirs + files) time and scratch memory per call — one full
+    /// post-order aggregation walk over the hot index under its read
+    /// lock, deliberately NOT cached (invalidation would cost more than
+    /// the walk; Task 20 measures).
+    pub fn size_tree(&self, root: &str, depth: u8, max_children: u8) -> Option<SizeNode> {
+        let hot = read_unpoisoned(&self.hot);
+        sizeagg::build_tree(&hot, root, depth, max_children)
     }
 
     /// Removes one member row (alive or tombstoned) from a collection.
@@ -1480,5 +1505,235 @@ mod tests {
             vec!["fixture".to_string()],
             "docs and its subtree dirs rows are gone"
         );
+    }
+
+    // ------------------ Task 11: directory size aggregation --------------
+
+    /// Fixture with known byte sizes at three levels:
+    /// fixture/{readme.md(5), empty/, docs/{notes.txt(10), final.pdf(1),
+    /// inner/{deep.bin(100), a.txt(2)}}, media/{b.jpg(7), c.png(7)}} —
+    /// fixture totals 132 bytes / 7 files; docs 113/4; inner 102/2;
+    /// media 14/2; empty 0/0.
+    fn write_size_fixture(base: &Path) -> PathBuf {
+        let root = base.join("fixture");
+        fs::create_dir_all(root.join("docs").join("inner")).unwrap();
+        fs::create_dir_all(root.join("empty")).unwrap();
+        fs::create_dir_all(root.join("media")).unwrap();
+        fs::write(root.join("readme.md"), b"hello").unwrap();
+        fs::write(root.join("docs").join("notes.txt"), b"0123456789").unwrap();
+        fs::write(root.join("docs").join("final.pdf"), b"x").unwrap();
+        fs::write(
+            root.join("docs").join("inner").join("deep.bin"),
+            vec![0u8; 100],
+        )
+        .unwrap();
+        fs::write(root.join("docs").join("inner").join("a.txt"), b"ab").unwrap();
+        fs::write(root.join("media").join("b.jpg"), b"1234567").unwrap();
+        fs::write(root.join("media").join("c.png"), b"abcdefg").unwrap();
+        root
+    }
+
+    /// Scans [`write_size_fixture`] and returns the warmed engine.
+    fn size_fixture_engine(tmp: &tempfile::TempDir) -> Engine {
+        let engine = open_engine(&tmp.path().join("index.db"), &tmp.path().join("fixture"));
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        let (_progress, _files, _dirs) = wait_scan_finished(&rx);
+        engine
+    }
+
+    /// Known-fixture aggregation: every level's size/file_count and the
+    /// size-descending (ties: name ascending) child ordering.
+    #[test]
+    fn size_tree_aggregates_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_size_fixture(tmp.path());
+        let engine = size_fixture_engine(&tmp);
+        let sep = std::path::MAIN_SEPARATOR;
+
+        let tree = engine
+            .size_tree("fixture", 2, 40)
+            .expect("the scanned root segment resolves");
+        assert_eq!(tree.name, "fixture");
+        assert_eq!(tree.path, "fixture");
+        assert_eq!(tree.size, 132, "sum of ALL descendant file bytes");
+        assert_eq!(tree.file_count, 7, "files only — dirs never count");
+
+        // Level 1: size-descending, dirs and the direct file interleaved.
+        // The empty dir is ABSENT by contract: the aggregation walks the
+        // interned dirs tree, and an empty dir never gets a dirs row
+        // (nothing was ever upserted into it) — it aggregates nothing and
+        // its path can never be a navigable root.
+        let names: Vec<&str> = tree.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["docs", "media", "readme.md"]);
+        assert!(tree.children.iter().all(|c| c.name != "empty"));
+
+        let docs = &tree.children[0];
+        assert_eq!(docs.path, format!("fixture{sep}docs"));
+        assert_eq!((docs.size, docs.file_count), (113, 4));
+
+        // Level 2: docs' children mix a dir and files, size-descending;
+        // inner's own aggregates are complete but its children are NOT
+        // materialized (two levels below the root is all depth 2 buys).
+        let docs_names: Vec<&str> = docs.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(docs_names, vec!["inner", "notes.txt", "final.pdf"]);
+        let inner = &docs.children[0];
+        assert_eq!(inner.path, format!("fixture{sep}docs{sep}inner"));
+        assert_eq!((inner.size, inner.file_count), (102, 2));
+        assert!(
+            inner.children.is_empty(),
+            "depth 2: inner's leaves are level 3"
+        );
+
+        // A same-size tie sorts by name ascending.
+        let media = &tree.children[1];
+        assert_eq!((media.size, media.file_count), (14, 2));
+        let media_names: Vec<&str> = media.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(media_names, vec!["b.jpg", "c.png"]);
+
+        // A file child is a leaf carrying its own size and file_count 1.
+        let readme = &tree.children[2];
+        assert_eq!((readme.size, readme.file_count), (5, 1));
+        assert_eq!(readme.path, format!("fixture{sep}readme.md"));
+        assert!(readme.children.is_empty());
+    }
+
+    #[test]
+    fn size_tree_depth_and_max_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_size_fixture(tmp.path());
+        let engine = size_fixture_engine(&tmp);
+        let sep = std::path::MAIN_SEPARATOR;
+        let docs_path = format!("fixture{sep}docs");
+
+        // depth 0: full aggregates, no children at all.
+        let shallow = engine.size_tree("fixture", 0, 40).unwrap();
+        assert_eq!((shallow.size, shallow.file_count), (132, 7));
+        assert!(shallow.children.is_empty(), "depth 0 -> children empty");
+
+        // Truncation: docs has 3 children; with max_children 2 the
+        // overflow merges into a trailing "(other)" node that counts
+        // against the budget.
+        let truncated = engine.size_tree(&docs_path, 1, 2).unwrap();
+        assert_eq!(truncated.size, 113);
+        assert_eq!(truncated.children.len(), 2, "(other) counts as one child");
+        assert_eq!(truncated.children[0].name, "inner");
+        assert_eq!(
+            (truncated.children[0].size, truncated.children[0].file_count),
+            (102, 2)
+        );
+        let other = &truncated.children[1];
+        assert_eq!(other.name, "(other)");
+        assert_eq!(other.path, format!("{docs_path}{sep}(other)"));
+        assert_eq!((other.size, other.file_count), (11, 2), "notes + final");
+        assert!(other.children.is_empty());
+
+        // max_children 1: only "(other)" remains, carrying everything.
+        let single = engine.size_tree(&docs_path, 1, 1).unwrap();
+        assert_eq!(single.children.len(), 1);
+        assert_eq!(single.children[0].name, "(other)");
+        assert_eq!(
+            (single.children[0].size, single.children[0].file_count),
+            (113, 4)
+        );
+
+        // Everything fits: no "(other)" is synthesized (fixture's three
+        // children: docs, media, readme.md — empty dirs carry no node).
+        let full = engine.size_tree("fixture", 1, 40).unwrap();
+        assert_eq!(full.children.len(), 3);
+        assert!(full.children.iter().all(|c| c.name != "(other)"));
+
+        // Depth 2 materializes inner's leaf files, size-descending.
+        let deep = engine.size_tree(&docs_path, 2, 40).unwrap();
+        let inner = &deep.children[0];
+        let inner_names: Vec<&str> = inner.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(inner_names, vec!["deep.bin", "a.txt"]);
+        assert_eq!(
+            (inner.children[0].size, inner.children[0].file_count),
+            (100, 1)
+        );
+    }
+
+    #[test]
+    fn size_tree_unknown_root_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_size_fixture(tmp.path());
+        let engine = size_fixture_engine(&tmp);
+
+        assert_eq!(engine.size_tree("nosuch", 2, 40), None);
+        assert_eq!(engine.size_tree("fixture/nosuch", 2, 40), None);
+        assert_eq!(engine.size_tree("fixture/no_such_dir/deeper", 2, 40), None);
+        // A file mid-path can never have children below it.
+        assert_eq!(engine.size_tree("fixture/readme.md/deeper", 2, 40), None);
+    }
+
+    #[test]
+    fn size_tree_virtual_root_lists_volumes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vol_a = tmp.path().join("vol_a");
+        let vol_b = tmp.path().join("vol_b");
+        fs::create_dir_all(&vol_a).unwrap();
+        fs::create_dir_all(&vol_b).unwrap();
+        fs::write(vol_a.join("big1.txt"), vec![0u8; 50]).unwrap();
+        fs::write(vol_b.join("small1.txt"), b"abc").unwrap();
+
+        let engine = Engine::open(
+            &tmp.path().join("index.db"),
+            EngineOptions {
+                volumes: vec![
+                    vol_a.to_string_lossy().into_owned(),
+                    vol_b.to_string_lossy().into_owned(),
+                ],
+                exclusions: Vec::new(),
+            },
+        )
+        .unwrap();
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        let (_progress, files, _dirs) = wait_scan_finished(&rx);
+        assert_eq!(files, 2);
+        let sep = std::path::MAIN_SEPARATOR;
+
+        let all = engine
+            .size_tree("", 2, 40)
+            .expect("the virtual root always exists");
+        assert_eq!(all.name, "(all)");
+        assert_eq!(all.path, "");
+        assert_eq!((all.size, all.file_count), (53, 2), "both volumes fold in");
+
+        // One child per scan-root segment, size-descending.
+        let segments: Vec<&str> = all.children.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(segments, vec!["vol_a", "vol_b"]);
+        let va = &all.children[0];
+        assert_eq!(va.path, "vol_a");
+        assert_eq!((va.size, va.file_count), (50, 1));
+
+        // Depth 2 reaches the files below each volume segment.
+        let leaf = &va.children[0];
+        assert_eq!(leaf.name, "big1.txt");
+        assert_eq!(leaf.path, format!("vol_a{sep}big1.txt"));
+        assert_eq!((leaf.size, leaf.file_count), (50, 1));
+    }
+
+    #[test]
+    fn size_tree_file_root_is_leaf() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_size_fixture(tmp.path());
+        let engine = size_fixture_engine(&tmp);
+        let sep = std::path::MAIN_SEPARATOR;
+
+        let tree = engine
+            .size_tree(&format!("fixture{sep}readme.md"), 3, 40)
+            .expect("a path that names a file resolves to a leaf");
+        assert_eq!(tree.name, "readme.md");
+        assert_eq!(tree.path, format!("fixture{sep}readme.md"));
+        assert_eq!((tree.size, tree.file_count), (5, 1));
+        assert!(tree.children.is_empty(), "a file is always a leaf");
+
+        // Sanity: the dir-root path next to it still aggregates.
+        let dir_tree = engine
+            .size_tree(&format!("fixture{sep}docs"), 1, 40)
+            .unwrap();
+        assert_eq!((dir_tree.size, dir_tree.file_count), (113, 4));
     }
 }
