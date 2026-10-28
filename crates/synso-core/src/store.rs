@@ -32,6 +32,21 @@ ALTER TABLE files ADD COLUMN py_init TEXT NOT NULL DEFAULT '';
 /// Current schema version, stored in `PRAGMA user_version`.
 const SCHEMA_VERSION: i64 = 2;
 
+/// One row's freshly computed hashes, together with the snapshot identity
+/// the write is guarded by (`mtime` AND `size` from the dedup snapshot the
+/// hashes were computed against). The `files` table has no AUTOINCREMENT,
+/// so a rescan's purge-and-reinsert can REUSE row ids for different files;
+/// a batch persisted without the guard would stamp the old files' hashes
+/// onto the new rows and forge dupe groups the incremental path never
+/// re-verifies.
+pub struct HashUpdate {
+    pub id: FileId,
+    pub mtime: i64,
+    pub size: u64,
+    pub hash_first: Option<u64>,
+    pub hash_full: Option<u64>,
+}
+
 /// Persistent index store over a single SQLite database file.
 pub struct Store {
     conn: Connection,
@@ -220,26 +235,29 @@ impl Store {
     /// Persists computed hashes (Task 9's dedup pipeline) in one
     /// transaction: every `Some` overwrites its column, every `None`
     /// preserves the stored value — each pipeline stage persists its own
-    /// column without clobbering the other's. Returns the number of rows
-    /// updated; unknown ids update nothing and are not an error.
-    pub fn update_file_hashes(
-        &mut self,
-        updates: &[(FileId, Option<u64>, Option<u64>)],
-    ) -> Result<usize> {
+    /// column without clobbering the other's. An update applies only while
+    /// the row STILL carries the snapshot's `mtime` and `size`; a replaced
+    /// row no longer matches, so a stale in-flight batch becomes a no-op
+    /// (hashes are a cache — a lost batch is recomputed by the next run).
+    /// Returns the number of rows updated; unknown or replaced ids update
+    /// nothing and are not an error.
+    pub fn update_file_hashes(&mut self, updates: &[HashUpdate]) -> Result<usize> {
         let tx = self.conn.transaction()?;
         let mut updated = 0usize;
         {
             let mut stmt = tx.prepare(
                 "UPDATE files
-                 SET hash_first = COALESCE(?2, hash_first),
-                     hash_full = COALESCE(?3, hash_full)
-                 WHERE id = ?1",
+                 SET hash_first = COALESCE(?4, hash_first),
+                     hash_full = COALESCE(?5, hash_full)
+                 WHERE id = ?1 AND mtime = ?2 AND size = ?3",
             )?;
-            for (id, hash_first, hash_full) in updates {
+            for update in updates {
                 updated += stmt.execute(params![
-                    id,
-                    hash_first.map(|h| h as i64),
-                    hash_full.map(|h| h as i64),
+                    update.id,
+                    update.mtime,
+                    update.size as i64,
+                    update.hash_first.map(|h| h as i64),
+                    update.hash_full.map(|h| h as i64),
                 ])?;
             }
         }
@@ -476,7 +494,7 @@ fn intern_extension(conn: &Connection, name: &str) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::SCHEMA_V1_SQL;
+    use super::{HashUpdate, SCHEMA_V1_SQL};
     use crate::model::FileRecord;
     use crate::store::Store;
     use crate::SynsoError;
@@ -768,13 +786,15 @@ mod tests {
     }
 
     #[test]
-    fn update_file_hashes_coalesce_and_overwrite() {
+    fn update_file_hashes_coalesce_overwrite_and_snapshot_guard() {
         let tmp = tempfile::tempdir().unwrap();
         let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
 
+        // rec() builds rows with mtime 1_700_000_000.
         let mut record = rec("memo.txt", 5);
         store.upsert_file(&["docs"], &mut record).unwrap();
         let id = record.id;
+        const MTIME: i64 = 1_700_000_000;
 
         let hashes = |store: &Store| -> (Option<i64>, Option<i64>) {
             store
@@ -786,38 +806,84 @@ mod tests {
                 )
                 .unwrap()
         };
+        let upd = |mtime: i64, size: u64, first: Option<u64>, full: Option<u64>| HashUpdate {
+            id,
+            mtime,
+            size,
+            hash_first: first,
+            hash_full: full,
+        };
 
         // A Some overwrites; a None preserves what the row already holds
-        // (each stage persists its own column without clobbering the other).
+        // (each stage persists its own column without clobbering the other)
+        // — provided the snapshot identity still matches.
         assert_eq!(
-            store.update_file_hashes(&[(id, Some(0x11), None)]).unwrap(),
+            store
+                .update_file_hashes(&[upd(MTIME, 5, Some(0x11), None)])
+                .unwrap(),
             1,
             "exactly the addressed row is updated"
         );
         assert_eq!(hashes(&store), (Some(0x11), None));
 
         assert_eq!(
-            store.update_file_hashes(&[(id, None, Some(0x22))]).unwrap(),
+            store
+                .update_file_hashes(&[upd(MTIME, 5, None, Some(0x22))])
+                .unwrap(),
             1
         );
         assert_eq!(hashes(&store), (Some(0x11), Some(0x22)));
 
         assert_eq!(
             store
-                .update_file_hashes(&[(id, Some(0x33), Some(0x44))])
+                .update_file_hashes(&[upd(MTIME, 5, Some(0x33), Some(0x44))])
                 .unwrap(),
             1
         );
         assert_eq!(hashes(&store), (Some(0x33), Some(0x44)));
 
-        // A batch mixes rows; unknown ids simply update nothing.
+        // The snapshot guard: a row replaced (or touched) since the batch
+        // was computed matches neither its mtime nor its size — the write
+        // is a no-op and the stored values stay untouched.
         assert_eq!(
             store
-                .update_file_hashes(&[(id, Some(0x55), None), (404, Some(1), Some(1))])
+                .update_file_hashes(&[upd(MTIME + 1, 5, Some(0x99), None)])
                 .unwrap(),
-            1
+            0,
+            "an mtime mismatch rejects the write"
         );
-        assert_eq!(hashes(&store), (Some(0x55), Some(0x44)));
+        assert_eq!(
+            store
+                .update_file_hashes(&[upd(MTIME, 6, None, Some(0x99))])
+                .unwrap(),
+            0,
+            "a size mismatch rejects the write"
+        );
+        assert_eq!(
+            hashes(&store),
+            (Some(0x33), Some(0x44)),
+            "rejected batches leave the row untouched"
+        );
+
+        // A batch mixes rows; only matching rows count, unknown ids update
+        // nothing, and a repeated id's last matching write wins.
+        assert_eq!(
+            store
+                .update_file_hashes(&[
+                    upd(MTIME, 5, Some(0x55), None),
+                    upd(MTIME, 5, Some(1), Some(1)),
+                    HashUpdate {
+                        id: 404,
+                        mtime: MTIME,
+                        size: 5,
+                        hash_first: Some(1),
+                        hash_full: Some(1),
+                    },
+                ])
+                .unwrap(),
+            2
+        );
+        assert_eq!(hashes(&store), (Some(1), Some(1)));
     }
 
     #[test]

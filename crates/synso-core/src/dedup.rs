@@ -34,6 +34,15 @@
 //! without a rescan) persistence works, which is what the dedup view's
 //! `dedup_start()` speed-up relies on.
 //!
+//! The persist itself is guarded ([`HashUpdate`]): every update carries the
+//! snapshot's mtime + size and lands only while the row still matches both.
+//! That matters because the `files` table has no AUTOINCREMENT — a rescan
+//! running WHILE a dedup run is hashing purges and re-inserts rows with
+//! REUSED ids, and an unguarded batch would stamp the old files' hashes
+//! onto different new files, forging dupe groups the incremental path
+//! would never re-verify. A guard-mismatched batch is a no-op; the hashes
+//! are recomputed by the next run.
+//!
 //! v1 deliberately does NOT throttle the hashing thread (no priority
 //! tweaks, no idle-time scheduling): `std::thread` at normal priority, the
 //! OS scheduler plus the staged skip rules keep the cost bounded.
@@ -53,7 +62,7 @@ use xxhash_rust::xxh64::{xxh64, Xxh64};
 
 use crate::engine::DedupPhase;
 use crate::model::FileId;
-use crate::store::Store;
+use crate::store::{HashUpdate, Store};
 
 /// Bytes hashed in the first stage (the design's "first 4KB").
 const FIRST_CHUNK: usize = 4096;
@@ -180,6 +189,11 @@ struct Entry {
     parent: FileId,
     name: String,
     size: u64,
+    /// Snapshot mtime — identity half of the persist guard: a batch is
+    /// written only while the row still carries this mtime AND `size`, so
+    /// a rescan's purge-and-reinsert (row ids are reused) cannot inherit
+    /// another file's hashes.
+    mtime: i64,
     hash_first: Option<u64>,
     hash_full: Option<u64>,
 }
@@ -237,6 +251,7 @@ fn load_snapshot(store: &Mutex<Store>) -> Snapshot {
                 parent: rec.parent,
                 name: rec.name,
                 size: rec.size,
+                mtime: rec.mtime,
                 hash_first: rec.hash_first,
                 hash_full: rec.hash_full,
             })
@@ -278,7 +293,7 @@ pub(crate) fn run_pipeline(
     // ---- Stage 2: HashingFirst — first 4 KiB xxh64, persisted hashes reused. ----
     progress(DedupPhase::HashingFirst, 0, candidates.len() as u64);
     let mut first_hashes: Vec<Option<u64>> = vec![None; snapshot.files.len()];
-    let mut pending: Vec<(FileId, Option<u64>, Option<u64>)> = Vec::new();
+    let mut pending: Vec<HashUpdate> = Vec::new();
     let mut done: u64 = 0;
     for &idx in &candidates {
         let hash = match snapshot.files[idx].hash_first {
@@ -421,7 +436,7 @@ fn advance_stage_progress(
     phase: DedupPhase,
     done: &mut u64,
     total: u64,
-    pending: &mut Vec<(FileId, Option<u64>, Option<u64>)>,
+    pending: &mut Vec<HashUpdate>,
     store: &Mutex<Store>,
 ) {
     *done += 1;
@@ -444,7 +459,7 @@ fn hash_first_of(
     roots: &[String],
     reader: &dyn FileReader,
     outcome: &mut DedupOutcome,
-    pending: &mut Vec<(FileId, Option<u64>, Option<u64>)>,
+    pending: &mut Vec<HashUpdate>,
 ) -> Option<u64> {
     let entry = &snapshot.files[idx];
     let path = open_candidate(snapshot, entry, roots, reader, outcome)?;
@@ -469,7 +484,13 @@ fn hash_first_of(
     }
     let hash = xxh64(&chunk[..filled], 0);
     outcome.hashed_first += 1;
-    pending.push((entry.id, Some(hash), None));
+    pending.push(HashUpdate {
+        id: entry.id,
+        mtime: entry.mtime,
+        size: entry.size,
+        hash_first: Some(hash),
+        hash_full: None,
+    });
     Some(hash)
 }
 
@@ -482,7 +503,7 @@ fn hash_full_of(
     roots: &[String],
     reader: &dyn FileReader,
     outcome: &mut DedupOutcome,
-    pending: &mut Vec<(FileId, Option<u64>, Option<u64>)>,
+    pending: &mut Vec<HashUpdate>,
 ) -> Option<u64> {
     let entry = &snapshot.files[idx];
     let path = open_candidate(snapshot, entry, roots, reader, outcome)?;
@@ -507,7 +528,13 @@ fn hash_full_of(
     }
     let hash = hasher.digest();
     outcome.hashed_full += 1;
-    pending.push((entry.id, None, Some(hash)));
+    pending.push(HashUpdate {
+        id: entry.id,
+        mtime: entry.mtime,
+        size: entry.size,
+        hash_first: None,
+        hash_full: Some(hash),
+    });
     Some(hash)
 }
 
@@ -549,8 +576,12 @@ fn open_candidate(
 
 /// Persists one batch of computed hashes under one short store lock (single
 /// transaction). Store errors are swallowed: hashes are a cache — a lost
-/// batch is recomputed by the next run, never fatal to this one.
-fn flush_persist(store: &Mutex<Store>, pending: &mut Vec<(FileId, Option<u64>, Option<u64>)>) {
+/// batch is recomputed by the next run, never fatal to this one. Every
+/// update carries the snapshot's mtime + size, so a batch that was in
+/// flight while a rescan purged and re-inserted rows (REUSED ids, the
+/// files table has no AUTOINCREMENT) becomes a no-op instead of stamping
+/// the old files' hashes onto the new rows.
+fn flush_persist(store: &Mutex<Store>, pending: &mut Vec<HashUpdate>) {
     if pending.is_empty() {
         return;
     }
@@ -716,6 +747,138 @@ mod tests {
             outcome.groups.is_empty(),
             "a skipped member cannot confirm a dupe group"
         );
+    }
+
+    /// The rescan-overlap hazard: `files` has no AUTOINCREMENT, so a full
+    /// rescan running while a dedup run is hashing purges and re-inserts
+    /// rows with REUSED ids. A persist batch queued from the pre-rescan
+    /// snapshot carries the old row's mtime + size; the store guard must
+    /// turn it into a no-op, or the old file's hashes land on the new
+    /// file's row and the incremental path would later group it with the
+    /// old file's true twin WITHOUT ever reading it.
+    #[test]
+    fn stale_hash_batch_cannot_pollute_reused_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("old.txt"), b"XX").unwrap();
+        fs::write(root.join("mate.txt"), b"XX").unwrap(); // old.txt's true twin
+
+        let (_tstore, store) = test_store();
+        let rec = |name: &str, mtime: i64| FileRecord {
+            id: 0,
+            parent: 0,
+            name: name.to_string(),
+            size: 2,
+            mtime,
+            ctime: mtime,
+            atime: mtime,
+            ext_id: 0,
+            is_dir: false,
+            hash_first: None,
+            hash_full: None,
+            py_full: String::new(),
+            py_init: String::new(),
+        };
+        {
+            let mut guard = crate::engine::lock_unpoisoned(&store);
+            let mut mate = rec("mate.txt", 1_700_000_000);
+            guard.upsert_file(&["fixture"], &mut mate).unwrap();
+            let mut old = rec("old.txt", 1_700_000_100);
+            guard.upsert_file(&["fixture"], &mut old).unwrap();
+        }
+
+        // The run's queued batch: computed against the old row (mtime
+        // 1_700_000_100), holding the old content's hash.
+        let twin_hash = xxh64(b"XX", 0);
+        let stale = HashUpdate {
+            id: 0, // fixed up below once the id is known
+            mtime: 1_700_000_100,
+            size: 2,
+            hash_first: Some(twin_hash),
+            hash_full: Some(twin_hash),
+        };
+        let old_id = {
+            let guard = crate::engine::lock_unpoisoned(&store);
+            guard
+                .all_files()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.name == "old.txt")
+                .map(|r| r.id)
+                .unwrap()
+        };
+        let stale = HashUpdate {
+            id: old_id,
+            ..stale
+        };
+
+        // The rescan's purge + reinsert: the deleted row was the max id, so
+        // the replacement REUSES it — the exact hazard this guards.
+        crate::engine::lock_unpoisoned(&store)
+            .delete_file(old_id)
+            .unwrap();
+        fs::remove_file(root.join("old.txt")).unwrap();
+        fs::write(root.join("reused.txt"), b"YY").unwrap();
+        let mut reused = rec("reused.txt", 1_700_000_999);
+        crate::engine::lock_unpoisoned(&store)
+            .upsert_file(&["fixture"], &mut reused)
+            .unwrap();
+        assert_eq!(
+            reused.id, old_id,
+            "rowid reuse is what makes the stale batch dangerous"
+        );
+
+        let hashes_of = |id: FileId| -> (Option<u64>, Option<u64>) {
+            crate::engine::lock_unpoisoned(&store)
+                .all_files()
+                .unwrap()
+                .into_iter()
+                .find(|r| r.id == id)
+                .map(|r| (r.hash_first, r.hash_full))
+                .unwrap()
+        };
+
+        // Flushing the stale batch must NOT touch the replaced row...
+        assert_eq!(
+            crate::engine::lock_unpoisoned(&store)
+                .update_file_hashes(&[stale])
+                .unwrap(),
+            0,
+            "the snapshot guard must reject the replaced row"
+        );
+        assert_eq!(
+            hashes_of(old_id),
+            (None, None),
+            "no stale hash may land on the reused row"
+        );
+
+        // ...and the next run must find NO pair between the two
+        // different-content files: it re-reads both instead of trusting
+        // anything stale.
+        let reader = RealFileReader;
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let outcome = run_pipeline(&store, &roots, &reader, &noop_progress);
+        assert!(
+            outcome.groups.is_empty(),
+            "XX and YY differ, so no group may form (stale or fresh)"
+        );
+
+        // Positive control: a batch carrying the CURRENT row's identity
+        // still lands — the guard is not over-broad.
+        assert_eq!(
+            crate::engine::lock_unpoisoned(&store)
+                .update_file_hashes(&[HashUpdate {
+                    id: reused.id,
+                    mtime: 1_700_000_999,
+                    size: 2,
+                    hash_first: Some(xxh64(b"YY", 0)),
+                    hash_full: None,
+                }])
+                .unwrap(),
+            1
+        );
+        assert_eq!(hashes_of(reused.id), (Some(xxh64(b"YY", 0)), None));
     }
 
     #[test]
