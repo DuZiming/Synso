@@ -282,28 +282,22 @@ pub(crate) fn run_parsed(
         },
         None => None,
     };
-    // The path needle lowercases once; slot paths lowercase per check.
-    let path_needle: Option<String> = q.path_prefix.as_deref().map(str::to_lowercase);
+    // The path filter lowers once and precomputes what it can (see
+    // [`PathFilter`]); slot checks then cost one hash probe or one
+    // materialization, never a per-slot path rebuild.
+    let path_filter = PathFilter::build(hot, &q.path_prefix);
     // Empty text lists the most recent entries; anything else requires
     // EVERY free-text word to hit the name or a pinyin key (AND).
     let words: Vec<String> = q.text.split_whitespace().map(str::to_lowercase).collect();
     let (total, ranked) = if words.is_empty() {
-        recent_slots(
-            hot,
-            q,
-            ext_id,
-            coll_members,
-            path_needle.as_deref(),
-            offset,
-            limit,
-        )
+        recent_slots(hot, q, ext_id, coll_members, &path_filter, offset, limit)
     } else {
         match_slots(
             hot,
             q,
             ext_id,
             coll_members,
-            path_needle.as_deref(),
+            &path_filter,
             &words,
             now,
             offset,
@@ -316,24 +310,71 @@ pub(crate) fn run_parsed(
     }
 }
 
+/// The `path:` filter, prepared once per ranking pass. A needle WITH a
+/// separator can match across a segment boundary (`path:cs\proj`), so
+/// surviving slots are checked by materializing their path — the original
+/// materialize-and-check strategy. A separator-FREE needle cannot cross a
+/// boundary (every boundary holds a separator the needle lacks), so its
+/// match must lie wholly in the parent dir's path text or wholly in the
+/// name: which dirs match is a PER-DIR property, precomputed here into a
+/// set, leaving the per-slot check one hash probe plus a name scan (Task
+/// 20 measurement: per-slot path materialization was ~6x the whole 50ms
+/// budget at 1M entries, and even a memoized text lookup per slot kept it
+/// over the line). Full paths still never materialize for the whole
+/// population, only for the returned page.
+enum PathFilter {
+    None,
+    Materialize(String),
+    Fast {
+        needle: String,
+        dir_hits: HashSet<FileId>,
+    },
+}
+
+impl PathFilter {
+    /// Lowers `raw` (the stored `path:` value) and prepares the strategy.
+    fn build(hot: &HotIndex, raw: &Option<String>) -> PathFilter {
+        let Some(raw) = raw.as_deref() else {
+            return PathFilter::None;
+        };
+        let needle = raw.to_lowercase();
+        if needle.contains(['/', '\\']) {
+            return PathFilter::Materialize(needle);
+        }
+        // Which dirs' full path texts contain the needle — built once per
+        // pass over the interned tree through the per-dir text memo; a
+        // scan-root tree holds orders of magnitude fewer dirs than slots.
+        let mut memo: HashMap<FileId, String> = HashMap::new();
+        let dir_hits: HashSet<FileId> = hot
+            .all_dir_rows()
+            .filter(|(id, _, _)| dir_path_lower(hot, *id, &mut memo).contains(&needle))
+            .map(|(id, _, _)| id)
+            .collect();
+        PathFilter::Fast { needle, dir_hits }
+    }
+}
 
 /// The fast-reject chain both ranking modes run per slot BEFORE any
 /// ranking or classification: ext id and size are integer compares,
 /// collection membership one hash lookup. The `path:` filter is the one
 /// expensive predicate, so it runs LAST and only for slots that survived
-/// the cheap ones — path-filter strategy (ruling 3): MATERIALIZE-AND-CHECK
-/// per surviving slot (`path_of` + one lowercase + `contains`), chosen over
-/// a segment-wise dir-chain walk because a substring may span separator
-/// boundaries (`path:cs\proj`, `path:cs/proj`), which segment-wise checks
-/// handle awkwardly; full paths still never materialize for the whole
-/// population, only for post-filter candidates.
+/// the cheap ones — and even then it materializes a slot path only when
+/// the needle itself contains a separator (the boundary-crossing shapes
+/// like `path:cs\proj`): a separator-free needle cannot cross a segment
+/// boundary (every boundary holds a separator the needle lacks), so its
+/// match must lie wholly inside the parent dir's path text or wholly
+/// inside the name — both checked without building the slot path, against
+/// a per-pass memo of lowercased dir texts (`dir_paths`; Task 20
+/// measurement: materializing 1M slot paths was ~6x the whole 50ms
+/// budget). Full paths still never materialize for the whole population,
+/// only for the returned page.
 #[inline]
 fn passes_filters(
     hot: &HotIndex,
     q: &ParsedQuery,
     ext_id: Option<i64>,
     coll_members: Option<&HashSet<FileId>>,
-    path_needle: Option<&str>,
+    path_filter: &PathFilter,
     slot: usize,
 ) -> bool {
     if let Some(want) = ext_id {
@@ -356,12 +397,68 @@ fn passes_filters(
             return false;
         }
     }
-    if let Some(needle) = path_needle {
-        if !hot.path_of(slot).to_lowercase().contains(needle) {
-            return false;
+    match path_filter {
+        PathFilter::None => {}
+        PathFilter::Materialize(needle) => {
+            if !hot.path_of(slot).to_lowercase().contains(needle) {
+                return false;
+            }
+        }
+        PathFilter::Fast { needle, dir_hits } => {
+            // The name check is the cheaper probe and short-circuits the
+            // dir-set lookup for name-bearing paths.
+            if !hot.name_lower(slot).contains(needle)
+                && !dir_hits.contains(&hot.parent_dir(slot))
+            {
+                return false;
+            }
         }
     }
     true
+}
+
+/// Full lowercased path text of dir `id` — root segment, ..., name,
+/// separator-joined — amortized per ranking pass through `memo` (each
+/// dir's text is built at most once; a scan-root tree holds orders of
+/// magnitude fewer dirs than slots). Same chain-stop rules as
+/// [`HotIndex::path_of`]'s reconstruction (a missing ancestor row ends the
+/// chain), lowercased per segment — identical to lowercasing the joined
+/// path, since `to_lowercase` is per-char and context-free.
+fn dir_path_lower<'a>(
+    hot: &HotIndex,
+    dir: FileId,
+    memo: &'a mut HashMap<FileId, String>,
+) -> &'a str {
+    if !memo.contains_key(&dir) {
+        // Walk up to a memo hit, a root, or a missing row, then fill
+        // downward: each dir's text = its parent's text + separator +
+        // lowercased name.
+        let mut chain: Vec<FileId> = Vec::new();
+        let mut current = dir;
+        let seed = loop {
+            if let Some(text) = memo.get(&current) {
+                break Some(text.clone());
+            }
+            match hot.dir_row(current) {
+                None => break Some(String::new()),
+                Some((parent, _name)) => {
+                    chain.push(current);
+                    match parent {
+                        Some(up) => current = up,
+                        None => break None,
+                    }
+                }
+            }
+        };
+        let mut acc = seed.unwrap_or_default();
+        for id in chain.iter().rev() {
+            let (_, name) = hot.dir_row(*id).expect("pushed only when present");
+            acc.push(MAIN_SEPARATOR);
+            acc.push_str(&name.to_lowercase());
+            memo.insert(*id, acc.clone());
+        }
+    }
+    &memo[&dir]
 }
 
 /// Ranking key for one matching slot. Path STRINGS are deliberately absent:
@@ -461,7 +558,6 @@ impl<'w> PreparedWord<'w> {
     }
 }
 
-
 /// The substring pass: filter first, then classify every name/pinyin hit
 /// of ALL free-text words, keeping only the best `page_len(offset, limit)`
 /// matches in final rank order (see [`insert_top_k`]). Returns `(total,
@@ -473,7 +569,7 @@ fn match_slots(
     q: &ParsedQuery,
     ext_id: Option<i64>,
     coll_members: Option<&HashSet<FileId>>,
-    path_needle: Option<&str>,
+    path_filter: &PathFilter,
     words: &[String],
     now: i64,
     offset: u32,
@@ -490,7 +586,7 @@ fn match_slots(
     // ancestor walk once.
     let mut path_lens: HashMap<FileId, u64> = HashMap::new();
     for slot in 0..hot.slot_count() {
-        if !passes_filters(hot, q, ext_id, coll_members, path_needle, slot) {
+        if !passes_filters(hot, q, ext_id, coll_members, path_filter, slot) {
             continue;
         }
         let Some(class) = classify_words(hot, slot, &prepared) else {
@@ -546,7 +642,6 @@ fn insert_top_k<T>(
     top.insert(pos, key);
 }
 
-
 /// Where the free-text words hit `slot`: every word must match (the name
 /// arena first, a pinyin key as fallback — the AND semantics); the slot's
 /// class is the BEST class across the words.
@@ -561,7 +656,6 @@ fn classify_words(hot: &HotIndex, slot: usize, words: &[PreparedWord]) -> Option
     }
     best
 }
-
 
 /// Ranking order: better class, then recency, then shorter full path, then
 /// lexicographic full path, then slot. That final slot comparison is a
@@ -595,7 +689,7 @@ fn recent_slots(
     q: &ParsedQuery,
     ext_id: Option<i64>,
     coll_members: Option<&HashSet<FileId>>,
-    path_needle: Option<&str>,
+    path_filter: &PathFilter,
     offset: u32,
     limit: u32,
 ) -> (u64, Vec<usize>) {
@@ -604,7 +698,7 @@ fn recent_slots(
     let mut top: Vec<Recent> = Vec::new();
     let mut path_lens: HashMap<FileId, u64> = HashMap::new();
     for slot in 0..hot.slot_count() {
-        if !passes_filters(hot, q, ext_id, coll_members, path_needle, slot) {
+        if !passes_filters(hot, q, ext_id, coll_members, path_filter, slot) {
             continue;
         }
         total += 1;
@@ -622,7 +716,6 @@ fn recent_slots(
     }
     (total, top.into_iter().map(|key| key.slot).collect())
 }
-
 
 /// Materializes the `[offset, offset + limit)` slice of the ranked slots.
 /// Hits are the only place full paths are built.
@@ -707,7 +800,6 @@ fn pinyin_class(hot: &HotIndex, slot: usize, word: &PreparedWord) -> Option<Matc
         None
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1199,6 +1291,22 @@ mod tests {
         assert_eq!(engine.search("annual path:docs", 0, 10).total, 2);
         assert_eq!(engine.search("annual path:DOCS", 0, 10).total, 2);
         assert_eq!(engine.search("annual path:other ext:pdf", 0, 10).total, 1);
+        // A separator-bearing needle keeps the materialize-and-check path;
+        // it matches only when the separator spelling matches the
+        // platform's (the joined `Hit::path` spelling).
+        let sep = MAIN_SEPARATOR;
+        assert_eq!(
+            engine
+                .search(&format!("annual path:docs{sep}annual"), 0, 10)
+                .total,
+            2
+        );
+        assert_eq!(
+            engine
+                .search(&format!("annual path:nope{sep}docs"), 0, 10)
+                .total,
+            0
+        );
         // The full combination: text AND ext AND size AND path.
         let combined = engine.search("annual ext:docx size:>1mb path:docs", 0, 10);
         assert_eq!(
