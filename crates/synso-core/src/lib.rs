@@ -4,6 +4,7 @@
 //! so the scanner/engine layers built on it remain embeddable and testable.
 
 pub mod collections;
+pub mod dedup;
 pub mod engine;
 pub mod hotindex;
 pub mod model;
@@ -15,6 +16,7 @@ pub mod volumes;
 pub mod watcher;
 
 pub use collections::{Collection, MemberHit};
+pub use dedup::{DedupState, DupeGroup};
 pub use engine::{DedupPhase, Engine, EngineEvent, EngineOptions, EngineStats};
 pub use hotindex::HotIndex;
 pub use model::{FileId, FileRecord, ParsedQuery};

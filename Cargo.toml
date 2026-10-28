@@ -22,6 +22,8 @@ globset = "=0.4.15"
 notify = "=8.2.0"
 pinyin = "0.11"
 sysinfo = { version = "0.36", default-features = false, features = ["disk"] }
+# Pure-Rust, no_std, dependency-free xxHash (verified to build on 1.83).
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 windows = { version = "0.62", features = ["Win32_Storage_FileSystem"] }
 junction = "=2.0.0"
 tempfile = "=3.23.0"

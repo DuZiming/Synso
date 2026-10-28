@@ -42,6 +42,11 @@ impl Store {
     /// schema up to [`SCHEMA_VERSION`].
     pub fn open(path: &Path) -> Result<Store> {
         let mut conn = Connection::open(path)?;
+        // Scans, watcher batches and dedup persists share this database from
+        // different threads (and a test may open a second connection); the
+        // short busy wait turns their rare overlap into a wait instead of an
+        // immediate SQLITE_BUSY error.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         migrate(&mut conn)?;
         Ok(Store { conn })
     }
@@ -210,6 +215,36 @@ impl Store {
             )
             .optional()?;
         Ok(text)
+    }
+
+    /// Persists computed hashes (Task 9's dedup pipeline) in one
+    /// transaction: every `Some` overwrites its column, every `None`
+    /// preserves the stored value — each pipeline stage persists its own
+    /// column without clobbering the other's. Returns the number of rows
+    /// updated; unknown ids update nothing and are not an error.
+    pub fn update_file_hashes(
+        &mut self,
+        updates: &[(FileId, Option<u64>, Option<u64>)],
+    ) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut updated = 0usize;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE files
+                 SET hash_first = COALESCE(?2, hash_first),
+                     hash_full = COALESCE(?3, hash_full)
+                 WHERE id = ?1",
+            )?;
+            for (id, hash_first, hash_full) in updates {
+                updated += stmt.execute(params![
+                    id,
+                    hash_first.map(|h| h as i64),
+                    hash_full.map(|h| h as i64),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(updated)
     }
 
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
@@ -730,6 +765,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(full, "baogao.docx");
+    }
+
+    #[test]
+    fn update_file_hashes_coalesce_and_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
+
+        let mut record = rec("memo.txt", 5);
+        store.upsert_file(&["docs"], &mut record).unwrap();
+        let id = record.id;
+
+        let hashes = |store: &Store| -> (Option<i64>, Option<i64>) {
+            store
+                .conn
+                .query_row(
+                    "SELECT hash_first, hash_full FROM files WHERE id = ?1",
+                    params![id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap()
+        };
+
+        // A Some overwrites; a None preserves what the row already holds
+        // (each stage persists its own column without clobbering the other).
+        assert_eq!(
+            store.update_file_hashes(&[(id, Some(0x11), None)]).unwrap(),
+            1,
+            "exactly the addressed row is updated"
+        );
+        assert_eq!(hashes(&store), (Some(0x11), None));
+
+        assert_eq!(
+            store.update_file_hashes(&[(id, None, Some(0x22))]).unwrap(),
+            1
+        );
+        assert_eq!(hashes(&store), (Some(0x11), Some(0x22)));
+
+        assert_eq!(
+            store
+                .update_file_hashes(&[(id, Some(0x33), Some(0x44))])
+                .unwrap(),
+            1
+        );
+        assert_eq!(hashes(&store), (Some(0x33), Some(0x44)));
+
+        // A batch mixes rows; unknown ids simply update nothing.
+        assert_eq!(
+            store
+                .update_file_hashes(&[(id, Some(0x55), None), (404, Some(1), Some(1))])
+                .unwrap(),
+            1
+        );
+        assert_eq!(hashes(&store), (Some(0x55), Some(0x44)));
     }
 
     #[test]

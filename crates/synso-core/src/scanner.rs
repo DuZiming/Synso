@@ -510,6 +510,29 @@ pub fn is_placeholder_attr(attrs: u32) -> bool {
     attrs & (0x1000 | 0x400000) != 0
 }
 
+/// Raw Windows attribute bits of `path` via `GetFileAttributesW`, or `None`
+/// when the path cannot be statted (vanished mid-walk, inaccessible).
+/// Shared by the scanner's reparse guard and dedup's placeholder skip
+/// (Task 9), so both agree on one attribute source.
+#[cfg(windows)]
+pub(crate) fn file_attributes(path: &Path) -> Option<u32> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{GetFileAttributesW, INVALID_FILE_ATTRIBUTES};
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let attrs = unsafe { GetFileAttributesW(PCWSTR::from_raw(wide.as_ptr())) };
+    (attrs != INVALID_FILE_ATTRIBUTES).then_some(attrs)
+}
+
+/// Non-Windows stand-in: no cloud-placeholder concept, zero attribute bits
+/// (`is_placeholder_attr(0)` is false, so nothing is ever skipped as one).
+#[cfg(not(windows))]
+pub(crate) fn file_attributes(_path: &Path) -> Option<u32> {
+    Some(0)
+}
+
 /// True when `path` itself is a symlink/junction, using stat metadata.
 fn is_reparse_point(path: &Path) -> bool {
     has_reparse_attr(path)
@@ -519,22 +542,14 @@ fn is_reparse_point(path: &Path) -> bool {
 }
 
 /// True when `path` carries `FILE_ATTRIBUTE_REPARSE_POINT` (0x400):
-/// symlink, junction, mount point or app-exec link. Queried through
-/// `GetFileAttributesW` so the check is independent of what the directory
-/// listing reported. An unreadable path (vanished mid-scan) reports false
-/// and is later counted as an error when its metadata prefetch fails.
+/// symlink, junction, mount point or app-exec link, queried through
+/// [`file_attributes`]. An unreadable path (vanished mid-scan) reports
+/// false and is later counted as an error when its metadata prefetch fails.
 #[cfg(windows)]
 fn has_reparse_attr(path: &Path) -> bool {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
-    use windows::Win32::Storage::FileSystem::{
-        GetFileAttributesW, FILE_ATTRIBUTE_REPARSE_POINT, INVALID_FILE_ATTRIBUTES,
-    };
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    wide.push(0);
-    let attrs = unsafe { GetFileAttributesW(PCWSTR::from_raw(wide.as_ptr())) };
-    attrs != INVALID_FILE_ATTRIBUTES && attrs & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+    file_attributes(path).is_some_and(|attrs| attrs & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0)
 }
 
 #[cfg(not(windows))]

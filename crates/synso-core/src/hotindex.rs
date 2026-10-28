@@ -410,6 +410,13 @@ impl HotIndex {
         self.ids[slot]
     }
 
+    /// The slot whose `files` row id is `id` (O(1) reverse lookup), or
+    /// `None` when the row is not indexed. The dedup groups view (Task 9)
+    /// materializes stored groups' members through this.
+    pub fn slot_of_id(&self, id: FileId) -> Option<usize> {
+        self.slot_by_id.get(&id).copied()
+    }
+
     /// The extension text interned for `ext_id` (from the `extensions`
     /// table); `""` for the no-extension sentinel 0 and unknown ids.
     pub fn ext_of(&self, ext_id: FileId) -> &str {
@@ -698,6 +705,10 @@ mod tests {
         assert_eq!(hot.ext_of(alpha.ext_id), "txt");
         assert_eq!(hot.ext_of(memo.ext_id), "md");
         assert_eq!(hot.ext_of(0), "");
+        // The row-id reverse lookup (dedup groups materialization).
+        assert_eq!(hot.slot_of_id(alpha.id), Some(0));
+        assert_eq!(hot.slot_of_id(memo.id), Some(1));
+        assert_eq!(hot.slot_of_id(424_242), None);
     }
 
     /// Full incremental round-trip: upsert a brand-new row (new dir chain

@@ -471,7 +471,10 @@ fn page(hot: &HotIndex, ranked: &[usize], offset: u32, limit: u32) -> Vec<Hit> {
         .collect()
 }
 
-fn hit_of(hot: &HotIndex, slot: usize) -> Hit {
+/// Materializes one fully populated [`Hit`] for `slot` (the only place a
+/// full path string is built). `pub(crate)`: the dedup groups view
+/// (Task 9) materializes its stored groups' members the same way.
+pub(crate) fn hit_of(hot: &HotIndex, slot: usize) -> Hit {
     Hit {
         id: hot.file_id(slot),
         path: hot.path_of(slot),

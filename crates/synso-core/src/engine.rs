@@ -37,16 +37,30 @@
 //! store -> hot ordering as a scan, so watcher edits and scan reloads
 //! serialize; events that arrive while a scan holds the mutex queue in the
 //! watcher's channel and apply right after — nothing is dropped.
+//!
+//! Dedup (Task 9): [`Engine::dedup_start`] runs the staged hashing
+//! pipeline (see [`crate::dedup`]) on its own thread — one run at a time,
+//! the slot claimed by CAS and released by the same drop-guard pattern as
+//! the scan slot. Hashing runs entirely OUTSIDE the store lock; only the
+//! snapshot read and short batched hash persists take it. One run is also
+//! auto-started 30 seconds after the first successful `ScanFinished` (the
+//! timer holds only a `Weak` to the dedup state, so dropping the engine
+//! cancels a pending kick-off instead of hashing behind the app's back).
+//! [`Engine::resolve_absolute`] maps index-relative paths back to real
+//! disk paths — hashing needs them, and trash (Task 10) and reveal
+//! (Task 15) will reuse the same mapping.
 
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
 use crate::collections::{self, Collection, MemberHit};
+use crate::dedup::{self, DedupState, DupeGroup, StoredGroup};
 use crate::hotindex::HotIndex;
 use crate::model::{FileId, ParsedQuery};
 use crate::query::{self, SearchResult};
@@ -54,6 +68,11 @@ use crate::scanner::{self, effective_roots, root_segment, ScanOptions};
 use crate::store::Store;
 use crate::watcher::Watcher;
 use crate::Result;
+
+/// Delay between the first successful `ScanFinished` and the engine's
+/// automatic dedup kick-off (the design's "idle-time start"; the dedup
+/// view calls `dedup_start()` to run it right now instead).
+const DEDUP_AUTOSTART_DELAY: Duration = Duration::from_secs(30);
 
 /// What the engine scans and what it skips. Empty `volumes` means "all
 /// fixed local volumes" (see [`crate::volumes::fixed_volumes`]);
@@ -65,8 +84,10 @@ pub struct EngineOptions {
     pub exclusions: Vec<String>,
 }
 
-/// Phase of a dedup run. Defined here so the event stream keeps its shape
-/// when dedup lands (Task 9); the engine does not emit dedup events yet.
+/// Phase of a dedup run (Task 9). The engine walks `Idle -> Grouping ->
+/// HashingFirst -> HashingFull -> Done` (intermediate stages are skipped
+/// when they have no work); `Grouping` reappears as the in-progress phase
+/// of every new run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DedupPhase {
     #[default]
@@ -99,13 +120,18 @@ pub enum EngineEvent {
     /// consistent when this fires, so subscribers can just re-query. Carries
     /// no payload — polls of `stats()`/`search()` are the source of truth.
     FsChanged,
-    /// Reserved for Task 9.
+    /// Dedup pipeline progress (Task 9): `done`/`total` count the records
+    /// of the current stage, emitted at every stage change and every 500
+    /// records within one. The final event carries `phase: Done` with
+    /// `done == total ==` the hash computations the run performed.
     DedupProgress {
         phase: DedupPhase,
         done: u64,
         total: u64,
     },
-    /// Reserved for Task 9.
+    /// A dedup run finished; `groups` is its group count. Fired after the
+    /// state machine reached `Done`, so [`Engine::dedup_groups`] already
+    /// serves the fresh groups when this arrives.
     DedupFinished { groups: u64 },
 }
 
@@ -132,6 +158,35 @@ pub struct Engine {
     /// Started lazily by [`Engine::start_watcher`]; dropping the engine
     /// drops the handle, which stops and joins the debounce thread.
     watcher: Mutex<Option<Watcher>>,
+    /// Dedup state machine + worker plumbing (Task 9). Threads and the
+    /// auto-start timer own `Arc`s of this, never of the engine.
+    dedup: Arc<DedupShared>,
+    /// Set on the first successful `ScanFinished` so the automatic dedup
+    /// kick-off happens exactly once per engine.
+    dedup_autostarted: Arc<AtomicBool>,
+}
+
+/// State shared between the engine, the dedup worker thread and the
+/// auto-start timer (Task 9).
+struct DedupShared {
+    /// One dedup run at a time: CAS claim, released by a drop guard.
+    running: AtomicBool,
+    /// The state machine behind `dedup_state()` plus the last completed
+    /// run's groups.
+    book: Mutex<DedupBookkeeping>,
+    /// Store access for the snapshot read and short persist batches.
+    store: Arc<Mutex<Store>>,
+    /// Effective scan roots (plain spellings), precomputed once at open so
+    /// path resolution never re-enumerates volumes per hashed file.
+    roots: Vec<String>,
+    /// Event fan-out (DedupProgress / DedupFinished).
+    subscribers: Arc<Mutex<Vec<Sender<EngineEvent>>>>,
+}
+
+/// The bookkeeping behind [`Engine::dedup_state`] / [`Engine::dedup_groups`].
+struct DedupBookkeeping {
+    state: DedupState,
+    groups: Arc<Vec<StoredGroup>>,
 }
 
 impl Engine {
@@ -141,17 +196,31 @@ impl Engine {
     pub fn open(db_path: &Path, opts: EngineOptions) -> Result<Engine> {
         let store = Arc::new(Mutex::new(Store::open(db_path)?));
         let hot = Arc::new(RwLock::new(HotIndex::cold()));
+        let scan_opts = ScanOptions {
+            roots: opts.volumes,
+            exclusions: opts.exclusions,
+        };
+        let subscribers: Arc<Mutex<Vec<Sender<EngineEvent>>>> = Arc::new(Mutex::new(Vec::new()));
+        let dedup = Arc::new(DedupShared {
+            running: AtomicBool::new(false),
+            book: Mutex::new(DedupBookkeeping {
+                state: DedupState::default(),
+                groups: Arc::new(Vec::new()),
+            }),
+            store: Arc::clone(&store),
+            roots: effective_roots(&scan_opts.roots),
+            subscribers: Arc::clone(&subscribers),
+        });
         let engine = Engine {
-            store: store.clone(),
+            store: Arc::clone(&store),
             hot: hot.clone(),
-            subscribers: Arc::new(Mutex::new(Vec::new())),
-            scan_opts: ScanOptions {
-                roots: opts.volumes,
-                exclusions: opts.exclusions,
-            },
+            subscribers,
+            scan_opts,
             scanning: Arc::new(AtomicBool::new(false)),
             db_path: db_path.to_path_buf(),
             watcher: Mutex::new(None),
+            dedup,
+            dedup_autostarted: Arc::new(AtomicBool::new(false)),
         };
         if let Err(err) = thread::Builder::new()
             .name("synso-hot-load".into())
@@ -193,7 +262,9 @@ impl Engine {
             let subscribers = self.subscribers.clone();
             let scanning = self.scanning.clone();
             let opts = self.scan_opts.clone();
-            move || scan_cycle(store, hot, subscribers, scanning, opts)
+            let dedup = Arc::clone(&self.dedup);
+            let autostarted = Arc::clone(&self.dedup_autostarted);
+            move || scan_cycle(store, hot, subscribers, scanning, opts, dedup, autostarted)
         });
         if let Err(err) = spawn {
             eprintln!("synso: failed to spawn the scan thread: {err}");
@@ -323,6 +394,85 @@ impl Engine {
         collections::add(&mut lock_unpoisoned(&self.store), id, members)
     }
 
+    // ---------------- Task 9: dedup state machine ------------------------
+
+    /// Starts a dedup run on a background thread; a no-op while one is
+    /// already running. The pipeline (see [`crate::dedup`]) groups by size,
+    /// hashes first 4 KiB for same-size survivors, then whole files —
+    /// persisted hashes are reused, so repeat runs are incremental.
+    /// `Idle -> Grouping` happens synchronously here; subscribers receive
+    /// [`EngineEvent::DedupProgress`] / [`EngineEvent::DedupFinished`] and
+    /// pollers read [`Engine::dedup_state`]. The engine also auto-starts
+    /// one run 30s after the first successful scan finishes.
+    pub fn dedup_start(&self) {
+        launch_dedup(&self.dedup);
+    }
+
+    /// Snapshot of the dedup state machine. While a run is going,
+    /// `done`/`total` mirror the latest progress event; at
+    /// [`DedupPhase::Done`] they equal the hash computations this run
+    /// performed (0 = fully incremental). `groups` is the last COMPLETED
+    /// run's group count; `errors` counts files skipped unreadable or as
+    /// cloud placeholders.
+    pub fn dedup_state(&self) -> DedupState {
+        lock_unpoisoned(&self.dedup.book).state
+    }
+
+    /// The last completed run's groups, `[offset, offset + limit)` of the
+    /// size-descending order, members materialized as search-style
+    /// [`crate::query::Hit`]s from the hot index. Files deleted since the
+    /// run drop out; a group falling below two surviving members dissolves
+    /// (its slot in the ordering disappears, the other groups keep their
+    /// relative order).
+    pub fn dedup_groups(&self, offset: u32, limit: u32) -> Vec<DupeGroup> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        // Snapshot the stored groups (cheap Arc clone) and release the
+        // bookkeeping lock before touching the hot index — the engine's
+        // locks never nest.
+        let groups = Arc::clone(&lock_unpoisoned(&self.dedup.book).groups);
+        let hot = read_unpoisoned(&self.hot);
+        let mut skipped: u32 = 0;
+        let mut page = Vec::new();
+        for group in groups.iter() {
+            let members: Vec<crate::query::Hit> = group
+                .members
+                .iter()
+                .filter_map(|id| hot.slot_of_id(*id).map(|slot| query::hit_of(&hot, slot)))
+                .collect();
+            if members.len() < 2 {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            page.push(DupeGroup {
+                hash: group.hash,
+                size: group.size,
+                members,
+            });
+            if page.len() == limit as usize {
+                break;
+            }
+        }
+        page
+    }
+
+    /// The absolute disk path of an index-relative path (root segment
+    /// first, `MAIN_SEPARATOR`-joined — the spelling of
+    /// [`crate::query::Hit::path`]), resolved by matching the path's first
+    /// segment against the engine's effective scan roots. `None` when no
+    /// root's segment matches. Hashing (Task 9), trash (Task 10) and
+    /// reveal (Task 15) all key on this: index paths deliberately carry no
+    /// drive prefix, so the engine owns the root mapping. Public for the
+    /// same reason as [`crate::scanner::is_placeholder_attr`] — its
+    /// consumers straddle crate and app layers.
+    pub fn resolve_absolute(&self, index_path: &str) -> Option<PathBuf> {
+        dedup::resolve_absolute_path(&self.dedup.roots, index_path)
+    }
+
     /// Removes one member row (alive or tombstoned) from a collection.
     pub fn coll_remove(&self, id: i64, member: FileId) -> Result<()> {
         collections::remove(&mut lock_unpoisoned(&self.store), id, member)
@@ -356,8 +506,9 @@ fn unix_now() -> i64 {
 
 /// Poison-tolerant locking for the engine's three locks (see the module
 /// docs for why each lock's invariants survive a panic). Also the reason
-/// this crate has no `unwrap`/`expect` in library code.
-fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+/// this crate has no `unwrap`/`expect` in library code. `pub(crate)`: the
+/// dedup pipeline (Task 9) takes the same short store locks.
+pub(crate) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -377,12 +528,12 @@ fn write_unpoisoned<T>(rwlock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T>
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Releases the one-scan-at-a-time flag on ANY exit from a scan cycle —
-/// normal return or panic unwind — so a failed or panicked scan can never
-/// leave `start_full_scan` a silent no-op forever.
-struct ScanSlot<'a>(&'a AtomicBool);
+/// Releases a one-at-a-time flag (the scan slot or the dedup slot) on ANY
+/// exit from its worker — normal return or panic unwind — so a failed or
+/// panicked run can never leave its trigger a silent no-op forever.
+struct SlotGuard<'a>(&'a AtomicBool);
 
-impl Drop for ScanSlot<'_> {
+impl Drop for SlotGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
@@ -390,15 +541,20 @@ impl Drop for ScanSlot<'_> {
 
 /// One full scan cycle on its own thread: purge each root's subtree, walk,
 /// reload the hot index, broadcast the outcome. The scan slot is released
-/// by [`ScanSlot`] on every exit path, panic included.
+/// by [`SlotGuard`] on every exit path, panic included. On success this is
+/// ALSO where the engine's one-time automatic dedup kick-off is scheduled
+/// (30s later, see [`DEDUP_AUTOSTART_DELAY`]).
+#[allow(clippy::too_many_arguments)]
 fn scan_cycle(
     store: Arc<Mutex<Store>>,
     hot: Arc<RwLock<HotIndex>>,
     subscribers: Arc<Mutex<Vec<Sender<EngineEvent>>>>,
     scanning: Arc<AtomicBool>,
     opts: ScanOptions,
+    dedup: Arc<DedupShared>,
+    autostarted: Arc<AtomicBool>,
 ) {
-    let _slot = ScanSlot(&scanning);
+    let _slot = SlotGuard(&scanning);
     let outcome = {
         let mut guard = lock_unpoisoned(&store);
         purge_root_subtrees(&mut guard, &opts);
@@ -425,6 +581,22 @@ fn scan_cycle(
     match outcome {
         Ok((files, dirs)) => {
             broadcast(&subscribers, EngineEvent::ScanFinished { files, dirs });
+            // Auto-start (Task 9): exactly one run, 30s after the FIRST
+            // successful scan. The timer holds only a `Weak` to the dedup
+            // state — an engine dropped meanwhile cancels the kick-off (the
+            // upgrade fails) instead of hashing behind the app's back. A
+            // spawn failure just loses this best-effort kick-off.
+            if !autostarted.swap(true, Ordering::AcqRel) {
+                let dedup = Arc::downgrade(&dedup);
+                let _ = thread::Builder::new()
+                    .name("synso-dedup-autostart".into())
+                    .spawn(move || {
+                        thread::sleep(DEDUP_AUTOSTART_DELAY);
+                        if let Some(dedup) = dedup.upgrade() {
+                            launch_dedup(&dedup);
+                        }
+                    });
+            }
         }
         // The failure description travels in the event (no ScanFinished is
         // emitted); nothing else to do — the store stays partial until the
@@ -439,6 +611,86 @@ fn scan_cycle(
             );
         }
     }
+}
+
+/// Claims the dedup slot, resets the state machine to `Grouping` (the
+/// `Idle -> Grouping` transition `dedup_start` promises — synchronously,
+/// so pollers never miss it) and spawns the worker thread. A no-op when a
+/// run is already going. Returns whether a run was started.
+fn launch_dedup(dedup: &Arc<DedupShared>) -> bool {
+    if dedup
+        .running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    {
+        let mut book = lock_unpoisoned(&dedup.book);
+        book.state = DedupState {
+            phase: DedupPhase::Grouping,
+            ..DedupState::default()
+        };
+        // `groups` keeps the previous run's list: dedup_groups goes on
+        // serving it until the new run finishes.
+    }
+    let spawn = thread::Builder::new().name("synso-dedup".into()).spawn({
+        let dedup = Arc::clone(dedup);
+        move || dedup_cycle(dedup)
+    });
+    match spawn {
+        Ok(_) => true,
+        Err(err) => {
+            eprintln!("synso: failed to spawn the dedup thread: {err}");
+            dedup.running.store(false, Ordering::Release);
+            lock_unpoisoned(&dedup.book).state.phase = DedupPhase::Idle;
+            false
+        }
+    }
+}
+
+/// One dedup cycle on its own thread: run the staged pipeline against the
+/// store (hashing happens outside the lock — only the snapshot read and
+/// short persist batches take it), fold the outcome into the state
+/// machine, then broadcast the final progress and `DedupFinished`. The
+/// slot is released by [`SlotGuard`] on every exit path, panic included.
+/// The cycle is eprintln-free by design: every skip is counted in
+/// [`DedupState::errors`] instead, and store failures merely degrade the
+/// run — they never panic it.
+fn dedup_cycle(dedup: Arc<DedupShared>) {
+    let _slot = SlotGuard(&dedup.running);
+    let subscribers = Arc::clone(&dedup.subscribers);
+    let progress = |phase: DedupPhase, done: u64, total: u64| {
+        {
+            let mut book = lock_unpoisoned(&dedup.book);
+            book.state.phase = phase;
+            book.state.done = done;
+            book.state.total = total;
+        }
+        broadcast(
+            &subscribers,
+            EngineEvent::DedupProgress { phase, done, total },
+        );
+    };
+    let reader = dedup::RealFileReader;
+    let outcome = dedup::run_pipeline(&dedup.store, &dedup.roots, &reader, &progress);
+    let groups = outcome.groups.len() as u64;
+    let hashed = outcome.hashed_first + outcome.hashed_full;
+    {
+        let mut book = lock_unpoisoned(&dedup.book);
+        book.state = DedupState {
+            phase: DedupPhase::Done,
+            done: hashed,
+            total: hashed,
+            groups,
+            // Both skip kinds share the public counter (the design's
+            // "marked skipped, not grouped"); the pipeline outcome keeps
+            // them apart for tests.
+            errors: outcome.errors + outcome.placeholders,
+        };
+        book.groups = Arc::new(outcome.groups);
+    }
+    broadcast(&subscribers, EngineEvent::DedupFinished { groups });
 }
 
 /// Rescan reconciliation: delete each root's whole index subtree before
@@ -753,5 +1005,209 @@ mod tests {
         let (_progress, files, dirs) = wait_scan_finished(&rx);
         assert_eq!((files, dirs), (3, 2));
         assert_eq!(engine.stats().files, 3);
+    }
+
+    // ------------------- Task 9: dedup pipeline ---------------------------
+
+    /// Receives events until `DedupFinished`, returning the finished run's
+    /// group count and the number of `DedupProgress` events seen on the way.
+    fn wait_dedup_finished(rx: &Receiver<EngineEvent>) -> (u64, usize) {
+        let mut progress = 0usize;
+        loop {
+            let event = rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("an event arrives before the timeout");
+            match event {
+                EngineEvent::DedupProgress { .. } => progress += 1,
+                EngineEvent::DedupFinished { groups } => return (groups, progress),
+                other => panic!("expected a dedup event, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn dedup_finds_identical_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("dup_a.txt"), b"alpha bravo").unwrap();
+        fs::write(root.join("sub").join("dup_b.txt"), b"alpha bravo").unwrap();
+        fs::write(root.join("other.txt"), b"alpha bravO").unwrap(); // same size, last byte differs
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        let (_progress, files, _dirs) = wait_scan_finished(&rx);
+        assert_eq!(files, 3);
+
+        engine.dedup_start();
+        let (groups, progress_events) = wait_dedup_finished(&rx);
+        assert_eq!(groups, 1, "only the byte-identical pair groups");
+        assert!(progress_events >= 1, "progress flows via DedupProgress");
+
+        let state = engine.dedup_state();
+        assert_eq!(state.phase, DedupPhase::Done);
+        assert_eq!(state.groups, 1);
+
+        let page = engine.dedup_groups(0, 10);
+        assert_eq!(page.len(), 1);
+        let group = &page[0];
+        assert_eq!(group.size, 11, "alpha bravo");
+        assert_eq!(group.members.len(), 2);
+        let mut names: Vec<&str> = group.members.iter().map(|m| m.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, vec!["dup_a.txt", "dup_b.txt"]);
+        assert!(group.members.iter().all(|m| m.size == 11 && !m.is_dir));
+        // Members are real hits whose paths resolve through the engine.
+        for member in &group.members {
+            assert!(engine.resolve_absolute(&member.path).is_some());
+        }
+        // The one-byte-different file belongs to no group; paging past the
+        // single group yields nothing.
+        assert!(engine
+            .dedup_groups(0, 10)
+            .iter()
+            .flat_map(|g| &g.members)
+            .all(|m| m.name != "other.txt"));
+        assert!(engine.dedup_groups(1, 10).is_empty());
+    }
+
+    #[test]
+    fn dedup_excludes_zero_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("empty_a.txt"), b"").unwrap();
+        fs::write(root.join("empty_b.txt"), b"").unwrap();
+        fs::write(root.join("real.txt"), b"r").unwrap();
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        engine.dedup_start();
+        let (groups, _progress) = wait_dedup_finished(&rx);
+        assert_eq!(groups, 0, "zero-size files never group");
+        assert!(engine.dedup_groups(0, 10).is_empty());
+        let state = engine.dedup_state();
+        assert_eq!(state.phase, DedupPhase::Done);
+        assert_eq!(state.errors, 0, "the size-0 filter is not an error");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dedup_marks_unreadable_skipped() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("locked.txt"), b"shared secret").unwrap();
+        fs::write(root.join("free.txt"), b"shared secret").unwrap();
+
+        // Hold the file with NO sharing flags: any other open fails.
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(root.join("locked.txt"))
+            .unwrap();
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        engine.dedup_start();
+        let (groups, _progress) = wait_dedup_finished(&rx);
+        assert_eq!(groups, 0, "the locked member cannot confirm a group");
+        assert!(engine.dedup_groups(0, 10).is_empty());
+        let state = engine.dedup_state();
+        assert_eq!(state.phase, DedupPhase::Done);
+        assert!(
+            state.errors >= 1,
+            "the sharing violation is counted, not fatal"
+        );
+
+        // Release the handle: a rerun hashes the file and the pair groups.
+        drop(held);
+        engine.dedup_start();
+        let (groups, _progress) = wait_dedup_finished(&rx);
+        assert_eq!(groups, 1);
+        assert_eq!(engine.dedup_groups(0, 10)[0].members.len(), 2);
+        assert_eq!(engine.dedup_state().errors, 0, "errors are per run");
+    }
+
+    #[test]
+    fn dedup_persists_hashes_and_is_incremental() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("keep1.txt"), b"persist me!!").unwrap();
+        fs::write(root.join("keep2.txt"), b"persist me!!").unwrap();
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        // First run: both files are hashed.
+        engine.dedup_start();
+        let (groups, _progress) = wait_dedup_finished(&rx);
+        assert_eq!(groups, 1);
+        let first_state = engine.dedup_state();
+        assert!(first_state.done > 0, "the first run did hashing work");
+
+        // The computed hashes live in the store itself.
+        let store = Store::open(&db_path).unwrap();
+        let rows = store.all_files().unwrap();
+        for name in ["keep1.txt", "keep2.txt"] {
+            let row = rows.iter().find(|r| r.name == name).unwrap();
+            assert!(row.hash_first.is_some(), "{name} hash_first persisted");
+            assert!(row.hash_full.is_some(), "{name} hash_full persisted");
+        }
+
+        // Second run: everything is already persisted, no hashing happens.
+        engine.dedup_start();
+        let (groups2, _progress2) = wait_dedup_finished(&rx);
+        assert_eq!(groups2, 1, "the group is found again");
+        let second_state = engine.dedup_state();
+        assert_eq!(second_state.phase, DedupPhase::Done);
+        assert_eq!(
+            (second_state.done, second_state.total),
+            (0, 0),
+            "done does not grow: already-hashed files are skipped"
+        );
+    }
+
+    /// The absolute-path resolution the dedup hashing (and Task 10 trash /
+    /// Task 15 reveal) rely on: a hit's index-relative path under a NESTED
+    /// root resolves to the real file, which then actually opens on disk.
+    #[test]
+    fn resolve_absolute_opens_nested_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("readme.md"), b"hello nested").unwrap();
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        let res = engine.search("readme", 0, 5);
+        assert_eq!(res.total, 1);
+        let abs = engine
+            .resolve_absolute(&res.hits[0].path)
+            .expect("the root segment resolves");
+        assert_eq!(abs, root.join("readme.md"));
+        assert_eq!(fs::read_to_string(&abs).unwrap(), "hello nested");
+        // A path whose root segment matches no root cannot resolve.
+        assert_eq!(engine.resolve_absolute("not_a_root_segment/x.txt"), None);
     }
 }
