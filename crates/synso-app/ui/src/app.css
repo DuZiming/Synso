@@ -156,3 +156,165 @@ button.primary:disabled {
   margin: 0;
   overflow-wrap: anywhere;
 }
+
+/* ---------------- First-run wizard (Task 14) ---------------- */
+
+.wizard {
+  max-width: 640px;
+  margin: 12px auto 0;
+}
+
+.wiz-head h1 {
+  font-size: 22px;
+  margin: 8px 0 6px;
+}
+
+.wiz-head .hint {
+  margin: 0 0 4px;
+}
+
+.steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  list-style: none;
+  padding: 0;
+  margin: 18px 0;
+}
+
+.steps li {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 4px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+
+.steps li.current {
+  color: var(--accent);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+
+.steps li.done {
+  border-style: dashed;
+}
+
+.step {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px 20px;
+}
+
+.step h2 {
+  font-size: 17px;
+  margin: 0 0 6px;
+}
+
+.step .hint {
+  margin: 0 0 14px;
+}
+
+.volumes {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.vol {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.vol-label {
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.vol-path {
+  color: var(--muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.vol-size {
+  margin-left: auto;
+  flex-shrink: 0;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+textarea.exclusions {
+  width: 100%;
+  resize: vertical;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.examples {
+  display: flex;
+  gap: 8px;
+  margin: 0 0 10px;
+}
+
+.examples code {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+
+.switch-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 600;
+  cursor: pointer;
+  margin: 4px 0 12px;
+}
+
+.switch-row input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+
+.wiz-nav {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+button.ghost {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 18px;
+  cursor: pointer;
+}
+
+.wiz-progress .scanbar {
+  margin: 6px 0 12px;
+}

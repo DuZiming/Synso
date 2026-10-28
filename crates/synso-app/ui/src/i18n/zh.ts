@@ -12,6 +12,10 @@ const zh: Dict = {
     zh: "中文",
     en: "English",
   },
+  a11y: {
+    langSelect: "Language / 语言",
+    scanProgress: "扫描进度",
+  },
   dashboard: {
     files: "文件",
     dirs: "目录",
@@ -23,6 +27,26 @@ const zh: Dict = {
     rescan: "重新扫描",
     scanning: "扫描中…",
     scanFailed: "扫描失败",
+  },
+  wizard: {
+    title: "欢迎使用 Synso",
+    subtitle: "首次扫描前先完成几项选择——之后随时可以在设置中修改。",
+    stepLang: "语言",
+    stepVolumes: "索引卷",
+    stepExclusions: "排除规则",
+    stepAutostart: "开机自启",
+    langHint: "选择界面语言，之后可随时在仪表盘上切换。",
+    volumesHint: "默认索引所有固定的本地磁盘；取消勾选即可跳过对应磁盘。",
+    volumesEmpty: "请至少选择一个要扫描的卷。",
+    exclusionsHint: "每行一条通配符规则，匹配的文件与目录不会进入索引。例如：",
+    autostartLabel: "开机时自动启动 Synso",
+    autostartHint:
+      "默认开启：登录系统后 Synso 会在后台自动运行，保持索引实时更新；用这个开关（或之后在设置里）即可一键关闭。",
+    back: "上一步",
+    next: "下一步",
+    begin: "开始扫描",
+    scanning: "正在建立索引…",
+    retry: "重试",
   },
 };
 

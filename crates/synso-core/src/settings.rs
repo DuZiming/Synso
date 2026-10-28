@@ -23,8 +23,9 @@ pub const DEFAULT_LANG: &str = "auto";
 /// `settings.shortcut` default: the design's global hotkey spelling.
 pub const DEFAULT_SHORTCUT: &str = "Ctrl+;";
 
-/// User-visible settings (the brief's five fields), backed by the `meta`
-/// table via [`Engine::settings`] / [`Engine::set_settings`].
+/// User-visible settings (the brief's five fields plus the first-run
+/// wizard's completion flag), backed by the `meta` table via
+/// [`Engine::settings`] / [`Engine::set_settings`].
 ///
 /// [`Engine::settings`]: crate::Engine::settings
 /// [`Engine::set_settings`]: crate::Engine::set_settings
@@ -45,6 +46,9 @@ pub struct Settings {
     pub volumes: Vec<String>,
     /// Global hotkey spelling, e.g. `"Ctrl+;"`.
     pub shortcut: String,
+    /// The first-run wizard has completed: the app opens on the dashboard
+    /// instead of the wizard (the wizard writes `true` on its final step).
+    pub first_run_done: bool,
 }
 
 impl Default for Settings {
@@ -55,6 +59,7 @@ impl Default for Settings {
             exclusions: Vec::new(),
             volumes: Vec::new(),
             shortcut: DEFAULT_SHORTCUT.to_owned(),
+            first_run_done: false,
         }
     }
 }
@@ -75,6 +80,13 @@ pub fn load(store: &Store) -> Settings {
         exclusions: read_list(store, "exclusions"),
         volumes: read_list(store, "volumes"),
         shortcut: read(store, "shortcut").unwrap_or_else(|| DEFAULT_SHORTCUT.to_owned()),
+        first_run_done: read(store, "first_run_done")
+            .and_then(|v| match v.as_str() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            })
+            .unwrap_or(false),
     }
 }
 
@@ -89,6 +101,10 @@ pub fn save(store: &Store, settings: &Settings) -> Result<()> {
     write_list(store, "exclusions", &settings.exclusions)?;
     write_list(store, "volumes", &settings.volumes)?;
     store.set_meta(&format!("{KEY_PREFIX}shortcut"), &settings.shortcut)?;
+    store.set_meta(
+        &format!("{KEY_PREFIX}first_run_done"),
+        if settings.first_run_done { "1" } else { "0" },
+    )?;
     Ok(())
 }
 
@@ -148,6 +164,7 @@ mod tests {
         assert!(first.settings().exclusions.is_empty());
         assert!(first.settings().volumes.is_empty());
         assert_eq!(first.settings().shortcut, "Ctrl+;");
+        assert!(!first.settings().first_run_done);
 
         // Save a modified set.
         let modified = Settings {
@@ -156,6 +173,7 @@ mod tests {
             exclusions: vec!["*.tmp".to_owned(), "**/node_modules/**".to_owned()],
             volumes: vec!["C:\\".to_owned()],
             shortcut: "Ctrl+Alt+S".to_owned(),
+            first_run_done: true,
         };
         first.set_settings(&modified).unwrap();
         assert_eq!(first.settings(), modified, "read-back after save");
@@ -185,6 +203,10 @@ mod tests {
         assert_eq!(loaded.lang, "en");
         assert_eq!(loaded.shortcut, "Ctrl+;", "unset field keeps its default");
         assert!(loaded.autostart, "unset boolean keeps its default");
+        assert!(
+            !loaded.first_run_done,
+            "unset boolean keeps its default (wizard still pending)"
+        );
     }
 
     /// An empty list round-trips as an explicit empty row (not a missing

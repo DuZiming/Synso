@@ -17,6 +17,7 @@ export interface Settings {
   exclusions: string[];
   volumes: string[];
   shortcut: string;
+  first_run_done: boolean;
 }
 
 /// Mirror of `synso_core::VolumeInfo`.

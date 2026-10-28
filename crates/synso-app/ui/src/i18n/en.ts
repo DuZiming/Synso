@@ -11,6 +11,10 @@ const en = {
     zh: "中文",
     en: "English",
   },
+  a11y: {
+    langSelect: "Language / 语言",
+    scanProgress: "Scan progress",
+  },
   dashboard: {
     files: "Files",
     dirs: "Directories",
@@ -22,6 +26,29 @@ const en = {
     rescan: "Rescan",
     scanning: "Scanning…",
     scanFailed: "Scan failed",
+  },
+  wizard: {
+    title: "Welcome to Synso",
+    subtitle:
+      "A few quick choices before the first scan — everything here can be changed later in settings.",
+    stepLang: "Language",
+    stepVolumes: "Volumes",
+    stepExclusions: "Exclusions",
+    stepAutostart: "Launch at startup",
+    langHint: "Pick the interface language. You can switch anytime from the dashboard.",
+    volumesHint:
+      "All fixed local disks are indexed by default. Uncheck a disk to leave it out of the index.",
+    volumesEmpty: "Select at least one volume to scan.",
+    exclusionsHint:
+      "One glob pattern per line; matching files and directories stay out of the index. For example:",
+    autostartLabel: "Launch Synso when the computer starts",
+    autostartHint:
+      "On by default: after login Synso runs in the background and keeps the index up to date. Flip the switch (or change it later in settings) to turn this off.",
+    back: "Back",
+    next: "Next",
+    begin: "Start scanning",
+    scanning: "Building the index…",
+    retry: "Retry",
   },
 };
 
