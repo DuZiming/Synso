@@ -30,9 +30,16 @@ pub fn start_full_scan(state: State<'_, AppState>) {
 }
 
 /// The persisted user settings.
+///
+/// Async (thread-pool, not the main thread — see `size_tree`): the read
+/// takes the store mutex, which a running scan holds for its whole walk,
+/// and Tauri runs sync commands on the main thread — a sync `settings_get`
+/// would freeze EVERY window for the scan's duration. Returns a `Result`
+/// because Tauri requires that of async commands with reference inputs;
+/// `Ok` serializes to exactly the `Settings` JSON the webview expects.
 #[tauri::command]
-pub fn settings_get(state: State<'_, AppState>) -> Settings {
-    state.engine.settings()
+pub async fn settings_get(state: State<'_, AppState>) -> Result<Settings, String> {
+    Ok(state.engine.settings())
 }
 
 /// Persists the user settings; errors surface to the webview as a string.
@@ -76,8 +83,12 @@ pub fn settings_set(
 /// bad spelling rolls back to the old combo and returns the plugin's
 /// error message for display. On success the new spelling is persisted,
 /// so it survives a restart.
+/// Async (thread-pool, not the main thread — see `size_tree`): the global
+/// shortcut re-registration and the settings read/write below take the
+/// store mutex, which a running scan holds for its whole walk — a sync
+/// command would freeze EVERY window for the scan's duration.
 #[tauri::command]
-pub fn set_shortcut(
+pub async fn set_shortcut(
     app: AppHandle,
     state: State<'_, AppState>,
     combo: String,
@@ -94,8 +105,12 @@ pub fn set_shortcut(
 /// Live autostart toggle (the settings panel's switch): updates the OS
 /// launch-at-startup registration first, then persists
 /// `Settings.autostart` — an OS failure must not persist a lie.
+/// Async (thread-pool, not the main thread — see `size_tree`): the OS
+/// toggle then the settings read/write below take the store mutex, which
+/// a running scan holds for its whole walk — a sync command would freeze
+/// EVERY window for the scan's duration.
 #[tauri::command]
-pub fn autostart_set(
+pub async fn autostart_set(
     app: AppHandle,
     state: State<'_, AppState>,
     enabled: bool,
@@ -242,8 +257,12 @@ pub fn dedup_groups(state: State<'_, AppState>, offset: u32, limit: u32) -> Vec<
 /// ONLY deletion path, never a permanent delete. Returns how many paths
 /// actually landed (dead ids and already-gone paths are skipped); errors
 /// carry the engine message verbatim.
+///
+/// Async (thread-pool, not the main thread — see `size_tree`): deletion
+/// takes the store mutex, which a running scan holds for its whole walk —
+/// a sync command would freeze EVERY window for the scan's duration.
 #[tauri::command]
-pub fn delete_to_trash(state: State<'_, AppState>, ids: Vec<i64>) -> Result<usize, String> {
+pub async fn delete_to_trash(state: State<'_, AppState>, ids: Vec<i64>) -> Result<usize, String> {
     state
         .engine
         .delete_to_trash(&ids)
@@ -306,10 +325,15 @@ pub fn reveal_index_path(
 // rows, multi-membership is core, rename/move tombstones then rebinds on
 // the next reconcile, and deleting a collection never touches files).
 // Every error surfaces to the webview verbatim as a string.
+//
+// ALL of these are async (thread-pool, not the main thread — see
+// `size_tree`): each takes the store mutex, which a running scan holds
+// for its whole walk, and Tauri runs sync commands on the main thread —
+// a sync call here would freeze EVERY window for the scan's duration.
 
 /// Creates a collection. A duplicate name is an error (engine Conflict).
 #[tauri::command]
-pub fn coll_create(state: State<'_, AppState>, name: String) -> Result<Collection, String> {
+pub async fn coll_create(state: State<'_, AppState>, name: String) -> Result<Collection, String> {
     state
         .engine
         .coll_create(&name)
@@ -318,7 +342,7 @@ pub fn coll_create(state: State<'_, AppState>, name: String) -> Result<Collectio
 
 /// Renames a collection (unknown id / taken name → engine error verbatim).
 #[tauri::command]
-pub fn coll_rename(state: State<'_, AppState>, id: i64, name: String) -> Result<(), String> {
+pub async fn coll_rename(state: State<'_, AppState>, id: i64, name: String) -> Result<(), String> {
     state
         .engine
         .coll_rename(id, &name)
@@ -327,20 +351,24 @@ pub fn coll_rename(state: State<'_, AppState>, id: i64, name: String) -> Result<
 
 /// Deletes a collection and its member rows — never the files themselves.
 #[tauri::command]
-pub fn coll_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+pub async fn coll_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> {
     state.engine.coll_delete(id).map_err(|err| err.to_string())
 }
 
 /// Every collection, id-ordered (creation order).
 #[tauri::command]
-pub fn coll_list(state: State<'_, AppState>) -> Result<Vec<Collection>, String> {
+pub async fn coll_list(state: State<'_, AppState>) -> Result<Vec<Collection>, String> {
     state.engine.coll_list().map_err(|err| err.to_string())
 }
 
 /// Adds file OR folder row ids to a collection, snapshotting each entry's
 /// current name + size (the later tombstone/rebind key).
 #[tauri::command]
-pub fn coll_add(state: State<'_, AppState>, id: i64, members: Vec<i64>) -> Result<(), String> {
+pub async fn coll_add(
+    state: State<'_, AppState>,
+    id: i64,
+    members: Vec<i64>,
+) -> Result<(), String> {
     state
         .engine
         .coll_add(id, &members)
@@ -349,7 +377,7 @@ pub fn coll_add(state: State<'_, AppState>, id: i64, members: Vec<i64>) -> Resul
 
 /// Removes one member row (alive or tombstoned) from a collection.
 #[tauri::command]
-pub fn coll_remove(state: State<'_, AppState>, id: i64, member: i64) -> Result<(), String> {
+pub async fn coll_remove(state: State<'_, AppState>, id: i64, member: i64) -> Result<(), String> {
     state
         .engine
         .coll_remove(id, member)
@@ -360,7 +388,7 @@ pub fn coll_remove(state: State<'_, AppState>, id: i64, member: i64) -> Result<(
 /// a hit synthesized from the add-time snapshot: empty path, mtime 0, the
 /// stale file id kept so the UI can still address the row).
 #[tauri::command]
-pub fn coll_members(state: State<'_, AppState>, id: i64) -> Result<Vec<MemberHit>, String> {
+pub async fn coll_members(state: State<'_, AppState>, id: i64) -> Result<Vec<MemberHit>, String> {
     state.engine.coll_members(id).map_err(|err| err.to_string())
 }
 
@@ -370,7 +398,7 @@ pub fn coll_members(state: State<'_, AppState>, id: i64) -> Result<Vec<MemberHit
 /// itself, not its children — to a collection. An unresolvable path is an
 /// error the view toasts verbatim.
 #[tauri::command]
-pub fn file_id_of(state: State<'_, AppState>, path: String) -> Result<i64, String> {
+pub async fn file_id_of(state: State<'_, AppState>, path: String) -> Result<i64, String> {
     state
         .engine
         .file_id_of(&path)
