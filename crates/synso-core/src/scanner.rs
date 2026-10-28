@@ -168,26 +168,7 @@ pub fn scan(store: &mut Store, opts: &ScanOptions, progress: &dyn Fn(u64)) -> Re
             } else {
                 stats.files += 1;
             }
-            batch.push((
-                segments,
-                FileRecord {
-                    id: 0,
-                    parent: 0,
-                    name: name.to_string(),
-                    size: if is_dir { 0 } else { meta.len() },
-                    mtime: unix_secs(meta.modified()),
-                    ctime: unix_secs(meta.created()),
-                    atime: unix_secs(meta.accessed()),
-                    ext_id: 0,
-                    is_dir,
-                    hash_first: None,
-                    hash_full: None,
-                    // Pinyin keys are store-assigned at upsert time; the
-                    // scanner never computes them itself.
-                    py_full: String::new(),
-                    py_init: String::new(),
-                },
-            ));
+            batch.push((segments, new_record(name, meta, is_dir)));
 
             if batch.len() >= PROGRESS_BATCH {
                 flush_batch(store, &mut batch)?;
@@ -199,6 +180,177 @@ pub fn scan(store: &mut Store, opts: &ScanOptions, progress: &dyn Fn(u64)) -> Re
     flush_batch(store, &mut batch)?;
     progress(stats.files);
     Ok(stats)
+}
+
+/// One indexed entry's [`FileRecord`] from prefetched metadata — the
+/// shared construction for the full scan and the watcher's subtree walk
+/// (directories record size 0; unavailable timestamps become 0; hashes and
+/// pinyin are filled in elsewhere: dedup later, the store at upsert).
+pub(crate) fn new_record(name: &str, meta: &Metadata, is_dir: bool) -> FileRecord {
+    FileRecord {
+        id: 0,
+        parent: 0,
+        name: name.to_string(),
+        size: if is_dir { 0 } else { meta.len() },
+        mtime: unix_secs(meta.modified()),
+        ctime: unix_secs(meta.created()),
+        atime: unix_secs(meta.accessed()),
+        ext_id: 0,
+        is_dir,
+        hash_first: None,
+        hash_full: None,
+        // Pinyin keys are store-assigned at upsert time; the scanner never
+        // computes them itself.
+        py_full: String::new(),
+        py_init: String::new(),
+    }
+}
+
+/// Walks the DESCENDANTS of `dir` (never `dir` itself) and upserts every
+/// entry into `store`, applying the exact conventions of [`scan`]: the
+/// exclusion patterns prune whole subtrees, symlinks/reparse points are
+/// neither indexed nor descended (so the walk stays acyclic), directories
+/// record size 0, and each descendant's `dirs` chain is `dir_segments` —
+/// the chain of `dir` itself, root segment first — extended by its
+/// relative path components. After each successful upsert,
+/// `stored(store, record)` is invoked with the row as persisted (id,
+/// parent, ext_id and pinyin assigned) — the watcher's hook for applying
+/// the same row to the hot index incrementally.
+///
+/// Watcher-only today (Task 8): a created or renamed directory arrives as
+/// a single event — ReadDirectoryChangesW/inotify report just the
+/// directory entry, children generate no events — so the batch must walk
+/// what moved inside it. The walk runs under the store lock the caller
+/// already holds for its batch, exactly like a full scan holds it for its
+/// whole walk; watcher batches queue meanwhile. Non-purging by design:
+/// purging belongs to the rescan path. FS errors are counted in
+/// [`ScanStats::errors`] and never abort the walk; store errors are
+/// returned.
+pub(crate) fn scan_subtree(
+    store: &mut Store,
+    dir: &Path,
+    dir_segments: &[String],
+    root: &Path,
+    matcher: &GlobSet,
+    stored: &mut dyn FnMut(&Store, &FileRecord),
+) -> Result<ScanStats> {
+    let mut stats = ScanStats::default();
+    // Nothing sane to walk under a reparse point (cycle risk); the entry
+    // itself was already indexed from its event, and the accepted
+    // junction corner self-heals at the next rescan.
+    if is_reparse_point(dir) {
+        stats.errors += 1;
+        return Ok(stats);
+    }
+    let mut batch: Vec<(Vec<String>, FileRecord)> = Vec::with_capacity(PROGRESS_BATCH);
+
+    let walker = WalkDirGeneric::<((), Option<Metadata>)>::new(dir)
+        .follow_links(false)
+        .min_depth(1)
+        .process_read_dir({
+            let matcher = matcher.clone();
+            let root = root.to_path_buf();
+            move |_depth, _path, _read_dir_state, children| {
+                // Same pruning as `scan`: excluded subtrees and reparse
+                // points never yield, which is what bounds the walk and
+                // keeps it out of junction cycles.
+                children.retain(|child| match child {
+                    // Keep read errors so the main loop can count them.
+                    Err(_) => true,
+                    Ok(entry) => {
+                        let path = entry.path();
+                        !excluded(&matcher, &path, &root)
+                            && !entry.file_type().is_symlink()
+                            && !has_reparse_attr(&path)
+                    }
+                });
+                // Prefetch metadata on the walker threads; the calling
+                // thread only upserts (it owns the store).
+                for entry in children.iter_mut().flatten() {
+                    entry.client_state = entry.path().symlink_metadata().ok();
+                }
+            }
+        });
+
+    for entry in walker {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                stats.errors += 1;
+                continue;
+            }
+        };
+        // Defense in depth for the reparse guard above.
+        if entry.file_type().is_symlink() {
+            continue;
+        }
+
+        let path = entry.path();
+        let rel = match path.strip_prefix(dir) {
+            Ok(rel) => rel,
+            Err(_) => {
+                stats.errors += 1;
+                continue;
+            }
+        };
+        let Some(name) = rel.file_name().and_then(|n| n.to_str()) else {
+            stats.errors += 1; // non-UTF-8 names cannot be stored as TEXT
+            continue;
+        };
+        let Some(meta) = entry.client_state.as_ref() else {
+            stats.errors += 1; // stat failed (vanished/unreadable)
+            continue;
+        };
+        let is_dir = entry.file_type().is_dir();
+
+        let mut segments = Vec::with_capacity(dir_segments.len() + entry.depth + 1);
+        segments.extend_from_slice(dir_segments);
+        if let Some(parent) = rel.parent() {
+            let mut all_utf8 = true;
+            for component in parent.components() {
+                match component.as_os_str().to_str() {
+                    Some(segment) => segments.push(segment.to_string()),
+                    None => {
+                        all_utf8 = false;
+                        break;
+                    }
+                }
+            }
+            if !all_utf8 {
+                stats.errors += 1;
+                continue;
+            }
+        }
+
+        if is_dir {
+            stats.dirs += 1;
+        } else {
+            stats.files += 1;
+        }
+        batch.push((segments, new_record(name, meta, is_dir)));
+
+        if batch.len() >= PROGRESS_BATCH {
+            flush_subtree_batch(store, &mut batch, stored)?;
+        }
+    }
+
+    flush_subtree_batch(store, &mut batch, stored)?;
+    Ok(stats)
+}
+
+/// Upserts and clears one buffered [`scan_subtree`] batch on the calling
+/// thread, reporting every persisted row through `stored`.
+fn flush_subtree_batch(
+    store: &mut Store,
+    batch: &mut Vec<(Vec<String>, FileRecord)>,
+    stored: &mut dyn FnMut(&Store, &FileRecord),
+) -> Result<()> {
+    for (segments, mut rec) in batch.drain(..) {
+        let dir_path: Vec<&str> = segments.iter().map(String::as_str).collect();
+        store.upsert_file(&dir_path, &mut rec)?;
+        stored(store, &rec);
+    }
+    Ok(())
 }
 
 /// Upserts and clears one buffered batch on the calling thread.

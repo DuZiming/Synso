@@ -34,6 +34,17 @@
 //!    (tombstone + rebind);
 //! 4. [`EngineEvent::FsChanged`] broadcasts as a UI refresh hint.
 //!
+//! Directory arrivals walk: an upsert that resolves to a DIRECTORY gets
+//! its subtree indexed in-batch via [`scanner::scan_subtree`] — the OS
+//! reports only the directory entry itself (ReadDirectoryChangesW /
+//! inotify deliver no events for the children), so a populated create or
+//! a rename/move would otherwise lose every descendant until the next
+//! rescan. The walk runs under the store lock the batch already holds —
+//! the exact discipline a full scan uses for its whole walk, watcher
+//! batches queue meanwhile — and is bounded by the same exclusion matcher
+//! and reparse-point guard; every walked row is hot-indexed through the
+//! incremental upsert path.
+//!
 //! Queue-during-scan: a running scan holds the store mutex for its whole
 //! walk, so the debounce thread simply BLOCKS on the mutex at batch-apply
 //! time while events keep piling up in the (unbounded) channel — nothing is
@@ -61,7 +72,6 @@
 //! applied, so the index reflects the last-seen disk state) and joins it.
 
 use std::collections::BTreeMap;
-use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -103,9 +113,11 @@ enum Op {
 /// One pending op with its index spelling precomputed at absorb time:
 /// `segments` is the containing directory's `dirs`-table chain (root
 /// segment first — the same spelling the scanner upserts under), `name`
-/// the entry's final component.
+/// the entry's final component, `root_idx` the watch root this path
+/// belongs to (the exclusion test's rel-base and the subtree walk's root).
 #[derive(Debug)]
 struct PendingOp {
+    root_idx: usize,
     segments: Vec<String>,
     name: String,
     op: Op,
@@ -137,7 +149,7 @@ impl Ctx {
         if self.db_filter.contains(&lower) {
             return None;
         }
-        for (root, segment) in self.roots.iter().zip(&self.root_segments) {
+        for (root_idx, (root, segment)) in self.roots.iter().zip(&self.root_segments).enumerate() {
             let Ok(rel) = path.strip_prefix(root) else {
                 continue;
             };
@@ -156,6 +168,7 @@ impl Ctx {
                 }
             }
             return Some(PendingOp {
+                root_idx,
                 segments,
                 name: name.to_string(),
                 op,
@@ -362,7 +375,11 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
     for (path, entry) in pending.iter() {
         match entry.op {
             Op::Upsert => match std::fs::symlink_metadata(path) {
-                Ok(meta) => upserts.push((path, entry, record_from_meta(&meta, &entry.name))),
+                Ok(meta) => upserts.push((
+                    path,
+                    entry,
+                    scanner::new_record(&entry.name, &meta, meta.is_dir()),
+                )),
                 // Gone again by apply time: apply a removal instead.
                 Err(_) => removals.push((path, entry)),
             },
@@ -383,6 +400,39 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
             let mut rec = rec;
             match store.upsert_file(&segments, &mut rec) {
                 Ok(()) => {
+                    // A directory arrives as ONE event with no child
+                    // events: a populated create, or a rename/move whose
+                    // whole subtree silently rode along (the Remove side
+                    // above already purged the old location). Walk the new
+                    // subtree in-batch — the same lock discipline as a
+                    // full scan's walk — bounded by the exclusion matcher
+                    // and the reparse-point guard, hot-indexing every
+                    // walked row through the incremental upsert path.
+                    if rec.is_dir {
+                        let mut dir_segments = entry.segments.clone();
+                        dir_segments.push(entry.name.clone());
+                        let mut hot_row = |store: &Store, walked: &FileRecord| {
+                            if let Err(err) = hot.upsert_slot(store, walked) {
+                                eprintln!("synso: watcher hot upsert of {walked:?} failed: {err}");
+                            }
+                        };
+                        match scanner::scan_subtree(
+                            &mut store,
+                            path,
+                            &dir_segments,
+                            &ctx.roots[entry.root_idx],
+                            &ctx.matcher,
+                            &mut hot_row,
+                        ) {
+                            Ok(sub) if sub.errors > 0 => {
+                                eprintln!("synso: watcher subtree walk of {path:?} skipped {sub:?}")
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                eprintln!("synso: watcher subtree walk of {path:?} failed: {err}")
+                            }
+                        }
+                    }
                     if let Err(err) = hot.upsert_slot(&store, &rec) {
                         eprintln!("synso: watcher hot upsert of {path:?} failed: {err}");
                     }
@@ -418,28 +468,6 @@ fn remove_path(store: &mut Store, hot: &mut HotIndex, segments: &[&str], name: &
         eprintln!("synso: watcher subtree delete of {path:?} failed: {err}");
     }
     hot.remove_by_dir_name(segments, name);
-}
-
-/// Builds a fresh [`FileRecord`] from a stat, mirroring the scanner's
-/// field conventions (directories record size 0; hashes and pinyin are
-/// computed elsewhere — pinyin by the store's upsert choke point).
-fn record_from_meta(meta: &Metadata, name: &str) -> FileRecord {
-    let is_dir = meta.is_dir();
-    FileRecord {
-        id: 0,
-        parent: 0,
-        name: name.to_string(),
-        size: if is_dir { 0 } else { meta.len() },
-        mtime: scanner::unix_secs(meta.modified()),
-        ctime: scanner::unix_secs(meta.created()),
-        atime: scanner::unix_secs(meta.accessed()),
-        ext_id: 0,
-        is_dir,
-        hash_first: None,
-        hash_full: None,
-        py_full: String::new(),
-        py_init: String::new(),
-    }
 }
 
 /// notify errors carry no io conversion; wrap the rendered message (the
@@ -639,6 +667,85 @@ mod tests {
     }
 
     #[test]
+    fn watcher_dir_rename_keeps_descendants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = write_fixture(tmp.path());
+        let engine = open_engine(&db_path, &root, Vec::new());
+        scan_once(&engine);
+        engine.start_watcher().unwrap();
+
+        // A populated tree, created while the watcher runs (each entry
+        // arrives as its own event, so the pre-move index is complete).
+        let moveme = root.join("moveme");
+        fs::create_dir_all(moveme.join("l1").join("l2")).unwrap();
+        fs::write(moveme.join("aaa.txt"), b"a").unwrap();
+        fs::write(moveme.join("l1").join("bbb.txt"), b"b").unwrap();
+        fs::write(moveme.join("l1").join("l2").join("ccc.txt"), b"c").unwrap();
+        poll_until(Duration::from_secs(10), || {
+            (search_total(&engine, "ccc") == 1).then_some(())
+        });
+
+        // THE regression: renaming a populated directory reports only the
+        // directory entry itself — children move with zero events. The
+        // Remove side purges the whole old subtree, so without an in-batch
+        // subtree walk the descendants would vanish from the index until
+        // the next rescan.
+        fs::rename(&moveme, root.join("moved")).unwrap();
+
+        // Every descendant is searchable at the NEW path (<=10s, brief).
+        // The poll matches on the new tail directly: a total==1 hit at the
+        // OLD path (pre-rename row) must not satisfy it.
+        let sep = std::path::MAIN_SEPARATOR;
+        for (text, tail) in [
+            ("aaa", format!("moved{sep}aaa.txt")),
+            ("bbb", format!("moved{sep}l1{sep}bbb.txt")),
+            ("ccc", format!("moved{sep}l1{sep}l2{sep}ccc.txt")),
+        ] {
+            let hit = poll_until(Duration::from_secs(10), || {
+                engine
+                    .search(text, 0, 10)
+                    .hits
+                    .into_iter()
+                    .find(|hit| hit.path.ends_with(&tail))
+            });
+            assert!(
+                hit.path.ends_with(&tail),
+                "{text} must resolve under the moved dir, got {hit:?}"
+            );
+        }
+
+        // The old path is gone from search...
+        poll_until(Duration::from_secs(10), || {
+            (search_total(&engine, "moveme") == 0).then_some(())
+        });
+        // ...stats equal disk truth (4 fixture files + 3 moved)...
+        let disk_files = disk_file_count(&root);
+        assert_eq!(disk_files, 7);
+        poll_until(Duration::from_secs(10), || {
+            (engine.stats().files == disk_files).then_some(())
+        });
+        // ...and the store holds the new chain with no moveme segment.
+        let store = Store::open(&db_path).unwrap();
+        let dir_names: Vec<String> = store
+            .all_dirs()
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, name)| name)
+            .collect();
+        assert!(
+            !dir_names.contains(&"moveme".to_string()),
+            "the old dir segment must be purged"
+        );
+        for kept in ["moved", "l1", "l2"] {
+            assert!(
+                dir_names.contains(&kept.to_string()),
+                "dir row {kept} must exist at the new path"
+            );
+        }
+    }
+
+    #[test]
     fn watcher_converges_after_event_storm() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("index.db");
@@ -665,16 +772,23 @@ mod tests {
         // then removed wholesale. The children's events sort AFTER the
         // parent dir's, so this is the convergence proof for the purge's
         // child-slot sweep (without it the children linger in the hot
-        // index and stats().files never reaches disk truth).
+        // index and stats().files never reaches disk truth). A second
+        // populated tree is RENAMED — its descendants ride along with zero
+        // child events, so the in-batch subtree walk must re-index them at
+        // the new path.
         fs::create_dir_all(root.join("bye").join("inner")).unwrap();
         fs::write(root.join("bye").join("inner").join("gone.txt"), b"g").unwrap();
         fs::write(root.join("bye").join("also.txt"), b"a").unwrap();
+        fs::create_dir_all(root.join("mvme").join("deep")).unwrap();
+        fs::write(root.join("mvme").join("keep.txt"), b"k").unwrap();
+        fs::write(root.join("mvme").join("deep").join("buried.txt"), b"b").unwrap();
         std::thread::sleep(Duration::from_millis(800)); // land as a batch first
         fs::remove_dir_all(root.join("bye")).unwrap();
+        fs::rename(root.join("mvme"), root.join("mvdone")).unwrap();
 
         // After quiesce (brief: <=10s): hot stats equal disk truth.
         let disk_files = disk_file_count(&root);
-        assert_eq!(disk_files, 104, "4 fixture files + 100 survivors");
+        assert_eq!(disk_files, 106, "4 fixture + 100 storm + 2 moved files");
         poll_until(Duration::from_secs(10), || {
             (engine.stats().files == disk_files).then_some(())
         });
@@ -700,10 +814,18 @@ mod tests {
         assert_eq!(file_rows, disk_files as i64, "store non-dir rows == disk");
         assert_eq!(engine.stats().files as i64, file_rows, "hot index == store");
 
-        // Spot-check survivors and deleted names.
+        // Spot-check survivors, deleted names, and the moved tree.
         assert_eq!(search_total(&engine, "s000"), 1, "even i survives in sub/");
         assert_eq!(search_total(&engine, "s001"), 0, "odd i was deleted");
         assert_eq!(search_total(&engine, "t003"), 0, "rename target deleted");
+        let buried = engine.search("buried", 0, 10);
+        assert_eq!(buried.total, 1, "the moved tree's deep file is indexed");
+        assert!(
+            buried.hits[0].path.contains("mvdone"),
+            "buried.txt must live under the new dir name, got {:?}",
+            buried.hits[0].path
+        );
+        assert_eq!(search_total(&engine, "mvme"), 0, "old dir name is gone");
     }
 
     #[test]
