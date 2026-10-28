@@ -14,7 +14,7 @@
 //! [`QuickState`], and surfaced by the dashboard through `quick_info`,
 //! whose "quick search" button stays as the always-working fallback.
 
-use tauri::{AppHandle, Manager, PhysicalPosition, WebviewWindow, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent};
 
 /// Fraction of the monitor height the window's top edge sits at (the
 /// Everything-style near-top placement; horizontal centering is exact).
@@ -22,6 +22,17 @@ const TOP_FRACTION: f64 = 0.18;
 
 /// The `tauri.conf.json` label of the quick window.
 pub const LABEL: &str = "quick";
+
+/// The pre-fill event the quick window's page listens for (kebab-case
+/// name; snake_case payload key — see `events.rs` conventions). Emitted by
+/// [`show_with_query`] and only consumed there.
+pub const QUERY_EVENT: &str = "quick-query";
+
+/// [`QUERY_EVENT`]'s payload: the query text to pre-fill.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QuickQueryPayload {
+    pub q: String,
+}
 
 /// Global-shortcut registration outcome, kept as managed state so
 /// `quick_info` can report it to the dashboard at any time.
@@ -119,6 +130,20 @@ pub fn show(app: &AppHandle) {
 pub fn hide(app: &AppHandle) {
     if let Some(win) = app.get_webview_window(LABEL) {
         let _ = win.hide();
+    }
+}
+
+/// Shows + focuses the window AND pre-fills its query: the exact [`show`]
+/// logic first (placement refresh, show, focus — the dashboard button's
+/// path), then one [`QUERY_EVENT`] `emit_to` the quick webview. The page
+/// is mounted from startup, so the listener applies the text whenever it
+/// lands; a failed emit (window gone) is logged, not fatal — the window
+/// still showed with its previous query. The collections view's 「在快速
+/// 搜索中查看」 button hands over `coll:<name>` through here.
+pub fn show_with_query(app: &AppHandle, q: &str) {
+    show(app);
+    if let Err(err) = app.emit_to(LABEL, QUERY_EVENT, QuickQueryPayload { q: q.to_owned() }) {
+        log::warn!("synso: quick query pre-fill failed: {err}");
     }
 }
 

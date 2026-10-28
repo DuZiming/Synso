@@ -507,6 +507,18 @@ impl Engine {
         hot.slot_of_id(id).map(|slot| query::hit_of(&hot, slot))
     }
 
+    /// The `files` row id the index-relative `path` names (the `Hit::path`
+    /// spelling; both separators accepted, directories included) — the
+    /// path → id bridge the app's `file_id_of` command (Task 18) needs,
+    /// because flame-chart nodes carry paths rather than row ids: adding a
+    /// flame node to a collection resolves it here first, then `coll_add`s
+    /// the id. `None` when the path matches nothing (unknown path, or the
+    /// virtual root `""` — it names no single entry).
+    pub fn file_id_of(&self, path: &str) -> Option<FileId> {
+        let hot = read_unpoisoned(&self.hot);
+        hot.id_of_path(path)
+    }
+
     // ---------------- Task 11: directory size aggregation ----------------
 
     /// Directory-size tree for the flame chart (Task 17): the subtree
@@ -1492,6 +1504,49 @@ mod tests {
         // Never-indexed and structurally invalid ids are dead ends.
         assert_eq!(engine.hit_by_id(999_999), None);
         assert_eq!(engine.hit_by_id(-1), None);
+    }
+
+    /// `file_id_of` (Task 18) turns an index path — the spelling
+    /// flame-chart nodes carry — into the same row id a search hit for it
+    /// would carry, files and directory entries alike; unknown paths and
+    /// the virtual root resolve to `None` so the app layer can error.
+    #[test]
+    fn file_id_of_resolves_paths_to_row_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join("docs").join("notes.txt"), b"hello").unwrap();
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        let file_hit = engine.search("notes", 0, 5);
+        assert_eq!(file_hit.total, 1);
+        let file = &file_hit.hits[0];
+        assert_eq!(
+            engine.file_id_of(&file.path),
+            Some(file.id),
+            "a file path resolves to its own row id"
+        );
+
+        let dir_hit = engine.search("docs", 0, 5);
+        assert_eq!(dir_hit.total, 1);
+        let dir = &dir_hit.hits[0];
+        assert!(dir.is_dir);
+        assert_eq!(
+            engine.file_id_of(&dir.path),
+            Some(dir.id),
+            "a directory path resolves to the dir's files row id"
+        );
+
+        // Dead ends: the virtual root names no single entry, and neither
+        // does anything outside the index.
+        assert_eq!(engine.file_id_of(""), None);
+        assert_eq!(engine.file_id_of("docs/absent.bin"), None);
+        assert_eq!(engine.file_id_of("not_a_root/x.txt"), None);
     }
 
     // ------------------ Task 10: recycle-bin deletion ---------------------

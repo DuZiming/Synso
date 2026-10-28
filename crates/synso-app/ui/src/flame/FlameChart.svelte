@@ -11,7 +11,7 @@
   // datum, so the built-in zoom stays as the instant visual response.
   // Hover shows a floating tooltip (the library's own, re-contented via
   // tip.html) with name / size / file count / % of parent. Right-click
-  // opens our context menu (reveal + a disabled Task-18 placeholder).
+  // opens our context menu (reveal + add-to-collection).
   //
   // Colors are a validated warm/cool alternating per-depth palette (light
   // and dark variants both pass the dataviz categorical checks; the
@@ -37,10 +37,12 @@
     root,
     onDrill,
     onReveal,
+    onAddToCollection,
   }: {
     root: SizeNode;
     onDrill: (path: string) => void;
     onReveal: (path: string) => void;
+    onAddToCollection: (path: string) => void;
   } = $props();
 
   /// What the chart renders: d3-flame-graph reads {name, value, children}
@@ -205,6 +207,15 @@
     closeMenu();
   }
 
+  /// Task 18: the 加入集合 item — the NODE itself (directory or file, not
+  /// its children) joins the collection; the parent view resolves the
+  /// path → row id (file_id_of) and opens the shared picker.
+  function addToCollectionFromMenu(): void {
+    if (!menu || menu.synthetic) return;
+    onAddToCollection(menu.path);
+    closeMenu();
+  }
+
   // ---------------- Chart lifecycle ----------------
 
   $effect(() => {
@@ -285,8 +296,7 @@
       >
         {$t("flame.reveal")}
       </button>
-      <!-- Task 18 wires the real action; disabled placeholder per ruling. -->
-      <button class="ctx-item" role="menuitem" disabled title={$t("tabs.comingSoon")}>
+      <button class="ctx-item" role="menuitem" onclick={addToCollectionFromMenu}>
         {$t("flame.addToCollection")}
       </button>
     </div>

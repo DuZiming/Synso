@@ -22,6 +22,10 @@ const en = {
     prevPage: "Previous page",
     nextPage: "Next page",
     confirmDialog: "Delete confirmation",
+    collList: "Collections list",
+    memberList: "Member list",
+    pickerDialog: "Collection picker",
+    pickBox: "Select this result",
   },
   dashboard: {
     files: "Files",
@@ -41,7 +45,6 @@ const en = {
     dedup: "Duplicates",
     flame: "Flame chart",
     collections: "Collections",
-    comingSoon: "Coming soon",
   },
   dedup: {
     start: "Start analysis",
@@ -131,6 +134,33 @@ const en = {
       "Aggregated node — the (other) bucket has no single path to drill into.",
     filesLine: "{n} files",
     ofParentLine: "{pct}% of parent",
+  },
+  collections: {
+    create: "New",
+    createPlaceholder: "New collection name",
+    empty:
+      "No collections yet. Create one, then add files to it from the quick search window (select results → Add to collection) or a flame-chart node's right-click menu.",
+    membersUnit: "members",
+    noMembers:
+      "No members yet — select results in the quick search window and use Add to collection, or right-click a node in the flame chart.",
+    lost: "Missing — the file was moved or deleted",
+    reveal: "Show in File Explorer",
+    removeMember: "Remove from collection",
+    viewInSearch: "View in quick search",
+    rename: "Rename",
+    delete: "Delete",
+    renamePlaceholder: "New name",
+    addTitle: "Add to collection",
+    pickerCreate: "Create and add",
+    pickerEmpty: "No collections yet — type a name to create one.",
+    added: "Added to {name}",
+    addFailed: "Failed to add",
+    notInIndex: "Path is not in the index",
+    deleteTitle: "Delete this collection?",
+    deleteKeepsFiles:
+      "Deleting a collection never deletes files — they stay on disk; only the collection record goes away.",
+    confirmDelete: "Delete",
+    confirmCancel: "Cancel",
   },
 };
 

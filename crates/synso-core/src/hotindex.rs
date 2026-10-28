@@ -581,6 +581,29 @@ impl HotIndex {
     pub fn is_dir_entry(&self, slot: usize) -> bool {
         self.is_dirs[slot]
     }
+
+    /// The `files` row id the index-relative `path` names (the `Hit::path`
+    /// spelling; both separators accepted, directories included): walk every
+    /// segment but the last through the interned dir tree, then look the
+    /// final name up as a slot under that dir. Directory entries ARE slots
+    /// (`files` rows with `is_dir = 1`), so a dir path yields the same row
+    /// id a search hit for that dir would carry — the shape `coll_add`
+    /// validates against. `None` when nothing matches: an unknown segment,
+    /// a single-segment path naming no entry (the walk root itself is never
+    /// a `files` row), or the empty virtual-root path `""`, which names no
+    /// single entry. The inverse of [`HotIndex::path_of`] — the app's
+    /// `file_id_of` command (Task 18) turns flame-chart nodes, which carry
+    /// paths rather than ids, into collection members with it.
+    pub fn id_of_path(&self, path: &str) -> Option<FileId> {
+        let segments: Vec<&str> = path
+            .split([MAIN_SEPARATOR, '/'])
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        let (name, parents) = segments.split_last()?;
+        let dir_id = self.resolve_dir(parents)?;
+        let slot = self.slot_in_dir(dir_id, name)?;
+        Some(self.file_id(slot))
+    }
 }
 
 #[cfg(test)]
@@ -736,6 +759,50 @@ mod tests {
         assert_eq!(hot.slot_of_id(alpha.id), Some(0));
         assert_eq!(hot.slot_of_id(memo.id), Some(1));
         assert_eq!(hot.slot_of_id(424_242), None);
+    }
+
+    /// `id_of_path` is the inverse of `path_of`: every indexed entry's path
+    /// round-trips to its own row id, files and directory entries alike,
+    /// and unknown shapes match nothing.
+    #[test]
+    fn id_of_path_roundtrips_path_of() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
+
+        let mut alpha = rec("Alpha.TXT", false);
+        store.upsert_file(&["docs"], &mut alpha).unwrap();
+        let mut sub = rec("Sub", true);
+        store.upsert_file(&["docs"], &mut sub).unwrap();
+        let mut memo = rec("memo.md", false);
+        store.upsert_file(&["docs", "inner"], &mut memo).unwrap();
+
+        let hot = HotIndex::load(&store).unwrap();
+        let sep = std::path::MAIN_SEPARATOR;
+
+        // Round-trip: the path each slot reconstructs names its own row.
+        for slot in 0..hot.slot_count() {
+            let path = hot.path_of(slot);
+            assert_eq!(
+                hot.id_of_path(&path),
+                Some(hot.file_id(slot)),
+                "path {path:?} must resolve to its own row id"
+            );
+        }
+        // The dir-entry slot is reachable by path too (dir ids are files
+        // row ids here — a search hit for "Sub" carries exactly this id).
+        assert_eq!(hot.id_of_path(&format!("docs{sep}Sub")), Some(sub.id));
+        // Forward separators are accepted as well (the engine normalizes
+        // neither; both spellings occur in user-built queries).
+        assert_eq!(hot.id_of_path("docs/Alpha.TXT"), Some(alpha.id));
+
+        // Nothing matches: the virtual root, an unknown segment, a file
+        // used as an INTERMEDIATE segment, a truncated chain, and a bare
+        // walk-root name (never a files row).
+        assert_eq!(hot.id_of_path(""), None);
+        assert_eq!(hot.id_of_path("docs/nope.txt"), None);
+        assert_eq!(hot.id_of_path("docs/Alpha.TXT/memo.md"), None);
+        assert_eq!(hot.id_of_path(&format!("docs{sep}inner")), None);
+        assert_eq!(hot.id_of_path("docs"), None);
     }
 
     /// Full incremental round-trip: upsert a brand-new row (new dir chain

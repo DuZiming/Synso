@@ -1,9 +1,9 @@
 <script lang="ts">
   // Dashboard shell (Task 16): client-side tabs over the main window —
-  // 概览 (index tiles + scan), 查重 (DedupView) and 火焰图 (FlameView,
-  // Task 17); the 集合 (Task 18) tab is a disabled placeholder. No router
-  // lib: tab state is one $state string, and tab content mounts on
-  // demand, so a re-opened tab re-reads its own state.
+  // 概览 (index tiles + scan), 查重 (DedupView), 火焰图 (FlameView,
+  // Task 17) and 集合 (CollectionsView, Task 18). No router lib: tab
+  // state is one $state string, and tab content mounts on demand, so a
+  // re-opened tab re-reads its own state.
   import { onMount } from "svelte";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { t } from "../i18n";
@@ -12,16 +12,19 @@
   import type { EngineStats } from "../lib/types";
   import DedupView from "../dedup/DedupView.svelte";
   import FlameView from "../flame/FlameView.svelte";
+  import CollectionsView from "../collections/CollectionsView.svelte";
 
-  type TabId = "overview" | "dedup" | "flame";
+  type TabId = "overview" | "dedup" | "flame" | "collections";
 
-  const tabs: { id: TabId; label: "tabs.overview" | "tabs.dedup" | "tabs.flame" }[] = [
+  const tabs: {
+    id: TabId;
+    label: "tabs.overview" | "tabs.dedup" | "tabs.flame" | "tabs.collections";
+  }[] = [
     { id: "overview", label: "tabs.overview" },
     { id: "dedup", label: "tabs.dedup" },
     { id: "flame", label: "tabs.flame" },
+    { id: "collections", label: "tabs.collections" },
   ];
-  /// Task 18 owns this; rendered disabled until then.
-  const soonTabs = ["tabs.collections"] as const;
 
   let tab = $state<TabId>("overview");
   let stats = $state<EngineStats | null>(null);
@@ -82,11 +85,6 @@
       {$t(tabDef.label)}
     </button>
   {/each}
-  {#each soonTabs as key (key)}
-    <button class="tab soon" role="tab" aria-selected="false" disabled>
-      {$t(key)}<span class="soon-note">{$t("tabs.comingSoon")}</span>
-    </button>
-  {/each}
 </div>
 
 {#if tab === "overview"}
@@ -138,6 +136,8 @@
   </section>
 {:else if tab === "flame"}
   <FlameView />
+{:else if tab === "collections"}
+  <CollectionsView />
 {:else}
   <DedupView onchanged={refresh} />
 {/if}

@@ -23,6 +23,10 @@ const zh: Dict = {
     prevPage: "上一页",
     nextPage: "下一页",
     confirmDialog: "删除确认",
+    collList: "集合列表",
+    memberList: "成员列表",
+    pickerDialog: "集合选择器",
+    pickBox: "选择此结果",
   },
   dashboard: {
     files: "文件",
@@ -42,7 +46,6 @@ const zh: Dict = {
     dedup: "查重",
     flame: "火焰图",
     collections: "集合",
-    comingSoon: "即将推出",
   },
   dedup: {
     start: "启动分析",
@@ -123,6 +126,33 @@ const zh: Dict = {
     aggregateNoDrill: "聚合节点不可下钻（(other) 是多个目录的合并项）。",
     filesLine: "{n} 个文件",
     ofParentLine: "占上级 {pct}%",
+  },
+  collections: {
+    create: "新建",
+    createPlaceholder: "新集合名称",
+    empty:
+      "还没有集合。先新建一个，再从快速搜索窗口（选中结果 → 加入集合）或火焰图节点右键菜单把文件加进来。",
+    membersUnit: "个成员",
+    noMembers:
+      "还没有成员。在快速搜索窗口选中结果后点「加入集合」，或在火焰图节点上右键加入。",
+    lost: "已丢失，文件被移走或删除",
+    reveal: "在资源管理器中显示",
+    removeMember: "移出集合",
+    viewInSearch: "在快速搜索中查看",
+    rename: "重命名",
+    delete: "删除",
+    renamePlaceholder: "新名称",
+    addTitle: "加入集合",
+    pickerCreate: "新建并加入",
+    pickerEmpty: "还没有集合——输入名称新建一个。",
+    added: "已加入「{name}」",
+    addFailed: "加入失败",
+    notInIndex: "该路径不在索引中",
+    deleteTitle: "删除这个集合？",
+    deleteKeepsFiles:
+      "删除集合不删除文件——文件保留在原位置，只删除这条集合记录。",
+    confirmDelete: "删除",
+    confirmCancel: "取消",
   },
 };
 

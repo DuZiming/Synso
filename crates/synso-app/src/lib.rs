@@ -63,12 +63,21 @@ pub fn run() {
             commands::quick_show,
             commands::quick_hide,
             commands::quick_info,
+            commands::quick_show_query,
             commands::dedup_start,
             commands::dedup_state,
             commands::dedup_groups,
             commands::delete_to_trash,
             commands::size_tree,
-            commands::reveal_index_path
+            commands::reveal_index_path,
+            commands::coll_create,
+            commands::coll_rename,
+            commands::coll_delete,
+            commands::coll_list,
+            commands::coll_add,
+            commands::coll_remove,
+            commands::coll_members,
+            commands::file_id_of
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

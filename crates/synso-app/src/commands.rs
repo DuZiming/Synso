@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 
 use synso_core::{
-    DedupState, DupeGroup, EngineStats, Hit, ParsedQuery, SearchResult, Settings, SizeNode,
-    VolumeInfo,
+    Collection, DedupState, DupeGroup, EngineStats, Hit, MemberHit, ParsedQuery, SearchResult,
+    Settings, SizeNode, VolumeInfo,
 };
 use tauri::{AppHandle, State};
 use tauri_plugin_opener::OpenerExt;
@@ -124,6 +124,18 @@ pub fn quick_info(state: State<'_, quick::QuickState>) -> quick::QuickInfo {
     state.info()
 }
 
+/// Shows + focuses the quick window with the query PRE-FILLED — the
+/// collections view's 「在快速搜索中查看」 button hands over `coll:<name>`.
+/// The same show logic the dashboard button (`quick_show`) uses, plus one
+/// `quick-query` event `emit_to` the quick webview (the pre-fill hook: the
+/// window's page is mounted from startup, its listener applies the text
+/// whenever it lands — see `quick::show_with_query`). snake_case payload
+/// key, kebab-case event name, per the events.rs conventions.
+#[tauri::command]
+pub fn quick_show_query(app: AppHandle, q: String) {
+    quick::show_with_query(&app, &q);
+}
+
 // ---------------------- Task 16: dedup dashboard ----------------------
 
 /// Starts a dedup run (or, while one is already going, is a harmless
@@ -213,4 +225,82 @@ pub fn reveal_index_path(
     app.opener()
         .reveal_item_in_dir(&abs)
         .map_err(|err| err.to_string())
+}
+
+// ---------------------- Task 18: collections UI ----------------------
+
+// Thin forwarders over the engine's coll_* facade (see
+// `synso_core::collections` for the semantics: members are files OR folder
+// rows, multi-membership is core, rename/move tombstones then rebinds on
+// the next reconcile, and deleting a collection never touches files).
+// Every error surfaces to the webview verbatim as a string.
+
+/// Creates a collection. A duplicate name is an error (engine Conflict).
+#[tauri::command]
+pub fn coll_create(state: State<'_, AppState>, name: String) -> Result<Collection, String> {
+    state
+        .engine
+        .coll_create(&name)
+        .map_err(|err| err.to_string())
+}
+
+/// Renames a collection (unknown id / taken name → engine error verbatim).
+#[tauri::command]
+pub fn coll_rename(state: State<'_, AppState>, id: i64, name: String) -> Result<(), String> {
+    state
+        .engine
+        .coll_rename(id, &name)
+        .map_err(|err| err.to_string())
+}
+
+/// Deletes a collection and its member rows — never the files themselves.
+#[tauri::command]
+pub fn coll_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    state.engine.coll_delete(id).map_err(|err| err.to_string())
+}
+
+/// Every collection, id-ordered (creation order).
+#[tauri::command]
+pub fn coll_list(state: State<'_, AppState>) -> Result<Vec<Collection>, String> {
+    state.engine.coll_list().map_err(|err| err.to_string())
+}
+
+/// Adds file OR folder row ids to a collection, snapshotting each entry's
+/// current name + size (the later tombstone/rebind key).
+#[tauri::command]
+pub fn coll_add(state: State<'_, AppState>, id: i64, members: Vec<i64>) -> Result<(), String> {
+    state
+        .engine
+        .coll_add(id, &members)
+        .map_err(|err| err.to_string())
+}
+
+/// Removes one member row (alive or tombstoned) from a collection.
+#[tauri::command]
+pub fn coll_remove(state: State<'_, AppState>, id: i64, member: i64) -> Result<(), String> {
+    state
+        .engine
+        .coll_remove(id, member)
+        .map_err(|err| err.to_string())
+}
+
+/// The collection's members, tombstoned ones included (dead members carry
+/// a hit synthesized from the add-time snapshot: empty path, mtime 0, the
+/// stale file id kept so the UI can still address the row).
+#[tauri::command]
+pub fn coll_members(state: State<'_, AppState>, id: i64) -> Result<Vec<MemberHit>, String> {
+    state.engine.coll_members(id).map_err(|err| err.to_string())
+}
+
+/// Resolves an INDEX path (the `Hit::path` spelling, directories included)
+/// to its `files` row id — the bridge that lets the flame chart (whose
+/// nodes carry paths, not ids) add its node — directory OR file, the node
+/// itself, not its children — to a collection. An unresolvable path is an
+/// error the view toasts verbatim.
+#[tauri::command]
+pub fn file_id_of(state: State<'_, AppState>, path: String) -> Result<i64, String> {
+    state
+        .engine
+        .file_id_of(&path)
+        .ok_or_else(|| format!("not in the index: \"{path}\""))
 }

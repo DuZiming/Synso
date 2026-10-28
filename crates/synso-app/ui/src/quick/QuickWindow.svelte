@@ -6,11 +6,21 @@
   // with its default app, Ctrl+Enter reveals it in Explorer, Esc (or a
   // focus loss, handled Rust-side) hides the window; re-showing keeps the
   // query text, selects it, and clears the result selection.
+  //
+  // Task 18 multi-select: results can be gathered into a collection —
+  // Ctrl/Cmd+click toggles one row, Shift+click extends the range from
+  // the last anchor, and every row carries a checkbox (the mouse-only
+  // path) — then 加入集合 opens the shared CollectionPicker and `coll_add`s
+  // the picked ids. Plain click keeps the launcher semantics (select +
+  // open). A fresh search resets the selection (it refers to the visible
+  // results); the quick-query event (the collections view's 「在快速搜索
+  // 中查看」 pre-fill) arrives after a Rust-side show and swaps the query.
   import { onMount } from "svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { initI18n, t } from "../i18n";
   import { formatTime, humanBytes } from "../lib/format";
   import {
+    collAdd,
     engineStats,
     openPath,
     parsePreview,
@@ -18,7 +28,8 @@
     revealPath,
     search,
   } from "../lib/tauri";
-  import type { Hit, ParsedQuery } from "../lib/types";
+  import type { Collection, Hit, ParsedQuery } from "../lib/types";
+  import CollectionPicker from "../collections/CollectionPicker.svelte";
 
   /// Fixed row height — the pixel grid the windowing slices on (and the
   /// rows' CSS height; both sides must agree).
@@ -40,6 +51,58 @@
   let warming = $state(false);
   /// Last open/reveal failure (stays visible so the user can read it).
   let openError = $state<string | null>(null);
+
+  // ---- Task 18: multi-select → 加入集合 ----
+  /// Picked rows by hit id (the ids coll_add consumes). A new search
+  /// clears this: a selection refers to the results it was made on.
+  let picked = $state<Record<number, boolean>>({});
+  /// Row index of the last click — the Shift+click range anchor.
+  let anchor = $state(-1);
+  /// The shared collection picker (CollectionPicker.svelte).
+  let pickerOpen = $state(false);
+  /// In-flight add + feedback lines (mutually exclusive with picked: a
+  /// successful add clears the selection).
+  let adding = $state(false);
+  let addedTo = $state<string | null>(null);
+  let addTimer: ReturnType<typeof setTimeout> | undefined;
+  let addError = $state<string | null>(null);
+
+  const pickedCount = $derived(
+    Object.values(picked).reduce((n, on) => n + (on ? 1 : 0), 0),
+  );
+
+  function pickedIds(): number[] {
+    return Object.entries(picked)
+      .filter(([, on]) => on)
+      .map(([id]) => Number(id));
+  }
+
+  function clearPicked(): void {
+    picked = {};
+    anchor = -1;
+  }
+
+  /// Ctrl/Cmd+click: toggle one row; also the checkbox path.
+  function togglePicked(index: number): void {
+    const hit = hits[index];
+    if (!hit) return;
+    picked[hit.id] = !picked[hit.id];
+    anchor = index;
+  }
+
+  /// Shift+click: extend the pick from the anchor (a fresh anchor picks
+  /// from the top). Range adds, never subtracts — the standard listbox
+  /// extension gesture.
+  function rangePicked(index: number): void {
+    if (hits.length === 0) return;
+    const start = anchor >= 0 ? Math.min(anchor, index) : 0;
+    const end = anchor >= 0 ? Math.max(anchor, index) : index;
+    for (let i = start; i <= end; i++) {
+      const hit = hits[i];
+      if (hit) picked[hit.id] = true;
+    }
+    anchor = index;
+  }
 
   let listEl: HTMLDivElement | undefined = $state();
   let inputEl: HTMLInputElement | undefined = $state();
@@ -95,6 +158,7 @@
     hits = res.hits;
     total = res.total;
     selected = -1;
+    clearPicked();
     scrollTop = 0;
     if (listEl) listEl.scrollTop = 0;
 
@@ -159,10 +223,21 @@
     return index >= 0 && index < hits.length ? index : -1;
   }
 
-  /// Hover selects, click opens — the launcher-style interaction.
+  /// Hover selects, click opens — the launcher-style interaction —
+  /// with the multi-select gestures layered on: Ctrl/Cmd+click toggles
+  /// the row into the 加入集合 selection, Shift+click extends the range.
   function onListClick(event: MouseEvent): void {
     const index = rowIndexAt(event.currentTarget as HTMLElement, event);
     if (index >= 0) {
+      if (event.ctrlKey || event.metaKey) {
+        togglePicked(index);
+        return;
+      }
+      if (event.shiftKey) {
+        rangePicked(index);
+        return;
+      }
+      anchor = index;
       selected = index;
       void activate(false);
     }
@@ -173,10 +248,54 @@
     selected = index;
   }
 
+  /// Opens the shared picker over the current selection. The picker only
+  /// resolves WHICH collection; the add itself happens in `onPickColl`.
+  function openPicker(): void {
+    if (pickedCount === 0) return;
+    openError = null;
+    pickerOpen = true;
+  }
+
+  async function onPickColl(coll: Collection): Promise<void> {
+    const ids = pickedIds();
+    if (ids.length === 0) {
+      pickerOpen = false;
+      return;
+    }
+    adding = true;
+    addError = null;
+    try {
+      await collAdd(coll.id, ids);
+      pickerOpen = false;
+      clearPicked();
+      addedTo = coll.name;
+      clearTimeout(addTimer);
+      addTimer = setTimeout(() => (addedTo = null), 10_000);
+    } catch (err) {
+      // Keeping the picker up is useless behind its own overlay — close it
+      // and surface the failure where the results are (ids may be stale
+      // after a rescan; the user re-picks and retries).
+      pickerOpen = false;
+      addError = String(err);
+    } finally {
+      adding = false;
+    }
+  }
+
   function onKeydown(event: KeyboardEvent): void {
     // IME composition (Chinese input!): Enter/arrows belong to the
     // composer until it ends — never act on them.
     if (event.isComposing) return;
+    // While the collection picker is up it owns the keyboard: Esc closes
+    // IT (not the window; the picker's own Esc handler closes it too —
+    // idempotent), every other key stays out of the way.
+    if (pickerOpen) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        pickerOpen = false;
+      }
+      return;
+    }
     if (event.key === "Escape") {
       event.preventDefault();
       void quickHide();
@@ -192,12 +311,32 @@
     }
   }
 
+  /// The collections view's 「在快速搜索中查看」: the Rust side shows the
+  /// window (the dashboard-button path) and emits `quick-query`; swap the
+  /// query and run the search immediately (bypassing the debounce — the
+  /// text arrived complete). The stale-response runId guard inside
+  /// runSearch makes a racing queued keystroke harmless.
+  async function applyQuery(q: string): Promise<void> {
+    query = q;
+    openError = null;
+    pickerOpen = false;
+    clearTimeout(debounceTimer);
+    await runSearch().catch(() => {});
+    inputEl?.focus();
+  }
+
   onMount(() => {
     void initI18n();
     inputEl?.focus();
     // Empty query lists the most recent entries (the engine's own
     // empty-text behavior) — a live first impression for free.
     void runSearch().catch(() => {});
+
+    // Task 18 pre-fill hook (quick.rs's quick_show_query command).
+    const unlistenQuery = getCurrentWindow().listen<{ q: string }>(
+      "quick-query",
+      (event) => void applyQuery(event.payload.q),
+    );
 
     // Re-show (window focus): keep the query text, select it, drop the
     // result selection. The hide side of focus loss is Rust's job.
@@ -211,7 +350,9 @@
     });
     return () => {
       void unlisten.then((fn) => fn());
+      void unlistenQuery.then((fn) => fn());
       clearTimeout(debounceTimer);
+      clearTimeout(addTimer);
     };
   });
 </script>
@@ -240,6 +381,14 @@
   {#if openError}
     <p class="error" role="alert">{openError}</p>
   {/if}
+  {#if addError}
+    <p class="error" role="alert">{addError}</p>
+  {/if}
+  {#if addedTo}
+    <p class="added" role="status">
+      {$t("collections.added").replace("{name}", addedTo)}
+    </p>
+  {/if}
 
   {#if hits.length === 0}
     <div class="empty">
@@ -258,7 +407,14 @@
       {:else}
         <span class="muted">{total.toLocaleString()} {$t("quick.results")}</span>
       {/if}
-      <span class="muted">{$t("quick.hints")}</span>
+      {#if pickedCount > 0}
+        <!-- Task 18: multi-select → the shared collection picker. -->
+        <button class="primary add-btn" disabled={adding} onclick={openPicker}>
+          {$t("collections.addTitle")} ({pickedCount.toLocaleString()})
+        </button>
+      {:else}
+        <span class="muted">{$t("quick.hints")}</span>
+      {/if}
     </div>
     <!-- Keyboard interaction lives on the window-level keydown handler
          (the input keeps focus), so the listbox itself needs no key
@@ -281,10 +437,29 @@
           <div
             class="row"
             class:selected={index === selected}
+            class:picked={!!picked[hit.id]}
             style="top: {index * ROW_H}px; height: {ROW_H}px"
             role="option"
             aria-selected={index === selected}
           >
+            <!-- Multi-select checkbox: the mouse-only toggle. The row
+                 itself carries the keyboard-free gestures too (Ctrl+click
+                 toggle, Shift+click range); the box is decorative to the
+                 a11y tree on purpose — a listbox option must not nest
+                 interactive descendants, and the gestures live on the
+                 option's own click. -->
+            <!-- svelte-ignore a11y_click_events_have_key_events -->
+            <!-- svelte-ignore a11y_no_static_element_interactions -->
+            <span
+              class="pickbox"
+              class:on={!!picked[hit.id]}
+              aria-hidden="true"
+              title={$t("a11y.pickBox")}
+              onclick={(event) => {
+                event.stopPropagation();
+                togglePicked(index);
+              }}
+            ></span>
             <span class="icon" class:dir={hit.is_dir} aria-hidden="true">
               {#if hit.is_dir}
                 <svg viewBox="0 0 16 16" width="16" height="16">
@@ -326,6 +501,13 @@
     </div>
   {/if}
 </div>
+
+{#if pickerOpen}
+  <CollectionPicker
+    onpick={(coll) => void onPickColl(coll)}
+    onclose={() => (pickerOpen = false)}
+  />
+{/if}
 
 <style>
   .quick {
@@ -394,6 +576,57 @@
 
   .muted {
     color: var(--muted);
+  }
+
+  /* Task 18: multi-select + add feedback. */
+  .added {
+    flex-shrink: 0;
+    margin: 0;
+    padding: 4px 12px;
+    color: var(--warm);
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .meta .add-btn {
+    padding: 4px 12px;
+    font-size: 12px;
+  }
+
+  .row.picked {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
+
+  .pickbox {
+    flex-shrink: 0;
+    width: 15px;
+    height: 15px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    line-height: 1;
+    color: #fff;
+    cursor: pointer;
+    opacity: 0;
+  }
+
+  .row:hover .pickbox,
+  .pickbox.on {
+    opacity: 1;
+  }
+
+  .pickbox.on {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .pickbox.on::after {
+    content: "✓";
   }
 
   .empty {
