@@ -307,12 +307,14 @@ fn run_loop(
         select! {
             recv(event_rx) -> msg => match msg {
                 Ok(event) => {
-                    absorb(ctx, event, pending);
-                    deadline = if pending.is_empty() {
-                        None
-                    } else {
-                        Some(Instant::now() + QUIET_WINDOW)
-                    };
+                    // Only REAL ops (re)open the quiet window: an event the
+                    // matcher filtered (excluded subtree, db sidecars,
+                    // outside every root) must not push the deadline out —
+                    // a flood of filtered noise would otherwise keep
+                    // sliding the window and starve the pending batch.
+                    if absorb(ctx, event, pending) {
+                        deadline = Some(Instant::now() + QUIET_WINDOW);
+                    }
                 }
                 Err(_) => return, // sender gone: nothing watchable remains
             },
@@ -325,12 +327,17 @@ fn run_loop(
 /// Merges one notify event into the pending map: per path, the latest
 /// disposition wins (create-then-delete becomes a removal,
 /// delete-then-create an upsert — disk truth at apply time decides).
-fn absorb(ctx: &Ctx, event: NotifyEvent, pending: &mut BTreeMap<PathBuf, PendingOp>) {
+/// Returns whether at least one op was actually queued — filtered paths
+/// contribute nothing and must not reopen the debounce window.
+fn absorb(ctx: &Ctx, event: NotifyEvent, pending: &mut BTreeMap<PathBuf, PendingOp>) -> bool {
+    let mut queued = false;
     for (path, op) in event_ops(&event) {
         if let Some(entry) = ctx.make_pending(&path, op) {
             pending.insert(path, entry);
+            queued = true;
         }
     }
+    queued
 }
 
 /// Reduces a notify event to (path, op) pairs. Rename kinds map their two
@@ -926,5 +933,59 @@ mod tests {
                 .all(|rec| rec.name != "late.txt"),
             "no store row for the excluded path either"
         );
+    }
+
+    /// Regression: events the matcher FILTERS (here: an excluded subtree)
+    /// must not push the debounce deadline out — a quiet window already
+    /// open on real ops still closes on time, so the batch applies while
+    /// the filtered noise keeps arriving. Before the fix, every filtered
+    /// event slid the deadline forward, so a continuous noise stream
+    /// starved the pending batch indefinitely.
+    #[test]
+    fn watcher_filtered_events_do_not_starve_quiet_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = write_fixture(tmp.path());
+        let engine = open_engine(&db_path, &root, vec!["noise".to_string()]);
+        scan_once(&engine);
+        engine.start_watcher().unwrap();
+
+        // A real op opens the quiet window (~t=0, deadline ~t+500ms).
+        let real = root.join("real_op.txt");
+        fs::write(&real, b"r").unwrap();
+        std::thread::sleep(Duration::from_millis(100)); // let it queue first
+
+        // Filtered noise, written continuously on another thread for 4s —
+        // far past the window's close. Every event is a fresh excluded
+        // path, so `make_pending` drops them all.
+        let noise_dir = root.join("noise");
+        fs::create_dir_all(&noise_dir).unwrap();
+        let flooding = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flood_flag = flooding.clone();
+        let flood_thread = std::thread::spawn(move || {
+            let end = Instant::now() + Duration::from_secs(4);
+            let mut i = 0u32;
+            while Instant::now() < end {
+                fs::write(noise_dir.join(format!("n{i}.tmp")), b"n").unwrap();
+                i += 1;
+            }
+            flood_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        // The real op must land ON TIME (one window, brief: <=2s) — while
+        // the flood is STILL RUNNING. Without the deadline fix the batch
+        // waits for the flood to end (~4s) and this budget expires first.
+        poll_until(Duration::from_secs(2), || {
+            (search_total(&engine, "real_op") == 1).then_some(())
+        });
+        assert!(
+            flooding.load(std::sync::atomic::Ordering::SeqCst),
+            "the batch must apply while filtered noise is still streaming"
+        );
+
+        flood_thread.join().unwrap();
+        // Noise stays excluded (ample time after the flood ended).
+        std::thread::sleep(Duration::from_millis(1200));
+        assert_eq!(search_total(&engine, "noise"), 0, "noise never indexed");
     }
 }
