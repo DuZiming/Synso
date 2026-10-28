@@ -459,8 +459,7 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
                                 log::error!("synso: watcher subtree walk of {path:?} failed: {err}")
                             }
                         }
-                        hot_ops
-                            .extend(walked.into_iter().map(HotOp::Upsert));
+                        hot_ops.extend(walked.into_iter().map(HotOp::Upsert));
                     }
                     hot_ops.push(HotOp::Upsert(rec));
                     applied += 1;

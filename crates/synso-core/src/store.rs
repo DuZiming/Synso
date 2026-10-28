@@ -367,7 +367,11 @@ fn backfill_pinyin_keys(conn: &Connection) -> Result<()> {
 /// scan pay journal-create/commit/delete churn per file, ~10x over the
 /// throughput budget on this machine). `pub(crate)`: the scanner's batch
 /// flush is the transactional caller.
-pub(crate) fn upsert_file_on(conn: &Connection, dir_path: &[&str], rec: &mut FileRecord) -> Result<()> {
+pub(crate) fn upsert_file_on(
+    conn: &Connection,
+    dir_path: &[&str],
+    rec: &mut FileRecord,
+) -> Result<()> {
     let dir_id = resolve_dir(conn, dir_path)?;
     let ext_id = intern_extension(conn, &rec.name)?;
     let (py_full, py_init) = pinyin_keys(&rec.name);

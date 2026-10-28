@@ -407,9 +407,7 @@ fn passes_filters(
         PathFilter::Fast { needle, dir_hits } => {
             // The name check is the cheaper probe and short-circuits the
             // dir-set lookup for name-bearing paths.
-            if !hot.name_lower(slot).contains(needle)
-                && !dir_hits.contains(&hot.parent_dir(slot))
-            {
+            if !hot.name_lower(slot).contains(needle) && !dir_hits.contains(&hot.parent_dir(slot)) {
                 return false;
             }
         }
@@ -509,9 +507,7 @@ impl<'w> PreparedWord<'w> {
         while start + needle.len() <= hay.len() {
             // The first-byte probe scans through the cheap rejects; the
             // tail compare runs only for the (rare) byte hits.
-            let Some(offset) = hay[start..].iter().position(|&byte| byte == *first) else {
-                return None;
-            };
+            let offset = hay[start..].iter().position(|&byte| byte == *first)?;
             let index = start + offset;
             // A byte hit can sit past the loop guard's last full-needle
             // window (the probe scans to the haystack end) — then no full
@@ -564,6 +560,11 @@ impl<'w> PreparedWord<'w> {
 /// ranked_prefix)` — `total` counts every match (the full result size the
 /// UI reports), `ranked_prefix` holds the `[0, offset + limit)` head of
 /// the full ranking, which is all [`page`] can ever materialize.
+// Newer clippy's `too_many_arguments` fires here (9 > 7). The args are the
+// pass's distinct inputs (hot index, parsed query, the three filters, the
+// word list, ranking page); bundling them into a struct would be style-only
+// churn on the engine's hottest path, so the lint is allowed, not restructured.
+#[allow(clippy::too_many_arguments)]
 fn match_slots(
     hot: &HotIndex,
     q: &ParsedQuery,
@@ -593,12 +594,17 @@ fn match_slots(
             continue;
         };
         total += 1;
-        insert_top_k(&mut top, page_len, Scored {
-            class,
-            recent: hot.mtime(slot) >= now - RECENCY_WINDOW_SECS,
-            path_len: hot.path_len_memo(&mut path_lens, slot),
-            slot,
-        }, |a, b| cmp_scored(hot, a, b));
+        insert_top_k(
+            &mut top,
+            page_len,
+            Scored {
+                class,
+                recent: hot.mtime(slot) >= now - RECENCY_WINDOW_SECS,
+                path_len: hot.path_len_memo(&mut path_lens, slot),
+                slot,
+            },
+            |a, b| cmp_scored(hot, a, b),
+        );
     }
     (total, top.into_iter().map(|key| key.slot).collect())
 }
@@ -623,12 +629,7 @@ fn page_len(offset: u32, limit: u32) -> usize {
 /// With `k` at page size and `n` candidates this is O(n) comparisons for
 /// the common reject path instead of O(n log n) sort comparisons plus the
 /// path-tie string work a 1M-element sort would pay.
-fn insert_top_k<T>(
-    top: &mut Vec<T>,
-    k: usize,
-    key: T,
-    mut cmp: impl FnMut(&T, &T) -> Ordering,
-) {
+fn insert_top_k<T>(top: &mut Vec<T>, k: usize, key: T, mut cmp: impl FnMut(&T, &T) -> Ordering) {
     if k == 0 {
         return;
     }
@@ -702,17 +703,22 @@ fn recent_slots(
             continue;
         }
         total += 1;
-        insert_top_k(&mut top, page_len, Recent {
-            mtime: hot.mtime(slot),
-            path_len: hot.path_len_memo(&mut path_lens, slot),
-            slot,
-        }, |a, b| {
-            b.mtime
-                .cmp(&a.mtime)
-                .then(a.path_len.cmp(&b.path_len))
-                .then_with(|| cmp_slot_paths(hot, a.slot, b.slot))
-                .then(a.slot.cmp(&b.slot))
-        });
+        insert_top_k(
+            &mut top,
+            page_len,
+            Recent {
+                mtime: hot.mtime(slot),
+                path_len: hot.path_len_memo(&mut path_lens, slot),
+                slot,
+            },
+            |a, b| {
+                b.mtime
+                    .cmp(&a.mtime)
+                    .then(a.path_len.cmp(&b.path_len))
+                    .then_with(|| cmp_slot_paths(hot, a.slot, b.slot))
+                    .then(a.slot.cmp(&b.slot))
+            },
+        );
     }
     (total, top.into_iter().map(|key| key.slot).collect())
 }

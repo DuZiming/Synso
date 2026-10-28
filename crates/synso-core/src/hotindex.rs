@@ -69,29 +69,35 @@ const SYNTHETIC_LATIN: [&str; 20] = [
 /// keys are computed from these by the production generator, so 「bg」 and
 /// 「baog」 probes match exactly the rows a real 报告-named corpus would.
 const SYNTHETIC_HAN: [&str; 24] = [
-    "报告", "会议", "计划", "笔记", "截图", "视频", "音乐", "图片", "资料", "合同", "发票",
-    "简历", "项目", "总结", "备份", "数据", "模板", "通知", "日志", "方案", "财务", "人事",
-    "培训", "调研",
+    "报告", "会议", "计划", "笔记", "截图", "视频", "音乐", "图片", "资料", "合同", "发票", "简历",
+    "项目", "总结", "备份", "数据", "模板", "通知", "日志", "方案", "财务", "人事", "培训", "调研",
 ];
 
 /// Extension pool for the synthetic corpus; "pdf" is index 0 so the
 /// `ext:pdf size:>1mb` probe filters through the interned-id fast path.
 const SYNTHETIC_EXTS: [&str; 14] = [
-    "pdf", "docx", "txt", "jpg", "png", "mp3", "mp4", "zip", "xlsx", "pptx", "md", "csv",
-    "wav", "mov",
+    "pdf", "docx", "txt", "jpg", "png", "mp3", "mp4", "zip", "xlsx", "pptx", "md", "csv", "wav",
+    "mov",
 ];
 
 /// Root segments of the synthetic dir tree; "projects" is the `path:`
 /// probe's target (no other segment contains that substring).
 const SYNTHETIC_ROOTS: [&str; 8] = [
-    "projects", "docs", "media", "downloads", "work", "archive", "backup", "photos",
+    "projects",
+    "docs",
+    "media",
+    "downloads",
+    "work",
+    "archive",
+    "backup",
+    "photos",
 ];
 
 /// Subdirectory name pool for the synthetic tree (numerically suffixed per
 /// parent, so sibling names stay unique).
 const SYNTHETIC_SUBDIRS: [&str; 14] = [
-    "src", "docs", "assets", "drafts", "final", "old", "new", "备份", "资料", "temp",
-    "export", "raw", "edit", "out",
+    "src", "docs", "assets", "drafts", "final", "old", "new", "备份", "资料", "temp", "export",
+    "raw", "edit", "out",
 ];
 
 /// mtime base of the synthetic corpus (2026-01-01T00:00:00Z); per-entry
@@ -266,13 +272,7 @@ impl HotIndex {
         };
 
         for (r, root) in SYNTHETIC_ROOTS.iter().enumerate() {
-            let root_id = intern_dir(
-                &mut hot,
-                None,
-                root,
-                &mut next_dir_id,
-                &mut next_file_id,
-            );
+            let root_id = intern_dir(&mut hot, None, root, &mut next_dir_id, &mut next_file_id);
             for k in 0..3 + rng.below(4) {
                 let name = format!(
                     "{}{k}",
