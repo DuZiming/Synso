@@ -139,7 +139,6 @@ fn synthetic_record(
     }
 }
 
-
 /// In-memory search index over the store (see module docs).
 #[derive(Debug, Default)]
 pub struct HotIndex {
@@ -797,7 +796,6 @@ impl HotIndex {
         }
         acc
     }
-
 
     /// Shared chain walk: `visit(dir_name)` for every dir from `slot`'s
     /// parent up to the root, stopping at a missing row, at a root, or
