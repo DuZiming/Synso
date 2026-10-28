@@ -106,6 +106,24 @@ const zh: Dict = {
     shortcut:
       "全局快捷键不可用（被占用或无效），可改用仪表盘上的“快速搜索”按钮打开搜索窗。",
   },
+  flame: {
+    compare: "对比模式",
+    refresh: "刷新",
+    loading: "加载中…",
+    missing: "路径不存在",
+    loadFailed: "加载失败",
+    rootPickerPlaceholder: "输入索引路径，回车跳转",
+    rootPickerLabel: "根路径输入框",
+    crumbsLabel: "根目录面包屑",
+    chartLabel: "目录大小火焰图",
+    menuLabel: "节点菜单",
+    reveal: "在资源管理器中显示",
+    revealUnavailable: "聚合节点没有对应的磁盘位置",
+    addToCollection: "加入集合",
+    aggregateNoDrill: "聚合节点不可下钻（(other) 是多个目录的合并项）。",
+    filesLine: "{n} 个文件",
+    ofParentLine: "占上级 {pct}%",
+  },
 };
 
 export default zh;

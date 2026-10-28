@@ -123,3 +123,17 @@ export interface DupeGroup {
   size: number;
   members: Hit[];
 }
+
+/// Mirror of `synso_core::SizeNode` (`size_tree`'s payload): one node of
+/// the directory-size tree. `size` sums ALL descendant file bytes (a file
+/// node: its own size), `file_count` counts descendant files. Paths are
+/// index-relative in the `Hit::path` spelling (`""` for the virtual
+/// "(all)" root); children are size-descending, truncated per level with
+/// the overflow merged into a trailing synthetic "(other)" node.
+export interface SizeNode {
+  path: string;
+  name: string;
+  size: number;
+  file_count: number;
+  children: SizeNode[];
+}

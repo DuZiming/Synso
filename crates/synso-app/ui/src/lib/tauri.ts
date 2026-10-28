@@ -10,6 +10,7 @@ import type {
   QuickInfo,
   SearchResult,
   Settings,
+  SizeNode,
   VolumeInfo,
 } from "./types";
 
@@ -104,4 +105,30 @@ export function dedupGroups(
  * delete); resolves with how many paths actually landed. */
 export function deleteToTrash(ids: number[]): Promise<number> {
   return invoke("delete_to_trash", { ids });
+}
+
+// ------------------ Task 17: flame chart ---------------------------------
+
+/** Directory-size tree behind `root` (an index path in the Hit::path
+ * spelling; "" is the virtual root over the scan roots). Resolves `null`
+ * for an unknown root — including the synthetic "(other)" nodes, which
+ * name no real directory — and rejects with the engine error string if
+ * the IPC fails (e.g. a poisoned index). Async server-side (the full
+ * index aggregation must not run on the main thread). The flame view
+ * calls this with (path, 2, 40) and drills by re-rooting at a clicked
+ * node's path. */
+export function sizeTree(
+  root: string,
+  depth: number,
+  maxChildren: number,
+): Promise<SizeNode | null> {
+  return invoke("size_tree", { root, depth, maxChildren });
+}
+
+/** Reveals an INDEX path in the OS file manager (Explorer with the item
+ * selected) — the path-based sibling of `revealPath`, since flame-chart
+ * nodes carry paths rather than row ids. Errors (synthetic or unknown
+ * paths) surface verbatim for the view to toast. */
+export function revealIndexPath(path: string): Promise<void> {
+  return invoke("reveal_index_path", { path });
 }

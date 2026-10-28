@@ -4,7 +4,8 @@
 use std::path::PathBuf;
 
 use synso_core::{
-    DedupState, DupeGroup, EngineStats, Hit, ParsedQuery, SearchResult, Settings, VolumeInfo,
+    DedupState, DupeGroup, EngineStats, Hit, ParsedQuery, SearchResult, Settings, SizeNode,
+    VolumeInfo,
 };
 use tauri::{AppHandle, State};
 use tauri_plugin_opener::OpenerExt;
@@ -162,5 +163,54 @@ pub fn delete_to_trash(state: State<'_, AppState>, ids: Vec<i64>) -> Result<usiz
     state
         .engine
         .delete_to_trash(&ids)
+        .map_err(|err| err.to_string())
+}
+
+// ---------------------- Task 17: flame chart ----------------------
+
+/// Directory-size tree behind `root` for the flame chart — an index path
+/// in the `Hit::path` spelling ("" is the virtual root over the scan
+/// roots). `depth` caps materialized child levels, `max_children`
+/// truncates each level with the overflow merged into a trailing
+/// "(other)" node; the UI calls this with (path, 2, 40)-shaped arguments
+/// and drills by re-rooting at a clicked node's path. An unknown root
+/// (including a synthetic "(other)" path, which names no real dir) is
+/// `None`, which the view renders as "path not found".
+///
+/// Async (thread-pool, not the main thread): the call takes the hot
+/// index's read lock for a full O(dirs + files) aggregation walk, and on
+/// a live tree the watcher's write-lock batches can delay that wait — a
+/// sync command would freeze the whole window while blocked (observed in
+/// the Task 17 verification on C:\Users\admin\AppData\Local and worked
+/// around here; Task 20 owns the deeper lock/l latency question).
+#[tauri::command]
+pub async fn size_tree(
+    state: State<'_, AppState>,
+    root: String,
+    depth: u8,
+    max_children: u8,
+) -> Result<Option<SizeNode>, String> {
+    Ok(state.engine.size_tree(&root, depth, max_children))
+}
+
+/// Reveals an INDEX path (the `Hit::path` spelling — flame-chart nodes
+/// carry paths, not row ids, so this is the path-based sibling of
+/// `reveal_path`) in the OS file manager: resolve to the absolute disk
+/// path through the SAME engine machinery the id-based reveal uses, then
+/// `tauri-plugin-opener`'s select-in-Explorer (works for dirs and files).
+/// A path no scan root resolves (synthetic "(all)"/"(other)" nodes,
+/// garbage from the webview) is an error the view surfaces verbatim.
+#[tauri::command]
+pub fn reveal_index_path(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    path: String,
+) -> Result<(), String> {
+    let abs = state
+        .engine
+        .resolve_absolute(&path)
+        .ok_or_else(|| format!("no scan root resolves \"{path}\""))?;
+    app.opener()
+        .reveal_item_in_dir(&abs)
         .map_err(|err| err.to_string())
 }

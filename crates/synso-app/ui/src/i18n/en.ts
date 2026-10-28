@@ -113,6 +113,25 @@ const en = {
     shortcut:
       "The global shortcut is unavailable (taken or invalid). Use the Quick search button on the dashboard instead.",
   },
+  flame: {
+    compare: "Compare mode",
+    refresh: "Refresh",
+    loading: "Loading…",
+    missing: "Path not found",
+    loadFailed: "Failed to load",
+    rootPickerPlaceholder: "Index path — Enter to jump",
+    rootPickerLabel: "Root path picker",
+    crumbsLabel: "Root breadcrumb",
+    chartLabel: "Directory size flame chart",
+    menuLabel: "Node menu",
+    reveal: "Show in File Explorer",
+    revealUnavailable: "Aggregated nodes have no disk location",
+    addToCollection: "Add to collection",
+    aggregateNoDrill:
+      "Aggregated node — the (other) bucket has no single path to drill into.",
+    filesLine: "{n} files",
+    ofParentLine: "{pct}% of parent",
+  },
 };
 
 export default en;

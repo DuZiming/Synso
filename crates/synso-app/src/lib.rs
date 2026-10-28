@@ -66,7 +66,9 @@ pub fn run() {
             commands::dedup_start,
             commands::dedup_state,
             commands::dedup_groups,
-            commands::delete_to_trash
+            commands::delete_to_trash,
+            commands::size_tree,
+            commands::reveal_index_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

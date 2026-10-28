@@ -1,9 +1,9 @@
 <script lang="ts">
   // Dashboard shell (Task 16): client-side tabs over the main window —
-  // 概览 (index tiles + scan) and 查重 (DedupView); the 火焰图 (Task 17)
-  // and 集合 (Task 18) tabs are disabled placeholders. No router lib: tab
-  // state is one $state string, and tab content mounts on demand, so the
-  // dedup view re-reads `dedup_state` every time its tab opens.
+  // 概览 (index tiles + scan), 查重 (DedupView) and 火焰图 (FlameView,
+  // Task 17); the 集合 (Task 18) tab is a disabled placeholder. No router
+  // lib: tab state is one $state string, and tab content mounts on
+  // demand, so a re-opened tab re-reads its own state.
   import { onMount } from "svelte";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { t } from "../i18n";
@@ -11,15 +11,17 @@
   import { engineStats, startFullScan } from "../lib/tauri";
   import type { EngineStats } from "../lib/types";
   import DedupView from "../dedup/DedupView.svelte";
+  import FlameView from "../flame/FlameView.svelte";
 
-  type TabId = "overview" | "dedup";
+  type TabId = "overview" | "dedup" | "flame";
 
-  const tabs: { id: TabId; label: "tabs.overview" | "tabs.dedup" }[] = [
+  const tabs: { id: TabId; label: "tabs.overview" | "tabs.dedup" | "tabs.flame" }[] = [
     { id: "overview", label: "tabs.overview" },
     { id: "dedup", label: "tabs.dedup" },
+    { id: "flame", label: "tabs.flame" },
   ];
-  /// Task 17 / Task 18 own these; rendered disabled until then.
-  const soonTabs = ["tabs.flame", "tabs.collections"] as const;
+  /// Task 18 owns this; rendered disabled until then.
+  const soonTabs = ["tabs.collections"] as const;
 
   let tab = $state<TabId>("overview");
   let stats = $state<EngineStats | null>(null);
@@ -134,6 +136,8 @@
       </p>
     {/if}
   </section>
+{:else if tab === "flame"}
+  <FlameView />
 {:else}
   <DedupView onchanged={refresh} />
 {/if}
