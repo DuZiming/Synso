@@ -66,7 +66,8 @@ use crate::model::{FileId, ParsedQuery};
 use crate::query::{self, SearchResult};
 use crate::scanner::{self, effective_roots, root_segment, ScanOptions};
 use crate::store::Store;
-use crate::watcher::Watcher;
+use crate::trash;
+use crate::watcher::{self, Watcher};
 use crate::Result;
 
 /// Delay between the first successful `ScanFinished` and the engine's
@@ -487,6 +488,127 @@ impl Engine {
             Vec::new()
         })
     }
+
+    // ---------------- Task 10: recycle-bin-only deletion -----------------
+
+    /// Moves the entries behind `ids` to the OS trash — Synso's ONLY
+    /// deletion path, and never a permanent delete (see [`crate::trash`]).
+    /// Per id: the live hot-index slot is resolved (a dead or unknown id is
+    /// skipped and counted as neither success nor error), the real disk
+    /// path comes from [`Engine::resolve_absolute`], and a path already
+    /// gone from disk is skipped the same way. Everything else is moved in
+    /// ONE trash batch ([`trash::delete_paths_to_trash`]); each path
+    /// actually gone from disk afterwards is then synced out of the index
+    /// with the watcher's removal mechanics
+    /// ([`crate::watcher::remove_path`]: the row located by (dir, name)
+    /// plus a subtree purge on the store, the slot removal plus subtree
+    /// sweep on the hot index) under one store -> hot lock pair, and — when
+    /// at least one path landed — the collections reconcile (tombstone +
+    /// rebind) runs in the same store critical section. A path the trash
+    /// batch refused is logged and keeps its index rows; the next rescan
+    /// heals any drift. Returns the success count.
+    pub fn delete_to_trash(&self, ids: &[FileId]) -> Result<usize> {
+        // Phase 1: one hot-index read snapshot -> one candidate per live
+        // id. The (dir chain, name) key and the index-relative spelling are
+        // copied out so the lock can drop before any I/O. The store lock is
+        // NOT taken here — locks never span the trash batch's I/O.
+        let mut candidates: Vec<Candidate> = Vec::with_capacity(ids.len());
+        {
+            let hot = read_unpoisoned(&self.hot);
+            for &id in ids {
+                let Some(slot) = hot.slot_of_id(id) else {
+                    continue; // dead/unknown id: skipped, not counted
+                };
+                candidates.push(Candidate {
+                    segments: hot.dir_chain(slot).into_iter().map(String::from).collect(),
+                    name: hot.name_original(slot).to_string(),
+                    index_path: hot.path_of(slot),
+                });
+            }
+        }
+        // Phase 2: resolve disk paths and check existence OUTSIDE every
+        // lock (the watcher batch's stat pass). An unresolvable root and a
+        // path already gone from disk are both plain skips.
+        let planned: Vec<PlannedDelete> = candidates
+            .into_iter()
+            .filter_map(
+                |candidate| match self.resolve_absolute(&candidate.index_path) {
+                    Some(abs) if trash::present(&abs) => Some(PlannedDelete {
+                        abs,
+                        segments: candidate.segments,
+                        name: candidate.name,
+                    }),
+                    // Already gone from disk: nothing left to trash.
+                    Some(_) => None,
+                    None => {
+                        eprintln!(
+                            "synso: trash skipped {:?}: no scan root resolves it",
+                            candidate.index_path
+                        );
+                        None
+                    }
+                },
+            )
+            .collect();
+        if planned.is_empty() {
+            return Ok(0);
+        }
+
+        // ONE batch for the whole slice; per-path refusals are the pure
+        // layer's concern (logged there, counted from disk state here).
+        let paths: Vec<&Path> = planned.iter().map(|entry| entry.abs.as_path()).collect();
+        trash::delete_paths_to_trash(&paths)?;
+
+        // Sync the paths that actually left the disk, under one
+        // store -> hot lock pair (the watcher batch's discipline; no I/O
+        // happens under these locks — the trash already did). The path is
+        // re-checked rather than trusted: a backend that lost items of a
+        // failing batch must not have its index rows deleted.
+        let mut deleted = 0usize;
+        {
+            let mut store = lock_unpoisoned(&self.store);
+            let mut hot = write_unpoisoned(&self.hot);
+            for entry in &planned {
+                if trash::present(&entry.abs) {
+                    eprintln!(
+                        "synso: trash refused {:?}; its index rows stay until the next rescan",
+                        entry.abs
+                    );
+                    continue;
+                }
+                let segments: Vec<&str> = entry.segments.iter().map(String::as_str).collect();
+                watcher::remove_path(&mut store, &mut hot, &segments, &entry.name, &entry.abs);
+                deleted += 1;
+            }
+            if deleted > 0 {
+                // Tombstone + rebind the collections in the same store
+                // critical section a scan's and a watcher batch's reconcile
+                // use; best-effort, like those.
+                if let Err(err) = collections::reconcile(&mut store) {
+                    eprintln!("synso: collection reconcile after trash failed: {err}");
+                }
+            }
+        }
+        Ok(deleted)
+    }
+}
+
+/// Phase-1 candidate: one live id's (dir chain, name) key and its
+/// index-relative path, copied out of a single hot-index snapshot before
+/// the disk-resolution pass decides whether it can be trashed at all.
+struct Candidate {
+    segments: Vec<String>,
+    name: String,
+    index_path: String,
+}
+
+/// One id [`Engine::delete_to_trash`] resolved far enough to attempt: the
+/// absolute disk path (still present at plan time), plus the key the index
+/// removal locates the row and slot by.
+struct PlannedDelete {
+    abs: PathBuf,
+    segments: Vec<String>,
+    name: String,
 }
 
 /// Sends `event` to every live subscriber, dropping disconnected ones.
@@ -1209,5 +1331,154 @@ mod tests {
         assert_eq!(fs::read_to_string(&abs).unwrap(), "hello nested");
         // A path whose root segment matches no root cannot resolve.
         assert_eq!(engine.resolve_absolute("not_a_root_segment/x.txt"), None);
+    }
+
+    // ------------------ Task 10: recycle-bin deletion ---------------------
+
+    /// The recycle-bin contract end to end: the file leaves the disk, leaves
+    /// search, leaves the store, and its collection membership is
+    /// tombstoned (alive=0) with the name snapshot kept for a later rebind.
+    #[test]
+    fn delete_to_trash_removes_and_updates_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("doomed.txt"), b"trash me").unwrap();
+        fs::write(root.join("keeper.txt"), b"keep me").unwrap();
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        let res = engine.search("doomed", 0, 10);
+        assert_eq!(res.total, 1);
+        let hit = res.hits[0].clone();
+        let doomed_id = hit.id;
+        let abs = engine
+            .resolve_absolute(&hit.path)
+            .expect("the root segment resolves");
+        assert!(abs.is_file());
+
+        // A collection tracks the doomed file so the tombstone is visible.
+        let coll = engine.coll_create("purge-test").unwrap();
+        engine.coll_add(coll.id, &[doomed_id]).unwrap();
+        assert!(engine.coll_members(coll.id)[0].alive);
+
+        assert_eq!(
+            engine.delete_to_trash(&[doomed_id]).unwrap(),
+            1,
+            "exactly the one path counts as success"
+        );
+
+        // Gone from disk (the trash moved it away)...
+        assert!(!abs.exists(), "the file must be gone from disk");
+        // ...gone from search while the sibling survives...
+        assert_eq!(engine.search("doomed", 0, 10).total, 0);
+        assert_eq!(engine.search("keeper", 0, 10).total, 1);
+        // ...gone from the store itself...
+        let store = Store::open(&db_path).unwrap();
+        assert!(store
+            .all_files()
+            .unwrap()
+            .iter()
+            .all(|rec| rec.name != "doomed.txt"));
+        // ...and tombstoned in the collection (alive=0, snapshot kept).
+        let members = engine.coll_members(coll.id);
+        assert_eq!(members.len(), 1);
+        assert!(!members[0].alive, "the deleted member must be tombstoned");
+        assert_eq!(members[0].hit.name, "doomed.txt");
+        assert_eq!(engine.stats().files, 1);
+    }
+
+    /// A path already gone from disk (and an id that was never indexed) is a
+    /// plain skip: zero successes, no error, and the stale index row is left
+    /// whole for the next rescan to reconcile — no half-deletion.
+    #[test]
+    fn delete_missing_path_returns_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("doomed.txt"), b"gone before the delete").unwrap();
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        let res = engine.search("doomed", 0, 10);
+        assert_eq!(res.total, 1);
+        let id = res.hits[0].id;
+
+        // The file vanishes OUTSIDE Synso (the "app was closed" scenario).
+        // Renamed away here — Synso never permanently deletes, not even in
+        // arranging this fixture.
+        fs::rename(root.join("doomed.txt"), root.join("moved.txt")).unwrap();
+
+        assert_eq!(engine.delete_to_trash(&[id]).unwrap(), 0);
+        assert_eq!(engine.delete_to_trash(&[424_242]).unwrap(), 0);
+        assert_eq!(engine.delete_to_trash(&[]).unwrap(), 0);
+
+        // The skips left the index untouched.
+        assert_eq!(engine.search("doomed", 0, 10).total, 1);
+        assert_eq!(engine.stats().files, 1);
+    }
+
+    /// Trashing a directory takes the whole subtree with it: every
+    /// descendant drops out of search AND out of the store (rows and dir
+    /// rows alike), while a sibling outside the directory survives.
+    #[test]
+    fn delete_dir_to_trash_purges_subtree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = write_fixture(tmp.path());
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        let (_progress, files, dirs) = wait_scan_finished(&rx);
+        assert_eq!((files, dirs), (3, 2));
+
+        let res = engine.search("docs", 0, 10);
+        assert_eq!(res.total, 1);
+        assert!(res.hits[0].is_dir, "the docs directory entry itself");
+        let docs_id = res.hits[0].id;
+
+        assert_eq!(engine.delete_to_trash(&[docs_id]).unwrap(), 1);
+
+        // Every descendant is gone from search...
+        for purged in ["docs", "notes", "final", "empty_dir"] {
+            assert_eq!(
+                engine.search(purged, 0, 10).total,
+                0,
+                "{purged} must be purged with the subtree"
+            );
+        }
+        assert_eq!(engine.search("readme", 0, 10).total, 1, "sibling survives");
+        let stats = engine.stats();
+        assert_eq!((stats.files, stats.dirs), (1, 0));
+        // ...and from the store itself: only the sibling's row and the root
+        // segment's dirs row remain.
+        let store = Store::open(&db_path).unwrap();
+        let names: Vec<String> = store
+            .all_files()
+            .unwrap()
+            .into_iter()
+            .map(|rec| rec.name)
+            .collect();
+        assert_eq!(names, vec!["readme.md".to_string()]);
+        let dir_names: Vec<String> = store
+            .all_dirs()
+            .unwrap()
+            .into_iter()
+            .map(|(_, _, name)| name)
+            .collect();
+        assert_eq!(
+            dir_names,
+            vec!["fixture".to_string()],
+            "docs and its subtree dirs rows are gone"
+        );
     }
 }

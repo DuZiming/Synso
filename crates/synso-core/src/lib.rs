@@ -12,6 +12,7 @@ pub mod pinyin;
 pub mod query;
 pub mod scanner;
 pub mod store;
+pub mod trash;
 pub mod volumes;
 pub mod watcher;
 
@@ -24,6 +25,7 @@ pub use pinyin::pinyin_keys;
 pub use query::{parse_query, Hit, SearchResult};
 pub use scanner::{is_placeholder_attr, scan, ScanOptions, ScanStats};
 pub use store::Store;
+pub use trash::delete_paths_to_trash;
 pub use volumes::{fixed_volumes, VolumeInfo};
 pub use watcher::Watcher;
 

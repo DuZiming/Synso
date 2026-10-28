@@ -15,6 +15,7 @@ notify.workspace = true
 pinyin.workspace = true
 sysinfo.workspace = true
 xxhash-rust.workspace = true
+trash.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

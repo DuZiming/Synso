@@ -457,8 +457,16 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
 /// Removes one path's row (located by dir segments + name) and, when the
 /// path was a directory, its whole subtree — a no-op for files, whose
 /// names never resolve to a `dirs` row. Errors are logged per statement
-/// and never abort the batch.
-fn remove_path(store: &mut Store, hot: &mut HotIndex, segments: &[&str], name: &str, path: &Path) {
+/// and never abort the batch. `pub(crate)`: the engine's recycle-bin
+/// deletion (Task 10) syncs its trashed paths through this exact purge, so
+/// the two removal paths cannot drift apart.
+pub(crate) fn remove_path(
+    store: &mut Store,
+    hot: &mut HotIndex,
+    segments: &[&str],
+    name: &str,
+    path: &Path,
+) {
     if let Err(err) = store.delete_file_by_path(segments, name) {
         eprintln!("synso: watcher delete of {path:?} failed: {err}");
     }

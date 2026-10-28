@@ -27,3 +27,7 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 windows = { version = "0.62", features = ["Win32_Storage_FileSystem"] }
 junction = "=2.0.0"
 tempfile = "=3.23.0"
+# Pinned (`=`): trash 5.2+ declares rust-version 1.85 (> the workspace's
+# 1.83); 5.1.1 declares none and compiles on 1.83 (its Windows backend rides
+# windows 0.56, a separate crate from our own windows 0.62 in Cargo's graph).
+trash = "=5.1.1"
