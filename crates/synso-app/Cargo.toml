@@ -1,6 +1,28 @@
 [package]
 name = "synso-app"
-description = "Synso desktop application crate (placeholder, replaced in Task 13)"
+description = "Synso desktop application: Tauri v2 shell over the synso-core engine"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# The ENGINE keeps the workspace MSRV of 1.83 (`cargo +1.83 check -p
+# synso-core`); this crate tracks the Tauri v2 dependency stack, whose
+# resolved floor (tauri 2.12.x) is Rust 1.90 — the 1.83 check therefore
+# does NOT cover synso-app (per the Task 13 controller ruling).
+rust-version = "1.90"
+publish = false
+
+[lib]
+# The `_lib` suffix avoids a Windows-only lib/bin name clash
+# (https://github.com/rust-lang/cargo/issues/8519, same as the template).
+name = "synso_app_lib"
+crate-type = ["rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+synso-core = { path = "../synso-core", features = ["serde"] }
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+crossbeam-channel.workspace = true
+# Facade logging only; a real backend is installed in Task 19.
+log.workspace = true

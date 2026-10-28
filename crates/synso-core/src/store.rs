@@ -270,10 +270,8 @@ impl Store {
         Ok(updated)
     }
 
-    /// Reads one `meta` value. Nothing reads metadata yet (schema version
-    /// lives in `PRAGMA user_version`); the accessor stays for the test
-    /// suite and future meta consumers.
-    #[allow(dead_code)]
+    /// Reads one `meta` value. Live consumers: the settings persistence
+    /// (`crate::settings`).
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
         let value: Option<String> = self
             .conn
@@ -335,9 +333,8 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
-    /// Upserts one `meta` value. Nothing writes metadata yet; the accessor
-    /// stays for the test suite and future meta consumers.
-    #[allow(dead_code)]
+    /// Upserts one `meta` value. Live consumers: the settings persistence
+    /// (`crate::settings`).
     pub fn set_meta(&self, key: &str, val: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES (?1, ?2)

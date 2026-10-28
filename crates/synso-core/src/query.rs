@@ -40,6 +40,7 @@ const RECENCY_WINDOW_SECS: i64 = 30 * 86_400;
 /// One fully materialized search-result row. Paths are only built for
 /// returned pages, never for the whole matching population.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Hit {
     /// The `files` row id (what reveal/trash/collections key on later).
     pub id: FileId,
@@ -61,6 +62,7 @@ pub struct Hit {
 /// One page of [`Hit`]s plus the full match count: `hits` covers
 /// `[offset, offset + limit)` of the ranked ordering.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SearchResult {
     pub hits: Vec<Hit>,
     pub total: u64,

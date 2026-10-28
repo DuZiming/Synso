@@ -7,6 +7,7 @@ use sysinfo::{Disk, Disks};
 
 /// One fixed local volume (removable media excluded).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct VolumeInfo {
     /// Mount point, ready to use as a scan root (e.g. `C:\` on Windows,
     /// `/` on unix).

@@ -5,7 +5,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# Optional serde support for the facade DATA types (the app layer and JSON
+# bridges enable it; core stays dependency-lean without it for Phase 2/3
+# embedders).
+serde = ["dep:serde"]
+
 [dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
 rusqlite.workspace = true
 thiserror.workspace = true
 crossbeam-channel.workspace = true

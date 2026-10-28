@@ -32,6 +32,7 @@ use crate::model::FileId;
 /// appear as leaf nodes (their own size, `file_count` 1) so the flame
 /// chart can render the deepest level too.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SizeNode {
     /// Index-relative path in the `Hit::path` spelling (`MAIN_SEPARATOR`
     /// joined, scan-root segment first; "" for the virtual root).

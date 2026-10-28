@@ -10,11 +10,20 @@
 //!
 //! - Engine plumbing: [`Engine`], [`EngineOptions`], [`EngineEvent`],
 //!   [`EngineStats`]
+//! - Settings: [`Settings`] (persisted in the store's meta table via
+//!   [`Engine::settings`] / [`Engine::set_settings`]), [`list_volumes`]
 //! - Query data: [`parse_query`], [`ParsedQuery`], [`SearchResult`], [`Hit`]
 //! - Feature data: [`SizeNode`], [`DedupPhase`], [`DedupState`],
 //!   [`DupeGroup`], [`Collection`], [`MemberHit`], [`FileId`],
 //!   [`VolumeInfo`], [`pinyin_keys`]
 //! - Errors: [`SynsoError`], [`Result`]
+//!
+//! With the optional `serde` feature enabled, the facade DATA types
+//! (`Hit`, `SearchResult`, `ParsedQuery`, `SizeNode`, `DedupPhase`,
+//! `DedupState`, `DupeGroup`, `Collection`, `MemberHit`, `EngineStats`,
+//! `EngineEvent`, `VolumeInfo`, `Settings`) derive `Serialize` /
+//! `Deserialize` — the app layer and JSON bridges turn that on; core
+//! itself stays dependency-lean without it.
 //!
 //! # Example
 //!
@@ -62,6 +71,7 @@ pub(crate) mod model;
 pub(crate) mod pinyin;
 pub(crate) mod query;
 pub(crate) mod scanner;
+pub(crate) mod settings;
 pub(crate) mod sizeagg;
 pub(crate) mod store;
 pub(crate) mod trash;
@@ -75,7 +85,12 @@ pub use engine::{DedupPhase, Engine, EngineEvent, EngineOptions, EngineStats};
 pub use model::{FileId, ParsedQuery};
 pub use pinyin::pinyin_keys;
 pub use query::{parse_query, Hit, SearchResult};
+pub use settings::Settings;
 pub use sizeagg::SizeNode;
+/// The fixed local volumes, under the name the first-run wizard consumes
+/// (`Task 13` facade ruling): a thin re-export of
+/// [`crate::volumes::fixed_volumes`].
+pub use volumes::fixed_volumes as list_volumes;
 pub use volumes::VolumeInfo;
 
 /// Error type for all synso-core operations.

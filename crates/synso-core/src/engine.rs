@@ -65,6 +65,7 @@ use crate::hotindex::HotIndex;
 use crate::model::{FileId, ParsedQuery};
 use crate::query::{self, SearchResult};
 use crate::scanner::{self, effective_roots, root_segment, ScanOptions};
+use crate::settings::{self, Settings};
 use crate::sizeagg::{self, SizeNode};
 use crate::store::Store;
 use crate::trash;
@@ -90,6 +91,7 @@ pub struct EngineOptions {
 /// when they have no work); `Grouping` reappears as the in-progress phase
 /// of every new run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DedupPhase {
     #[default]
     Idle,
@@ -102,6 +104,7 @@ pub enum DedupPhase {
 /// Event broadcast to every subscriber that registered before the event
 /// fired.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum EngineEvent {
     /// Forwarded scanner progress (files done so far). `total` is always 0
     /// here: the walk total is unknown while walking.
@@ -138,6 +141,7 @@ pub enum EngineEvent {
 
 /// Point-in-time engine state, read from the hot index.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EngineStats {
     pub files: u64,
     pub dirs: u64,
@@ -308,6 +312,23 @@ impl Engine {
             warm: hot.is_warm(),
             interned_bytes: hot.interned_bytes(),
         }
+    }
+
+    // ---------------- Task 13: user settings -----------------------------
+
+    /// The persisted user settings (see [`crate::settings`]). Missing
+    /// fields read as their documented defaults, and a store read error
+    /// degrades to the default for that field — settings are UI
+    /// convenience, never a startup failure.
+    pub fn settings(&self) -> Settings {
+        settings::load(&lock_unpoisoned(&self.store))
+    }
+
+    /// Persists `settings` to the store's meta table; store errors surface
+    /// to the caller. The change applies to the field's consumers on their
+    /// next read (the engine holds no in-memory copy).
+    pub fn set_settings(&self, settings: &Settings) -> Result<()> {
+        settings::save(&lock_unpoisoned(&self.store), settings)
     }
 
     /// Case-insensitive substring search over the hot index's name arena

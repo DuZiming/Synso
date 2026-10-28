@@ -42,6 +42,7 @@ pub struct FileRecord {
 /// recognized along the way. Pure data — parsing does no I/O; execution
 /// (filtering) happens in [`crate::engine::Engine::search_parsed`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ParsedQuery {
     /// The free-text tokens that were NOT modifiers, joined by single
     /// spaces, original spelling. Multiple words must ALL match (AND),

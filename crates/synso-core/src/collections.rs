@@ -39,6 +39,7 @@ use crate::{Result, SynsoError};
 
 /// One virtual collection row.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Collection {
     pub id: i64,
     pub name: String,
@@ -50,6 +51,7 @@ pub struct Collection {
 /// `mtime` is 0, `is_dir` is false, `ext` is derived from `snap_name`, and
 /// `id` is the STALE file id (kept so the UI can address the member).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MemberHit {
     pub hit: Hit,
     pub alive: bool,

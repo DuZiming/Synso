@@ -87,6 +87,7 @@ const PERSIST_BATCH: usize = 128;
 /// this run because they could not be read OR were cloud placeholders —
 /// both are "marked skipped, not grouped" per the design.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DedupState {
     pub phase: DedupPhase,
     pub done: u64,
@@ -102,6 +103,7 @@ pub struct DedupState {
 ///
 /// [`Hit`]: crate::query::Hit
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DupeGroup {
     /// The full-content xxh64 every member shares.
     pub hash: u64,
