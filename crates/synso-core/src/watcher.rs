@@ -18,20 +18,23 @@
 //!    disk; a path that vanished again demotes to a removal, converging
 //!    half-renames and same-window delete races instead of upserting
 //!    phantom rows);
-//! 1. under the store mutex (held only for the batch): all removals —
-//!    first, so a delete can never land on a row a sibling op in the same
-//!    batch just wrote. Removals delete the row located by (dir segments,
-//!    name) — never by rowid, which SQLite may have recycled between
-//!    events — plus the removed path's subtree (catches children of a
-//!    deleted directory even when their individual events were coalesced
-//!    away); then all upserts (the store computes pinyin at its upsert
-//!    choke point);
+//! 1. under the STORE mutex alone: all removals — first, so a delete can
+//!    never land on a row a sibling op in the same batch just wrote.
+//!    Removals delete the row located by (dir segments, name) — never by
+//!    rowid, which SQLite may have recycled between events — plus the
+//!    removed path's subtree (catches children of a deleted directory
+//!    even when their individual events were coalesced away); then all
+//!    upserts (the store computes pinyin at its upsert choke point);
 //! 2. the same ops apply INCREMENTALLY to the hot index
-//!    ([`HotIndex::upsert_slot`] / [`HotIndex::remove_by_dir_name`]);
-//!    wholesale reload stays the scan path;
+//!    ([`HotIndex::upsert_slot`] / [`HotIndex::remove_by_dir_name`]),
+//!    under the canonical store -> hot pair with the store guard
+//!    read-only — so the hot WRITE lock never spans pass 1's per-row
+//!    store commits (Task 20 churn measurement: that span froze searches
+//!    for a whole batch, 8.8s at a 400-file burst); wholesale reload
+//!    stays the scan path;
 //! 3. if the batch contained deletions or renames,
-//!    [`crate::collections::reconcile`] runs under the same store lock
-//!    (tombstone + rebind);
+//!    [`crate::collections::reconcile`] runs in pass 1's store critical
+//!    section (tombstone + rebind);
 //! 4. [`EngineEvent::FsChanged`] broadcasts as a UI refresh hint.
 //!
 //! Directory arrivals walk: an upsert that resolves to a DIRECTORY gets
@@ -360,13 +363,25 @@ fn event_ops(event: &NotifyEvent) -> Vec<(PathBuf, Op)> {
 /// Applies one debounced batch in three passes: (0) stat every upsert path
 /// OUTSIDE any lock (fresh metadata, and vanished paths demote to removals
 /// — converging half-renames and same-window delete races instead of
-/// upserting phantom rows); (1) all removals; (2) all upserts. Removals run
-/// before upserts so a delete can never land on a row a sibling op in the
-/// same batch just wrote (e.g. a case-renamed path whose two spellings are
-/// distinct map keys). Both locks are held for passes 1-2 only — the same
-/// store -> hot ordering the scan path uses — so a concurrent scan either
-/// finishes first (this thread blocked on the store mutex, events safely
-/// queued in the channel) or runs after this batch wholesale.
+/// upserting phantom rows); (1) all removals, then all upserts — under the
+/// STORE lock alone; (2) the same ops replayed into the hot index, under
+/// the canonical store -> hot pair. Removals run before upserts so a
+/// delete can never land on a row a sibling op in the same batch just
+/// wrote (e.g. a case-renamed path whose two spellings are distinct map
+/// keys).
+///
+/// The store/hot split is the Task 20 churn finding's fix: the original
+/// version held the hot WRITE lock across pass 1's per-row autocommit
+/// store writes, so a 400-file burst froze every search for the whole
+/// batch — measured at 8.8s on this machine. Searches take only the hot
+/// READ lock, so keeping pass 1 store-only (and pass 2's store access
+/// read-only: `upsert_slot`'s ancestor reads hit the fully committed
+/// store) shrinks the hot-lock hold to the in-memory replay, microseconds
+/// per row. The watcher thread still blocks on the store mutex for the
+/// batch duration — same store -> hot ordering as the scan path, so a
+/// concurrent scan either finishes first (events safely queue in the
+/// channel) or runs after this batch wholesale, and batches can never
+/// interleave with a scan reload.
 fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
     if pending.is_empty() {
         return;
@@ -387,13 +402,24 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
             Op::Remove => removals.push((path, entry)),
         }
     }
+    // The hot halves replayed in pass 2, in batch order (removals first).
+    enum HotOp {
+        Remove { segments: Vec<String>, name: String },
+        Upsert(FileRecord),
+    }
+    let mut hot_ops: Vec<HotOp> = Vec::new();
     let mut applied = 0u32;
     {
+        // Pass 1: store writes only — the hot index is not held, so
+        // searches never wait on this pass's per-row commits.
         let mut store = lock_unpoisoned(&ctx.store);
-        let mut hot = write_unpoisoned(&ctx.hot);
         for (path, entry) in &removals {
             let segments: Vec<&str> = entry.segments.iter().map(String::as_str).collect();
-            remove_path(&mut store, &mut hot, &segments, &entry.name, path);
+            remove_path_store(&mut store, &segments, &entry.name, path);
+            hot_ops.push(HotOp::Remove {
+                segments: entry.segments.clone(),
+                name: entry.name.clone(),
+            });
             applied += 1;
         }
         for (path, entry, rec) in upserts {
@@ -405,19 +431,15 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
                     // events: a populated create, or a rename/move whose
                     // whole subtree silently rode along (the Remove side
                     // above already purged the old location). Walk the new
-                    // subtree in-batch — the same lock discipline as a
-                    // full scan's walk — bounded by the exclusion matcher
-                    // and the reparse-point guard, hot-indexing every
-                    // walked row through the incremental upsert path.
+                    // subtree in-batch — bounded by the exclusion matcher
+                    // and the reparse-point guard — and queue every walked
+                    // row for the hot replay.
                     if rec.is_dir {
                         let mut dir_segments = entry.segments.clone();
                         dir_segments.push(entry.name.clone());
-                        let mut hot_row = |store: &Store, walked: &FileRecord| {
-                            if let Err(err) = hot.upsert_slot(store, walked) {
-                                log::error!(
-                                    "synso: watcher hot upsert of {walked:?} failed: {err}"
-                                );
-                            }
+                        let mut walked: Vec<FileRecord> = Vec::new();
+                        let mut store_row = |_store: &Store, walked_row: &FileRecord| {
+                            walked.push(walked_row.clone());
                         };
                         match scanner::scan_subtree(
                             &mut store,
@@ -425,7 +447,7 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
                             &dir_segments,
                             &ctx.roots[entry.root_idx],
                             &ctx.matcher,
-                            &mut hot_row,
+                            &mut store_row,
                         ) {
                             Ok(sub) if sub.errors > 0 => {
                                 log::warn!(
@@ -437,10 +459,10 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
                                 log::error!("synso: watcher subtree walk of {path:?} failed: {err}")
                             }
                         }
+                        hot_ops
+                            .extend(walked.into_iter().map(HotOp::Upsert));
                     }
-                    if let Err(err) = hot.upsert_slot(&store, &rec) {
-                        log::error!("synso: watcher hot upsert of {path:?} failed: {err}");
-                    }
+                    hot_ops.push(HotOp::Upsert(rec));
                     applied += 1;
                 }
                 Err(err) => log::error!("synso: watcher upsert of {path:?} failed: {err}"),
@@ -450,6 +472,26 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
         if !removals.is_empty() {
             if let Err(err) = collections::reconcile(&mut store) {
                 log::warn!("synso: watcher collection reconcile failed: {err}");
+            }
+        }
+    }
+    {
+        // Pass 2: hot replay under the canonical store -> hot order (the
+        // store guard is read-only here: `upsert_slot`'s on-demand
+        // ancestor/extension reads hit the fully committed store).
+        let store = lock_unpoisoned(&ctx.store);
+        let mut hot = write_unpoisoned(&ctx.hot);
+        for op in &hot_ops {
+            match op {
+                HotOp::Remove { segments, name } => {
+                    let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
+                    hot.remove_by_dir_name(&segments, name);
+                }
+                HotOp::Upsert(rec) => {
+                    if let Err(err) = hot.upsert_slot(&store, rec) {
+                        log::error!("synso: watcher hot upsert of {rec:?} failed: {err}");
+                    }
+                }
             }
         }
     }
@@ -464,7 +506,10 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
 /// names never resolve to a `dirs` row. Errors are logged per statement
 /// and never abort the batch. `pub(crate)`: the engine's recycle-bin
 /// deletion (Task 10) syncs its trashed paths through this exact purge, so
-/// the two removal paths cannot drift apart.
+/// the two removal paths cannot drift apart. The watcher's own batch
+/// applies the two halves SEPARATELY (see [`apply_batch`]'s doc: the hot
+/// lock must not span the batch's store writes) — this paired form stays
+/// for the engine's one-shot deletions.
 pub(crate) fn remove_path(
     store: &mut Store,
     hot: &mut HotIndex,
@@ -472,6 +517,13 @@ pub(crate) fn remove_path(
     name: &str,
     path: &Path,
 ) {
+    remove_path_store(store, segments, name, path);
+    hot.remove_by_dir_name(segments, name);
+}
+
+/// The store half of [`remove_path`]: the row delete plus the subtree
+/// purge, store errors logged and never fatal (the watcher's pass 1).
+fn remove_path_store(store: &mut Store, segments: &[&str], name: &str, path: &Path) {
     if let Err(err) = store.delete_file_by_path(segments, name) {
         log::error!("synso: watcher delete of {path:?} failed: {err}");
     }
@@ -480,7 +532,6 @@ pub(crate) fn remove_path(
     if let Err(err) = store.delete_subtree(&subtree) {
         log::error!("synso: watcher subtree delete of {path:?} failed: {err}");
     }
-    hot.remove_by_dir_name(segments, name);
 }
 
 /// notify errors carry no io conversion; wrap the rendered message (the
