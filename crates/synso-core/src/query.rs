@@ -327,6 +327,7 @@ pub(crate) fn run_parsed(
 /// boundaries (`path:cs\proj`, `path:cs/proj`), which segment-wise checks
 /// handle awkwardly; full paths still never materialize for the whole
 /// population, only for post-filter candidates.
+#[inline]
 fn passes_filters(
     hot: &HotIndex,
     q: &ParsedQuery,
@@ -376,6 +377,91 @@ struct Scored {
     slot: usize,
 }
 
+/// A free-text word with its scan state prepared ONCE per ranking pass.
+/// The std `contains` / `match_indices` calls this module used per slot
+/// rebuild a two-way searcher for the needle on every call — at 1M slots
+/// over three arenas that setup alone is a measurable budget line (measured
+/// Task 20: an 8-char zero-hit query spent ~3x more in searcher setup than
+/// in scanning). The scan below is a first-byte skip plus tail compare,
+/// the cheapest sound scan for the short needles keystrokes produce.
+/// Occurrence byte positions are char boundaries automatically: an exact
+/// byte match of valid UTF-8 inside valid UTF-8 cannot split a character.
+struct PreparedWord<'w> {
+    bytes: &'w [u8],
+}
+
+impl<'w> PreparedWord<'w> {
+    fn new(word: &'w str) -> PreparedWord<'w> {
+        PreparedWord {
+            bytes: word.as_bytes(),
+        }
+    }
+
+    /// First occurrence of the word in `hay` at or after byte `from`.
+    fn find_from(&self, hay: &[u8], from: usize) -> Option<usize> {
+        let needle = self.bytes;
+        if needle.is_empty() {
+            return Some(from.min(hay.len()));
+        }
+        let hay = hay.get(from..)?;
+        if hay.len() < needle.len() {
+            return None;
+        }
+        let (first, rest) = needle.split_first().expect("non-empty checked above");
+        let mut start = 0;
+        while start + needle.len() <= hay.len() {
+            // The first-byte probe scans through the cheap rejects; the
+            // tail compare runs only for the (rare) byte hits.
+            let Some(offset) = hay[start..].iter().position(|&byte| byte == *first) else {
+                return None;
+            };
+            let index = start + offset;
+            // A byte hit can sit past the loop guard's last full-needle
+            // window (the probe scans to the haystack end) — then no full
+            // occurrence fits anymore.
+            if index + needle.len() > hay.len() {
+                return None;
+            }
+            if &hay[index + 1..index + needle.len()] == rest {
+                return Some(from + index);
+            }
+            start = index + 1;
+        }
+        None
+    }
+
+    /// The word's best match class in `name` — exactly the old
+    /// `classify` semantics: `Prefix` short-circuits (nothing can beat it),
+    /// otherwise the best of word-start/substring across occurrences,
+    /// `None` when the name does not contain the word.
+    fn classify_in(&self, name: &str) -> Option<MatchClass> {
+        let hay = name.as_bytes();
+        let mut best: Option<MatchClass> = None;
+        let mut from = 0;
+        while let Some(index) = self.find_from(hay, from) {
+            let class = if index == 0 {
+                return Some(MatchClass::Prefix); // cannot do better; stop scanning
+            } else {
+                // `index` is a char boundary, so the char ending at it is
+                // the one immediately before the match.
+                match name[..index].chars().next_back() {
+                    Some(prev) if !prev.is_alphanumeric() => MatchClass::WordStart,
+                    _ => MatchClass::Substring,
+                }
+            };
+            best = Some(best.map_or(class, |best| best.max(class)));
+            from = index + 1;
+        }
+        best
+    }
+
+    /// Substring containment — the pinyin fallback's semantics.
+    fn contained_in(&self, key: &str) -> bool {
+        self.find_from(key.as_bytes(), 0).is_some()
+    }
+}
+
+
 /// The substring pass: filter first, then classify every name/pinyin hit
 /// of ALL free-text words, keeping only the best `page_len(offset, limit)`
 /// matches in final rank order (see [`insert_top_k`]). Returns `(total,
@@ -396,6 +482,9 @@ fn match_slots(
     let page_len = page_len(offset, limit);
     let mut total = 0u64;
     let mut top: Vec<Scored> = Vec::new();
+    // Scan state built once per pass, not per slot x arena (see
+    // `PreparedWord`).
+    let prepared: Vec<PreparedWord> = words.iter().map(|word| PreparedWord::new(word)).collect();
     // One per-dir path-length memo for the whole pass (see
     // `HotIndex::path_len_memo`): matches under the same dir pay the
     // ancestor walk once.
@@ -404,7 +493,7 @@ fn match_slots(
         if !passes_filters(hot, q, ext_id, coll_members, path_needle, slot) {
             continue;
         }
-        let Some(class) = classify_words(hot, slot, words) else {
+        let Some(class) = classify_words(hot, slot, &prepared) else {
             continue;
         };
         total += 1;
@@ -461,15 +550,18 @@ fn insert_top_k<T>(
 /// Where the free-text words hit `slot`: every word must match (the name
 /// arena first, a pinyin key as fallback — the AND semantics); the slot's
 /// class is the BEST class across the words.
-fn classify_words(hot: &HotIndex, slot: usize, words: &[String]) -> Option<MatchClass> {
+#[inline]
+fn classify_words(hot: &HotIndex, slot: usize, words: &[PreparedWord]) -> Option<MatchClass> {
     let mut best: Option<MatchClass> = None;
     for word in words {
-        let class =
-            classify(hot.name_lower(slot), word).or_else(|| pinyin_class(hot, slot, word))?;
+        let class = word
+            .classify_in(hot.name_lower(slot))
+            .or_else(|| pinyin_class(hot, slot, word))?;
         best = Some(best.map_or(class, |best| best.max(class)));
     }
     best
 }
+
 
 /// Ranking order: better class, then recency, then shorter full path, then
 /// lexicographic full path, then slot. That final slot comparison is a
@@ -607,39 +699,15 @@ fn cmp_segment_with_sep(x: &[u8], y: &[u8], sep: u8) -> Ordering {
 /// either pinyin key is a [`MatchClass::Substring`] hit — position inside
 /// the key does not matter, so pinyin never outranks a literal match of
 /// the same file (or any other file's literal Prefix/WordStart hit).
-fn pinyin_class(hot: &HotIndex, slot: usize, query: &str) -> Option<MatchClass> {
-    if hot.py_full(slot).contains(query) || hot.py_init(slot).contains(query) {
+#[inline]
+fn pinyin_class(hot: &HotIndex, slot: usize, word: &PreparedWord) -> Option<MatchClass> {
+    if word.contained_in(hot.py_full(slot)) || word.contained_in(hot.py_init(slot)) {
         Some(MatchClass::Substring)
     } else {
         None
     }
 }
 
-/// Where `query` (both sides already lowercased) matches inside `name`:
-/// [`MatchClass::Prefix`] for an occurrence at index 0,
-/// [`MatchClass::WordStart`] when some occurrence starts right after a
-/// non-alphanumeric char, [`MatchClass::Substring`] for any other
-/// occurrence; `None` when the name does not contain the query at all.
-fn classify(name: &str, query: &str) -> Option<MatchClass> {
-    let mut best: Option<MatchClass> = None;
-    for (idx, _) in name.match_indices(query) {
-        let class = if idx == 0 {
-            MatchClass::Prefix
-        } else {
-            // `idx` is a char boundary, so the char ending at it is the one
-            // immediately before the match.
-            match name[..idx].chars().next_back() {
-                Some(prev) if !prev.is_alphanumeric() => MatchClass::WordStart,
-                _ => MatchClass::Substring,
-            }
-        };
-        if class == MatchClass::Prefix {
-            return Some(MatchClass::Prefix); // cannot do better; stop scanning
-        }
-        best = Some(best.map_or(class, |best| best.max(class)));
-    }
-    best
-}
 
 #[cfg(test)]
 mod tests {
@@ -951,21 +1019,25 @@ mod tests {
     #[test]
     fn classify_prefix_word_start_substring() {
         use MatchClass::*;
+        let class_of = |name: &str, word: &str| PreparedWord::new(word).classify_in(name);
         // At index 0 the match is a prefix ...
-        assert_eq!(classify("report.docx", "report"), Some(Prefix));
+        assert_eq!(class_of("report.docx", "report"), Some(Prefix));
         // ... right after a delimiter it is a word start ...
-        assert_eq!(classify("annual-report.pdf", "report"), Some(WordStart));
-        assert_eq!(classify("my_report.docx", "report"), Some(WordStart));
-        assert_eq!(classify("docs report.pdf", "report"), Some(WordStart));
+        assert_eq!(class_of("annual-report.pdf", "report"), Some(WordStart));
+        assert_eq!(class_of("my_report.docx", "report"), Some(WordStart));
+        assert_eq!(class_of("docs report.pdf", "report"), Some(WordStart));
         // ... inside a word it is a plain substring.
-        assert_eq!(classify("myreport.docx", "report"), Some(Substring));
+        assert_eq!(class_of("myreport.docx", "report"), Some(Substring));
         // CJK chars are alphanumeric: the match inside 年度报告 is a substring.
-        assert_eq!(classify("年度报告.docx", "报告"), Some(Substring));
+        assert_eq!(class_of("年度报告.docx", "报告"), Some(Substring));
         // The best occurrence wins; none of these is a prefix.
-        assert_eq!(classify("x-report report", "report"), Some(WordStart));
+        assert_eq!(class_of("x-report report", "report"), Some(WordStart));
+        // Overlapping occurrences are all found ("aa" in "aaa" twice).
+        assert_eq!(class_of("aaa", "aa"), Some(Prefix));
+        assert_eq!(class_of("xaa", "aa"), Some(Substring));
         // No match at all.
-        assert_eq!(classify("report", "reports"), None);
-        assert_eq!(classify("readme.md", "zzz"), None);
+        assert_eq!(class_of("report", "reports"), None);
+        assert_eq!(class_of("readme.md", "zzz"), None);
     }
 
     // ------------------- Task 7: parse_query + filters ---------------------

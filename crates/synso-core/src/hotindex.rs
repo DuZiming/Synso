@@ -639,11 +639,13 @@ impl HotIndex {
     }
 
     /// Entry count (files + directory entries): the arena length.
+    #[inline]
     pub fn slot_count(&self) -> usize {
         self.names_lower.len()
     }
 
     /// The `files` row id of `slot`.
+    #[inline]
     pub fn file_id(&self, slot: usize) -> FileId {
         self.ids[slot]
     }
@@ -830,11 +832,13 @@ impl HotIndex {
     }
 
     /// Lowercased name of `slot` (case-insensitive matching).
+    #[inline]
     pub fn name_lower(&self, slot: usize) -> &str {
         &self.names_lower[slot]
     }
 
     /// Original-case name of `slot` (display, rebuilds).
+    #[inline]
     pub fn name_original(&self, slot: usize) -> &str {
         &self.names_orig[slot]
     }
@@ -842,6 +846,7 @@ impl HotIndex {
     /// Full-pinyin key of `slot` ("baogao.docx"), loaded from the store's
     /// `py_full` column. Substring matching target alongside
     /// [`HotIndex::name_lower`].
+    #[inline]
     pub fn py_full(&self, slot: usize) -> &str {
         &self.py_fulls[slot]
     }
@@ -849,31 +854,37 @@ impl HotIndex {
     /// First-letter pinyin key of `slot` ("bg.docx"), loaded from the
     /// store's `py_init` column. Substring matching target alongside
     /// [`HotIndex::py_full`].
+    #[inline]
     pub fn py_init(&self, slot: usize) -> &str {
         &self.py_inits[slot]
     }
 
     /// Containing directory's `dirs` row id of `slot`.
+    #[inline]
     pub fn parent_dir(&self, slot: usize) -> FileId {
         self.parents[slot]
     }
 
     /// Size in bytes of `slot` (0 for directory entries).
+    #[inline]
     pub fn size(&self, slot: usize) -> u64 {
         self.sizes[slot]
     }
 
     /// mtime (Unix-epoch seconds) of `slot`.
+    #[inline]
     pub fn mtime(&self, slot: usize) -> i64 {
         self.mtimes[slot]
     }
 
     /// Interned extension id of `slot` (0 = no extension).
+    #[inline]
     pub fn ext_id(&self, slot: usize) -> i64 {
         self.ext_ids[slot]
     }
 
     /// Whether `slot` is a directory entry.
+    #[inline]
     pub fn is_dir_entry(&self, slot: usize) -> bool {
         self.is_dirs[slot]
     }
