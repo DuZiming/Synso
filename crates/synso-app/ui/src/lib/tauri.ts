@@ -87,6 +87,22 @@ export function quickShowQuery(q: string): Promise<void> {
   return invoke("quick_show_query", { q });
 }
 
+// ------------------ Task 19: settings panel / tray / autostart -----------
+
+/** Re-registers the global quick-search shortcut LIVE (the settings
+ * view's Apply button). A conflict or bad spelling rolls back to the
+ * previous combo and rejects with the backend's message; success
+ * persists the new spelling. */
+export function setShortcut(combo: string): Promise<void> {
+  return invoke("set_shortcut", { combo });
+}
+
+/** Enables/disables the OS launch-at-startup registration live AND
+ * persists `Settings.autostart`. */
+export function autostartSet(enabled: boolean): Promise<void> {
+  return invoke("autostart_set", { enabled });
+}
+
 // ------------------ Task 16: dedup dashboard -----------------------------
 
 /** Starts a dedup run (a no-op while one is already going). The real

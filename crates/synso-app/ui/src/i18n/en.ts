@@ -26,6 +26,9 @@ const en = {
     memberList: "Member list",
     pickerDialog: "Collection picker",
     pickBox: "Select this result",
+    shortcutInput: "Shortcut combo input",
+    exclusionsInput: "Exclusion patterns input",
+    volumesList: "Index volumes",
   },
   dashboard: {
     files: "Files",
@@ -45,6 +48,7 @@ const en = {
     dedup: "Duplicates",
     flame: "Flame chart",
     collections: "Collections",
+    settings: "Settings",
   },
   dedup: {
     start: "Start analysis",
@@ -161,6 +165,22 @@ const en = {
       "Deleting a collection never deletes files — they stay on disk; only the collection record goes away.",
     confirmDelete: "Delete",
     confirmCancel: "Cancel",
+  },
+  settings: {
+    langTitle: "Language",
+    autostartTitle: "Launch at startup",
+    autostartHint:
+      "Applies immediately: the switch updates the OS launch-at-startup registration live.",
+    shortcutTitle: "Global shortcut",
+    shortcutHint:
+      "The quick search window's hotkey, e.g. Ctrl+Shift+Space. Apply re-registers it right away; if another app owns the combo, the old one is kept and the error is shown.",
+    apply: "Apply",
+    applied: "Applied",
+    shortcutFailed: "Shortcut unavailable",
+    indexTitle: "Index scope",
+    save: "Save",
+    saved: "Saved — scope changes take effect after a rescan.",
+    rescanStarted: "Rescan started — track it on the Overview tab.",
   },
 };
 

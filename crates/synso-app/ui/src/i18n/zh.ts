@@ -27,6 +27,9 @@ const zh: Dict = {
     memberList: "成员列表",
     pickerDialog: "集合选择器",
     pickBox: "选择此结果",
+    shortcutInput: "快捷键组合输入框",
+    exclusionsInput: "排除规则输入框",
+    volumesList: "索引卷列表",
   },
   dashboard: {
     files: "文件",
@@ -46,6 +49,7 @@ const zh: Dict = {
     dedup: "查重",
     flame: "火焰图",
     collections: "集合",
+    settings: "设置",
   },
   dedup: {
     start: "启动分析",
@@ -153,6 +157,21 @@ const zh: Dict = {
       "删除集合不删除文件——文件保留在原位置，只删除这条集合记录。",
     confirmDelete: "删除",
     confirmCancel: "取消",
+  },
+  settings: {
+    langTitle: "语言",
+    autostartTitle: "开机自启",
+    autostartHint: "开关即时生效：直接更新系统的开机自启注册。",
+    shortcutTitle: "全局快捷键",
+    shortcutHint:
+      "快速搜索窗的全局快捷键，如 Ctrl+Shift+Space。点「应用」立即生效；若组合被其他程序占用，会保留原快捷键并显示错误。",
+    apply: "应用",
+    applied: "已生效",
+    shortcutFailed: "快捷键不可用",
+    indexTitle: "索引范围",
+    save: "保存",
+    saved: "已保存——需要重新扫描后生效。",
+    rescanStarted: "已开始重新扫描，可在「概览」页查看进度。",
   },
 };
 

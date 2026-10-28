@@ -36,8 +36,63 @@ pub fn settings_get(state: State<'_, AppState>) -> Settings {
 }
 
 /// Persists the user settings; errors surface to the webview as a string.
+/// A changed `lang` re-labels the tray menu live (the tray follows the
+/// language switch; see `tray.rs`).
 #[tauri::command]
-pub fn settings_set(state: State<'_, AppState>, settings: Settings) -> Result<(), String> {
+pub fn settings_set(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    settings: Settings,
+) -> Result<(), String> {
+    state
+        .engine
+        .set_settings(&settings)
+        .map_err(|err| err.to_string())?;
+    crate::tray::relabel(&app, &settings.lang);
+    Ok(())
+}
+
+// ---------------------- Task 19: tray / autostart / shortcut --------------
+
+/// Re-registers the global quick-search shortcut LIVE (the settings
+/// panel's 应用 button): unregister old, register new. A conflict or a
+/// bad spelling rolls back to the old combo and returns the plugin's
+/// error message for display. On success the new spelling is persisted,
+/// so it survives a restart.
+#[tauri::command]
+pub fn set_shortcut(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    combo: String,
+) -> Result<(), String> {
+    crate::quick::set_shortcut(&app, &combo)?;
+    let mut settings = state.engine.settings();
+    settings.shortcut = combo;
+    state
+        .engine
+        .set_settings(&settings)
+        .map_err(|err| err.to_string())
+}
+
+/// Live autostart toggle (the settings panel's switch): updates the OS
+/// launch-at-startup registration first, then persists
+/// `Settings.autostart` — an OS failure must not persist a lie.
+#[tauri::command]
+pub fn autostart_set(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let launcher = app.autolaunch();
+    let outcome = if enabled {
+        launcher.enable()
+    } else {
+        launcher.disable()
+    };
+    outcome.map_err(|err| err.to_string())?;
+    let mut settings = state.engine.settings();
+    settings.autostart = enabled;
     state
         .engine
         .set_settings(&settings)

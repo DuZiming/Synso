@@ -14,6 +14,7 @@
     startFullScan,
   } from "../lib/tauri";
   import type { Settings, VolumeInfo } from "../lib/types";
+  import { parseExclusions, volumesChecked, volumesSaved } from "../lib/settings";
 
   // First-run wizard (Task 14): language -> volumes -> exclusions ->
   // autostart notice, then 开始 persists the whole Settings (including
@@ -57,22 +58,9 @@
   let beginning = $state(false);
 
   const checkedCount = $derived(volumes.filter((v) => checked[v.path]).length);
-  const allChecked = $derived(
-    volumes.length > 0 && checkedCount === volumes.length,
-  );
 
   function gb(bytes: number): string {
     return (bytes / 2 ** 30).toFixed(1);
-  }
-
-  /** One trimmed glob per line; blanks and duplicates dropped. */
-  function parseExclusions(text: string): string[] {
-    const seen = new Set<string>();
-    for (const line of text.split(/\r\n|\r|\n/)) {
-      const pattern = line.trim();
-      if (pattern !== "") seen.add(pattern);
-    }
-    return [...seen];
   }
 
   function begin(): void {
@@ -91,9 +79,7 @@
           lang: $langSetting,
           autostart,
           exclusions: parseExclusions(exclusionsText),
-          volumes: allChecked
-            ? []
-            : volumes.filter((v) => checked[v.path]).map((v) => v.path),
+          volumes: volumesSaved(volumes, checked),
           first_run_done: true,
         });
       } catch (err) {
@@ -120,7 +106,7 @@
       autostart = settings.autostart;
       exclusionsText = settings.exclusions.join("\n");
       volumes = list;
-      checked = Object.fromEntries(list.map((v) => [v.path, true]));
+      checked = volumesChecked(list, settings.volumes);
       loaded = true;
     })();
 

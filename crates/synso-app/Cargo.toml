@@ -21,10 +21,29 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 synso-core = { path = "../synso-core", features = ["serde"] }
-tauri = { version = "2", features = [] }
+# tray-icon: the built-in v2 tray (Task 19). image-png/image-ico: decode the
+# bundled placeholder icon for the tray (and window icons come from the
+# bundle section of tauri.conf.json).
+tauri = { version = "2", features = ["tray-icon", "image-png", "image-ico"] }
 tauri-plugin-opener = "2"
 tauri-plugin-global-shortcut = "2"
+# Task 19: native confirm dialog for the mid-scan quit confirmation,
+# OS autostart registration, and single-instance (second launch focuses
+# the running app). All driven from Rust; no webview permissions needed.
+tauri-plugin-dialog = "2"
+tauri-plugin-autostart = "2"
+tauri-plugin-single-instance = "2"
+# OS UI language for the tray menu's "auto" resolution (see tray.rs);
+# the crate is already in the graph via synso-core — this only widens
+# the feature set.
+windows = { workspace = true, features = ["Win32_Globalization"] }
 serde = { version = "1", features = ["derive"] }
 crossbeam-channel.workspace = true
-# Facade logging only; a real backend is installed in Task 19.
-log.workspace = true
+# Facade logging; the file backend lives in `logging.rs` (Task 19).
+# `std` is opt-in since log 0.4.34 dropped its default features (the
+# engine stays lean; only the backend needs a real writer + boxed Log).
+log = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+# The logging rotation tests need a throwaway directory.
+tempfile.workspace = true

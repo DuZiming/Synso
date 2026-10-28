@@ -281,6 +281,13 @@ impl Engine {
         }
     }
 
+    /// Whether a full scan is currently running. The app shell's quit
+    /// flow uses it to stand a confirmation in front of interrupting a
+    /// scan (Task 19's tray 退出 dialog).
+    pub fn is_scanning(&self) -> bool {
+        self.scanning.load(Ordering::Acquire)
+    }
+
     /// Starts the filesystem watcher (see `crate::watcher`): recursive
     /// `notify` watches on the effective scan roots, events merged into
     /// 500ms quiet-window batches, each batch applied incrementally to the
@@ -951,6 +958,16 @@ mod tests {
             serde_json::from_str::<DedupPhase>("\"hashing_first\"").unwrap(),
             DedupPhase::HashingFirst
         );
+    }
+
+    /// The scan-slot flag reads false while idle — the app shell's
+    /// quit-dialog trigger (Task 19) must never fire without a scan.
+    #[test]
+    fn is_scanning_false_while_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = write_fixture(tmp.path());
+        let engine = open_engine(&tmp.path().join("index.db"), &root);
+        assert!(!engine.is_scanning());
     }
 
     /// Fixture tree: `fixture/{readme.md, docs/{notes.txt, final.pdf,

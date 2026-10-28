@@ -57,6 +57,12 @@ export interface DedupFinishedPayload {
   groups: number;
 }
 
+/// Payload of the `nav-tab` event (the tray's 设置 item switches the
+/// dashboard's tab — see crates/synso-app/src/tray.rs).
+export interface NavTabPayload {
+  tab: string;
+}
+
 /// Mirror of `synso_core::Hit` (one search-result row).
 export interface Hit {
   id: number;

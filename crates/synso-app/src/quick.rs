@@ -1,20 +1,25 @@
-//! Quick search window lifecycle (Task 15).
+//! Quick search window lifecycle (Task 15, live re-registration Task 19).
 //!
 //! The window itself is declared in `tauri.conf.json` (frameless, always
 //! on top, out of the taskbar, starts hidden); this module owns everything
 //! runtime: placement (top-center of the monitor, top edge at
 //! [`TOP_FRACTION`] of its height), hide-on-focus-loss, the global
-//! shortcut's show/hide toggle, and the command backends `quick_show` /
-//! `quick_hide` / `quick_info` (see `commands.rs`).
+//! shortcut's show/hide toggle, live re-registration ([`set_shortcut`],
+//! the settings panel's 应用 button), and the command backends
+//! `quick_show` / `quick_hide` / `quick_info` (see `commands.rs`).
 //!
-//! Shortcut: `settings.shortcut` (default `"Ctrl+;"`) is registered once
-//! at startup — re-registration on a later settings change is Task 19. A
-//! parse or registration failure (taken by another app, garbage spelling)
-//! never fails the launch: it is logged, kept in the managed
-//! [`QuickState`], and surfaced by the dashboard through `quick_info`,
-//! whose "quick search" button stays as the always-working fallback.
+//! Shortcut: `settings.shortcut` (default `"Ctrl+;"`) is registered at
+//! startup and re-registered live by [`set_shortcut`]. A parse or
+//! registration failure (taken by another app, garbage spelling) never
+//! fails the launch or leaves the user shortcutless: it is logged, kept
+//! in the managed [`QuickState`], surfaced by the dashboard through
+//! `quick_info` — and a failed re-registration rolls back to the previous
+//! combo.
+
+use std::sync::Mutex;
 
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent};
+use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 /// Fraction of the monitor height the window's top edge sits at (the
 /// Everything-style near-top placement; horizontal centering is exact).
@@ -35,11 +40,19 @@ pub struct QuickQueryPayload {
 }
 
 /// Global-shortcut registration outcome, kept as managed state so
-/// `quick_info` can report it to the dashboard at any time.
+/// `quick_info` can report it to the dashboard at any time and
+/// [`set_shortcut`] can roll a failed re-registration back. Interior
+/// mutability: the registration is updated live from the `set_shortcut`
+/// command.
 pub struct QuickState {
-    pub shortcut: String,
-    pub registered: bool,
-    pub error: Option<String>,
+    inner: Mutex<QuickInner>,
+}
+
+#[derive(Debug, Clone)]
+struct QuickInner {
+    shortcut: String,
+    registered: bool,
+    error: Option<String>,
 }
 
 /// `quick_info`'s payload — the serde view of [`QuickState`].
@@ -51,12 +64,36 @@ pub struct QuickInfo {
 }
 
 impl QuickState {
-    pub fn info(&self) -> QuickInfo {
-        QuickInfo {
-            shortcut: self.shortcut.clone(),
-            registered: self.registered,
-            error: self.error.clone(),
+    fn new(shortcut: String, registered: bool, error: Option<String>) -> Self {
+        QuickState {
+            inner: Mutex::new(QuickInner {
+                shortcut,
+                registered,
+                error,
+            }),
         }
+    }
+
+    pub fn info(&self) -> QuickInfo {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        QuickInfo {
+            shortcut: inner.shortcut.clone(),
+            registered: inner.registered,
+            error: inner.error.clone(),
+        }
+    }
+
+    fn replace(&self, shortcut: String, registered: bool, error: Option<String>) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.shortcut = shortcut;
+        inner.registered = registered;
+        inner.error = error;
     }
 }
 
@@ -91,18 +128,69 @@ pub fn init(app: &AppHandle) {
             (false, Some(err))
         }
     };
-    app.manage(QuickState {
-        shortcut,
-        registered,
-        error,
-    });
+    app.manage(QuickState::new(shortcut, registered, error));
+}
+
+/// Re-registers the global shortcut LIVE (the settings panel's 应用
+/// button, Task 19): unregisters the old combo, registers the new one.
+/// A failure (conflict or bad spelling) rolls back — the old combo is
+/// re-registered and the managed state keeps reporting it — and the
+/// error string goes back to the caller for display. Persisting the new
+/// spelling is the command's job (`commands::set_shortcut`), so a
+/// registration that succeeded but a save that failed stays honest.
+///
+/// Re-registering the same spelling is allowed (unregister first, then
+/// register again) — an idempotent "apply".
+pub fn set_shortcut(app: &AppHandle, combo: &str) -> Result<(), String> {
+    let state = app.state::<QuickState>();
+    let (old, old_registered) = {
+        let inner = state
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (inner.shortcut.clone(), inner.registered)
+    };
+
+    if old_registered {
+        // A no-op unregister (the plugin never had it) is harmless — its
+        // only cost is the log line.
+        if let Err(err) = app.global_shortcut().unregister(old.as_str()) {
+            log::warn!("synso: unregistering old shortcut {old:?} failed: {err}");
+        }
+    }
+
+    match register_shortcut(app, combo) {
+        Ok(()) => {
+            state.replace(combo.to_owned(), true, None);
+            log::info!("synso: global shortcut re-registered: {old:?} -> {combo:?}");
+            Ok(())
+        }
+        Err(err) => {
+            log::warn!(
+                "synso: re-registering global shortcut {combo:?} failed ({err}); \
+                 rolling back to {old:?}"
+            );
+            let (registered, error) = if old_registered {
+                match register_shortcut(app, &old) {
+                    Ok(()) => (true, None),
+                    Err(rollback) => (false, Some(rollback)),
+                }
+            } else {
+                // The old combo was already unregistered at startup; the
+                // state keeps reporting exactly that.
+                (false, None)
+            };
+            state.replace(old, registered, error);
+            Err(err)
+        }
+    }
 }
 
 /// Registers `spelling` with the show/hide toggle as its handler. Both a
 /// bad spelling (`settings.shortcut` is user-editable text) and an OS-side
 /// rejection (another app owns it) surface as the error string.
 fn register_shortcut(app: &AppHandle, spelling: &str) -> Result<(), String> {
-    use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+    use tauri_plugin_global_shortcut::ShortcutState;
 
     app.global_shortcut()
         .on_shortcut(spelling, |app, _shortcut, event| {
