@@ -361,9 +361,6 @@ fn backfill_pinyin_keys(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Resolves `segments` in `dirs`, creating missing levels (each segment's
-/// parent is the previous one; the first segment's parent is NULL), and
-/// returns the final dir id.
 /// The row-level half of [`Store::upsert_file`], connection-generic so a
 /// caller can run many upserts inside ONE transaction — the full scan's
 /// batch flush does (Task 20: per-row autocommit made a 100k-file first
@@ -415,6 +412,9 @@ pub(crate) fn upsert_file_on(conn: &Connection, dir_path: &[&str], rec: &mut Fil
     Ok(())
 }
 
+/// Resolves `segments` in `dirs`, creating missing levels (each segment's
+/// parent is the previous one; the first segment's parent is NULL), and
+/// returns the final dir id.
 fn resolve_dir(conn: &Connection, segments: &[&str]) -> Result<FileId> {
     if segments.is_empty() {
         return Err(SynsoError::BadQuery(
