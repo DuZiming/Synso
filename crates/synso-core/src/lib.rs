@@ -13,6 +13,9 @@
 //! - Settings: [`Settings`] (persisted in the store's meta table via
 //!   [`Engine::settings`] / [`Engine::set_settings`]), [`list_volumes`]
 //! - Query data: [`parse_query`], [`ParsedQuery`], [`SearchResult`], [`Hit`]
+//! - Hot index: [`HotIndex`] (with the deterministic [`HotIndex::synthetic`]
+//!   fixture constructor) and [`search_index`], the standalone query
+//!   pipeline over it
 //! - Feature data: [`SizeNode`], [`DedupPhase`], [`DedupState`],
 //!   [`DupeGroup`], [`Collection`], [`MemberHit`], [`FileId`],
 //!   [`VolumeInfo`], [`pinyin_keys`]
@@ -82,6 +85,7 @@ pub(crate) mod watcher;
 pub use collections::{Collection, MemberHit};
 pub use dedup::{DedupState, DupeGroup};
 pub use engine::{DedupPhase, Engine, EngineEvent, EngineOptions, EngineStats};
+pub use hotindex::HotIndex;
 pub use model::{FileId, ParsedQuery};
 pub use pinyin::pinyin_keys;
 pub use query::{parse_query, Hit, SearchResult};
@@ -92,6 +96,17 @@ pub use sizeagg::SizeNode;
 /// [`crate::volumes::fixed_volumes`].
 pub use volumes::fixed_volumes as list_volumes;
 pub use volumes::VolumeInfo;
+
+/// Runs [`parse_query`] plus the full query pipeline over a STANDALONE hot
+/// index — the same path [`Engine::search`] executes (parse, dimension
+/// filters, rank, page), minus only the store-side `coll:` resolution and
+/// the engine's RwLock snapshot. Exposed for embedders that hold a hot
+/// index directly and for the Task 20 perf harness (`benches/search.rs`,
+/// `tests/perf.rs`), which times this over [`HotIndex::synthetic`].
+pub fn search_index(hot: &HotIndex, text: &str, offset: u32, limit: u32) -> SearchResult {
+    let parsed = parse_query(text);
+    query::run_parsed(hot, &parsed, None, offset, limit, engine::unix_now())
+}
 
 /// Error type for all synso-core operations.
 #[derive(Debug, thiserror::Error)]

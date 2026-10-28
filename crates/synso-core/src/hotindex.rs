@@ -31,6 +31,115 @@ struct DirEntry {
     name: String,
 }
 
+// --------------------- Task 20: synthetic perf fixture -------------------
+
+/// Deterministic xorshift64* for [`HotIndex::synthetic`] — the fixture must
+/// be reproducible run to run (and dependency-free), so benchmark runs
+/// compare like for like. Every bound at the call sites is a nonzero
+/// constant.
+struct SyntheticRng(u64);
+
+impl SyntheticRng {
+    fn below(&mut self, bound: u64) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) % bound
+    }
+}
+
+/// Latin basename pool for the synthetic corpus ("report123456.pdf").
+const SYNTHETIC_LATIN: [&str; 20] = [
+    "report", "invoice", "photo", "song", "backup", "meeting", "notes", "design", "budget",
+    "resume", "manual", "spec", "draft", "scan", "cover", "letter", "contract", "summary",
+    "archive", "export",
+];
+
+/// Han basename pool for the synthetic corpus ("报告123456.pdf"); pinyin
+/// keys are computed from these by the production generator, so 「bg」 and
+/// 「baog」 probes match exactly the rows a real 报告-named corpus would.
+const SYNTHETIC_HAN: [&str; 24] = [
+    "报告", "会议", "计划", "笔记", "截图", "视频", "音乐", "图片", "资料", "合同", "发票",
+    "简历", "项目", "总结", "备份", "数据", "模板", "通知", "日志", "方案", "财务", "人事",
+    "培训", "调研",
+];
+
+/// Extension pool for the synthetic corpus; "pdf" is index 0 so the
+/// `ext:pdf size:>1mb` probe filters through the interned-id fast path.
+const SYNTHETIC_EXTS: [&str; 14] = [
+    "pdf", "docx", "txt", "jpg", "png", "mp3", "mp4", "zip", "xlsx", "pptx", "md", "csv",
+    "wav", "mov",
+];
+
+/// Root segments of the synthetic dir tree; "projects" is the `path:`
+/// probe's target (no other segment contains that substring).
+const SYNTHETIC_ROOTS: [&str; 8] = [
+    "projects", "docs", "media", "downloads", "work", "archive", "backup", "photos",
+];
+
+/// Subdirectory name pool for the synthetic tree (numerically suffixed per
+/// parent, so sibling names stay unique).
+const SYNTHETIC_SUBDIRS: [&str; 14] = [
+    "src", "docs", "assets", "drafts", "final", "old", "new", "备份", "资料", "temp",
+    "export", "raw", "edit", "out",
+];
+
+/// mtime base of the synthetic corpus (2026-01-01T00:00:00Z); per-entry
+/// mtimes spread deterministically over the following ~11 months.
+const SYNTHETIC_MTIME_BASE: i64 = 1_767_225_600;
+
+/// One synthetic corpus name for ordinal `i` (unique per dir because `i`
+/// rides along): 40% latin, 30% Han, 20% mixed, 10% extension-less /
+/// multi-dot oddballs — the name shapes the query probes target.
+fn synthetic_name(i: u64) -> String {
+    let ext = SYNTHETIC_EXTS[(i % SYNTHETIC_EXTS.len() as u64) as usize];
+    let latin = SYNTHETIC_LATIN[(i % SYNTHETIC_LATIN.len() as u64) as usize];
+    let han = SYNTHETIC_HAN[(i % SYNTHETIC_HAN.len() as u64) as usize];
+    match i % 10 {
+        0..=3 => format!("{latin}{i}.{ext}"),
+        4..=6 => format!("{han}{i}.{ext}"),
+        7..=8 => format!("{latin}-{han}{i}.{ext}"),
+        _ => match i % 4 {
+            0 => format!("README_{i}"),
+            1 => format!("makefile_{i}"),
+            2 => format!("数据备份{i}"),
+            _ => format!("archive_{i}.tar.gz"),
+        },
+    }
+}
+
+/// One synthetic `files` row (pinyin keys from the production generator,
+/// exactly as [`crate::store::Store::upsert_file`] would store them).
+fn synthetic_record(
+    id: FileId,
+    parent: FileId,
+    name: &str,
+    size: u64,
+    mtime: i64,
+    ext_id: FileId,
+    is_dir: bool,
+) -> FileRecord {
+    let (py_full, py_init) = crate::pinyin::pinyin_keys(name);
+    FileRecord {
+        id,
+        parent,
+        name: name.to_string(),
+        size: if is_dir { 0 } else { size },
+        mtime,
+        ctime: mtime,
+        atime: mtime,
+        ext_id: if is_dir { 0 } else { ext_id },
+        is_dir,
+        hash_first: None,
+        hash_full: None,
+        py_full,
+        py_init,
+    }
+}
+
+
 /// In-memory search index over the store (see module docs).
 #[derive(Debug, Default)]
 pub struct HotIndex {
@@ -91,6 +200,135 @@ impl HotIndex {
     /// The empty, not-yet-loaded index an engine starts with.
     pub fn cold() -> HotIndex {
         HotIndex::default()
+    }
+
+    // ------------------- Task 20: synthetic perf fixture -----------------
+    //
+    // The validation harness (benches/search.rs, tests/perf.rs) times the
+    // query pipeline against a million-entry index — a size no test fixture
+    // can reach through the real scan path (a million store upserts). This
+    // constructor builds the same shape in memory instead: a deterministic
+    // mixed CJK/latin corpus over a small directory tree, pinyin keys from
+    // the production generator, so budget numbers measure the real arena
+    // layout and the real match targets.
+
+    /// A warm, deterministic, fully in-memory index holding `n` file
+    /// entries (plus the directory entries of a ~170-dir synthetic tree)
+    /// of mixed CJK/latin names. NOT part of the store-backed lifecycle:
+    /// no `Store` is consulted, ids come from internal counters, and every
+    /// draw comes from a fixed-seed PRNG, so repeated runs build byte-
+    /// identical indexes and benchmarks compare like for like. Pinyin keys
+    /// go through [`crate::pinyin::pinyin_keys`] — the same generator the
+    /// store uses at upsert time — so the arenas hold exactly the spellings
+    /// a scanned corpus would. Names embed their ordinal, keeping
+    /// `(dir, name)` unique as the corpus scales.
+    pub fn synthetic(n: u64) -> HotIndex {
+        let mut hot = HotIndex {
+            warm: true,
+            ..HotIndex::default()
+        };
+        let mut rng = SyntheticRng(0x53_59_4E_53_4F_00_00_01); // "SYNSO"
+        let mut next_dir_id: FileId = 1;
+        let mut next_file_id: FileId = 1;
+
+        for (idx, ext) in SYNTHETIC_EXTS.iter().enumerate() {
+            hot.exts.insert(idx as FileId + 1, ext.to_string());
+        }
+
+        // The interned dir tree plus each directory's own entry slot. The
+        // walk root segments get no slot (production scans never index the
+        // root itself — min_depth(1)); every nested dir does, mirroring how
+        // a scan stores directories as `files` rows with `is_dir = 1`.
+        // `file_dirs` collects the dirs files are distributed over.
+        let mut file_dirs: Vec<FileId> = Vec::new();
+        let mut intern_dir = |hot: &mut HotIndex,
+                              parent: Option<FileId>,
+                              name: &str,
+                              next_dir_id: &mut FileId,
+                              next_file_id: &mut FileId| {
+            let id = *next_dir_id;
+            *next_dir_id += 1;
+            hot.intern_dir(id, parent, name.to_string());
+            if let Some(parent) = parent {
+                let rec = synthetic_record(*next_file_id, parent, name, 0, 0, 0, true);
+                *next_file_id += 1;
+                hot.push(rec);
+            }
+            file_dirs.push(id);
+            id
+        };
+
+        for (r, root) in SYNTHETIC_ROOTS.iter().enumerate() {
+            let root_id = intern_dir(
+                &mut hot,
+                None,
+                root,
+                &mut next_dir_id,
+                &mut next_file_id,
+            );
+            for k in 0..3 + rng.below(4) {
+                let name = format!(
+                    "{}{k}",
+                    SYNTHETIC_SUBDIRS[(r * 5 + k as usize) % SYNTHETIC_SUBDIRS.len()]
+                );
+                let sub_id = intern_dir(
+                    &mut hot,
+                    Some(root_id),
+                    &name,
+                    &mut next_dir_id,
+                    &mut next_file_id,
+                );
+                if rng.below(2) == 0 {
+                    for g in 0..1 + rng.below(2) {
+                        let gname = format!("deep{g}_{k}");
+                        intern_dir(
+                            &mut hot,
+                            Some(sub_id),
+                            &gname,
+                            &mut next_dir_id,
+                            &mut next_file_id,
+                        );
+                    }
+                }
+            }
+        }
+        // One deeper chain under the first root (projects) so path lengths
+        // span a realistic depth range 2..=5.
+        let mut parent = 1;
+        for seg in ["alpha", "src", "include"] {
+            parent = intern_dir(
+                &mut hot,
+                Some(parent),
+                seg,
+                &mut next_dir_id,
+                &mut next_file_id,
+            );
+        }
+
+        for i in 0..n {
+            let parent = file_dirs[(i as usize) % file_dirs.len()];
+            let name = synthetic_name(i);
+            let rec = synthetic_record(
+                next_file_id,
+                parent,
+                &name,
+                1024u64 << rng.below(14), // 1 KiB .. 8 MiB
+                SYNTHETIC_MTIME_BASE + ((i as i64 * 37) % 29_030_400),
+                (i % SYNTHETIC_EXTS.len() as u64) as FileId + 1,
+                false,
+            );
+            next_file_id += 1;
+            hot.push(rec);
+        }
+        hot
+    }
+
+    /// Interns one synthetic `dirs` row (the shared shape of
+    /// [`HotIndex::load`]'s dir loop).
+    fn intern_dir(&mut self, id: FileId, parent: Option<FileId>, name: String) {
+        self.interned_bytes += name.len() as u64;
+        self.dir_by_parent_name.insert((parent, name.clone()), id);
+        self.dirs.insert(id, DirEntry { parent, name });
     }
 
     /// Loads the full `dirs`, `extensions` and `files` tables from `store`

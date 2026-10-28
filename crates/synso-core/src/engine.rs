@@ -774,8 +774,9 @@ pub(crate) fn broadcast(subscribers: &Arc<Mutex<Vec<Sender<EngineEvent>>>>, even
 }
 
 /// Current Unix-epoch seconds (0 if the clock reads pre-epoch); the query
-/// time the search recency window is measured against.
-fn unix_now() -> i64 {
+/// time the search recency window is measured against. `pub(crate)`:
+/// the facade's standalone `search_index` uses the same query clock.
+pub(crate) fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs() as i64)

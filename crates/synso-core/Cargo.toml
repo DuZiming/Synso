@@ -33,6 +33,16 @@ tempfile.workspace = true
 # Asserts the serde spellings of the facade data types (the JSON contract
 # the app's IPC serves; see the DedupPhase test in engine.rs).
 serde_json = "1"
+# Task 20: criterion benchmarks the ten query classes over the 1M-entry
+# synthetic hot index (benches/search.rs). Pinned to 0.5.x: the 0.5 line
+# declares MSRV 1.70, staying inside the workspace's 1.83 floor. Its clap
+# dependency is locked to 4.5.48 in Cargo.lock for the same reason (clap
+# 4.6 is edition2024 / beyond 1.83).
+criterion = "=0.5.1"
+
+[[bench]]
+name = "search"
+harness = false
 
 [target.'cfg(windows)'.dev-dependencies]
 junction.workspace = true
