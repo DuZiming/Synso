@@ -56,3 +56,41 @@ export interface DedupProgressPayload {
 export interface DedupFinishedPayload {
   groups: number;
 }
+
+/// Mirror of `synso_core::Hit` (one search-result row).
+export interface Hit {
+  id: number;
+  path: string;
+  name: string;
+  size: number;
+  mtime: number;
+  ext: string;
+  is_dir: boolean;
+}
+
+/// Mirror of `synso_core::SearchResult` (`search`'s payload): page of hits
+/// plus the full match count.
+export interface SearchResult {
+  hits: Hit[];
+  total: number;
+}
+
+/// Mirror of `synso_core::ParsedQuery` (`parse_preview`'s payload): the
+/// modifiers the engine recognized, for the quick window's chips. `null`
+/// fields are absent modifiers.
+export interface ParsedQuery {
+  text: string;
+  ext: string | null;
+  min_size: number | null;
+  max_size: number | null;
+  path_prefix: string | null;
+  collections: string[];
+}
+
+/// Payload of `quick_info`: the global shortcut's spelling and whether its
+/// startup registration succeeded (the dashboard toasts when it did not).
+export interface QuickInfo {
+  shortcut: string;
+  registered: boolean;
+  error: string | null;
+}

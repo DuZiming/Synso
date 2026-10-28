@@ -22,6 +22,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 synso-core = { path = "../synso-core", features = ["serde"] }
 tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-global-shortcut = "2"
 serde = { version = "1", features = ["derive"] }
 crossbeam-channel.workspace = true
 # Facade logging only; a real backend is installed in Task 19.

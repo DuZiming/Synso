@@ -157,6 +157,42 @@ button.primary:disabled {
   overflow-wrap: anywhere;
 }
 
+/* ---------------- Dashboard top actions + toast (Task 15) ---------------- */
+
+.top-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(560px, calc(100vw - 32px));
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  box-shadow: 0 6px 24px rgb(0 0 0 / 0.15);
+}
+
+.toast-x {
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 2px;
+  border: none;
+  background: none;
+  color: var(--muted);
+  cursor: pointer;
+}
+
 /* ---------------- First-run wizard (Task 14) ---------------- */
 
 .wizard {

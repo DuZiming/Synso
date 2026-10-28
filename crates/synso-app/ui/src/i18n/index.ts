@@ -48,12 +48,27 @@ export const t = derived(langSetting, ($setting) => {
   return (key: I18nKey): string => lookup(locale, key) ?? lookup("en", key) ?? key;
 });
 
-/** Loads the persisted preference into the store (call once at startup). */
+/** Loads the persisted preference into the store (call once at startup).
+ *
+ * Retries briefly: the engine state is managed in the Tauri setup hook,
+ * which runs AFTER the config windows exist — a page that mounts fast can
+ * see "state not managed" rejections for a few hundred ms (surfaced by the
+ * Task 15 dev run: without the retry, the wizard's view decision raced the
+ * backend and a fresh install could land straight on the dashboard). A
+ * genuinely dead backend exhausts the retries; language is a preference,
+ * so the caller's fallback (and the store's default) apply instead. */
 export async function initI18n(): Promise<void> {
-  const settings = await settingsGet();
-  langSetting.set(
-    settings.lang === "zh" || settings.lang === "en" ? settings.lang : "auto",
-  );
+  for (let attempt = 0; attempt < 15; attempt++) {
+    try {
+      const settings = await settingsGet();
+      langSetting.set(
+        settings.lang === "zh" || settings.lang === "en" ? settings.lang : "auto",
+      );
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
 }
 
 /** Switches the language live AND persists the choice via settings_set. */

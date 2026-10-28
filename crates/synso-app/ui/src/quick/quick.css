@@ -1,0 +1,13 @@
+/* Quick window page shell: the window is frameless and the component
+   manages its own layout, so the page is exactly the viewport — no page
+   scroll, no margins. (Colors/typography come from app.css.) */
+html,
+body.quick-body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+#app {
+  height: 100%;
+}

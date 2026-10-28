@@ -8,7 +8,7 @@
     langSetting,
     type LangSetting,
   } from "./i18n";
-  import { engineStats, settingsGet, startFullScan } from "./lib/tauri";
+  import { engineStats, quickInfo, quickShow, settingsGet, startFullScan } from "./lib/tauri";
   import type { EngineStats } from "./lib/types";
   import Wizard from "./welcome/Wizard.svelte";
 
@@ -23,8 +23,17 @@
   let scanning = $state(false);
   let scanError = $state<string | null>(null);
   let progressDone = $state(0);
+  // Transient toast (e.g. global shortcut unavailable — Task 15).
+  let toast = $state<string | null>(null);
+  let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
   const langOptions = ["auto", "zh", "en"] as const;
+
+  function showToast(message: string): void {
+    toast = message;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => (toast = null), 10_000);
+  }
 
   async function refresh(): Promise<void> {
     stats = await engineStats();
@@ -59,6 +68,15 @@
         view = "dashboard";
       }
       if (view === "dashboard") void refresh();
+      // Task 15: when the global shortcut could not be registered at
+      // startup (taken or invalid), tell the user about the fallback
+      // button — the quick window stays reachable regardless.
+      try {
+        const info = await quickInfo();
+        if (!info.registered) showToast($t("toast.shortcut"));
+      } catch {
+        // quick_info itself unreachable — same degraded state as above.
+      }
     })();
 
     const unlisteners: UnlistenFn[] = [];
@@ -93,6 +111,7 @@
 
     return () => {
       for (const un of unlisteners) un();
+      clearTimeout(toastTimer);
     };
   });
 </script>
@@ -101,17 +120,24 @@
   <header class="topbar">
     <h1>{$t("app.title")}</h1>
     {#if view === "dashboard"}
-      <select
-        class="lang"
-        aria-label={$t("a11y.langSelect")}
-        value={$langSetting}
-        onchange={(event) =>
-          void changeLang(event.currentTarget.value as LangSetting)}
-      >
-        {#each langOptions as lang (lang)}
-          <option value={lang}>{$t(`lang.${lang}`)}</option>
-        {/each}
-      </select>
+      <div class="top-actions">
+        <!-- Task 15 fallback entry: opens the quick window even when the
+             global shortcut is taken (its always-working path). -->
+        <button class="ghost" onclick={() => void quickShow()}>
+          {$t("dashboard.quickSearch")}
+        </button>
+        <select
+          class="lang"
+          aria-label={$t("a11y.langSelect")}
+          value={$langSetting}
+          onchange={(event) =>
+            void changeLang(event.currentTarget.value as LangSetting)}
+        >
+          {#each langOptions as lang (lang)}
+            <option value={lang}>{$t(`lang.${lang}`)}</option>
+          {/each}
+        </select>
+      </div>
     {/if}
   </header>
 
@@ -162,5 +188,14 @@
         <p class="error" role="alert">{$t("dashboard.scanFailed")}: {scanError}</p>
       {/if}
     </section>
+  {/if}
+
+  {#if toast}
+    <div class="toast" role="status">
+      <span>{toast}</span>
+      <button class="toast-x" aria-label={$t("a11y.dismiss")} onclick={() => (toast = null)}
+        >×</button
+      >
+    </div>
   {/if}
 </main>

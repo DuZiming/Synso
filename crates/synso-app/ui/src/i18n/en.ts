@@ -14,6 +14,10 @@ const en = {
   a11y: {
     langSelect: "Language / 语言",
     scanProgress: "Scan progress",
+    dismiss: "Dismiss",
+    quickInput: "Quick search input",
+    modifierChips: "Recognized query modifiers",
+    resultsList: "Search results",
   },
   dashboard: {
     files: "Files",
@@ -26,6 +30,7 @@ const en = {
     rescan: "Rescan",
     scanning: "Scanning…",
     scanFailed: "Scan failed",
+    quickSearch: "Quick search",
   },
   wizard: {
     title: "Welcome to Synso",
@@ -49,6 +54,18 @@ const en = {
     begin: "Start scanning",
     scanning: "Building the index…",
     retry: "Retry",
+  },
+  quick: {
+    placeholder: "Search files… (ext: size: path: coll:)",
+    hint: "Type to search — pinyin initials work too (bg finds 报告.docx).",
+    noResults: "No results",
+    warming: "The index is warming up — results appear in a moment.",
+    results: "results",
+    hints: "Enter open · Ctrl+Enter reveal · Esc close",
+  },
+  toast: {
+    shortcut:
+      "The global shortcut is unavailable (taken or invalid). Use the Quick search button on the dashboard instead.",
   },
 };
 

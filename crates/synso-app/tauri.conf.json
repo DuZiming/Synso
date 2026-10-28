@@ -17,6 +17,18 @@
         "height": 700,
         "minWidth": 760,
         "minHeight": 520
+      },
+      {
+        "label": "quick",
+        "url": "quick.html",
+        "title": "Synso Quick Search",
+        "width": 680,
+        "height": 460,
+        "resizable": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false
       }
     ],
     "security": {

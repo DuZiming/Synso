@@ -492,6 +492,17 @@ impl Engine {
         dedup::resolve_absolute_path(&self.dedup.roots, index_path)
     }
 
+    /// The live hot-index hit behind a `files` row id — the id → hit step
+    /// of the reveal/open pipeline (Task 15). `None` when the id is dead
+    /// (deleted) or unknown, mirroring the skip rule `delete_to_trash`
+    /// applies; unlike trash, the app layer surfaces that as an error to
+    /// the user. Pairs with [`Engine::resolve_absolute`], which turns the
+    /// hit's index-relative path into the real disk path.
+    pub fn hit_by_id(&self, id: FileId) -> Option<crate::Hit> {
+        let hot = read_unpoisoned(&self.hot);
+        hot.slot_of_id(id).map(|slot| query::hit_of(&hot, slot))
+    }
+
     // ---------------- Task 11: directory size aggregation ----------------
 
     /// Directory-size tree for the flame chart (Task 17): the subtree
@@ -1410,6 +1421,37 @@ mod tests {
         assert_eq!(fs::read_to_string(&abs).unwrap(), "hello nested");
         // A path whose root segment matches no root cannot resolve.
         assert_eq!(engine.resolve_absolute("not_a_root_segment/x.txt"), None);
+    }
+
+    // ------------------ Task 15: id → hit for reveal/open ----------------
+
+    /// The quick window's open/reveal commands resolve an id to its hit
+    /// before mapping to disk: a live id returns the very hit search
+    /// returned, and dead/unknown ids (deleted entries, garbage from the
+    /// webview) resolve to `None` so the app layer can error cleanly.
+    #[test]
+    fn hit_by_id_resolves_live_ids_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = write_fixture(tmp.path());
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        let res = engine.search("notes", 0, 5);
+        assert_eq!(res.total, 1);
+        let hit = &res.hits[0];
+        assert_eq!(
+            engine.hit_by_id(hit.id).as_ref(),
+            Some(hit),
+            "a live id resolves to the same hit search returned"
+        );
+
+        // Never-indexed and structurally invalid ids are dead ends.
+        assert_eq!(engine.hit_by_id(999_999), None);
+        assert_eq!(engine.hit_by_id(-1), None);
     }
 
     // ------------------ Task 10: recycle-bin deletion ---------------------

@@ -10,6 +10,7 @@
 
 mod commands;
 mod events;
+mod quick;
 mod state;
 
 use tauri::Manager;
@@ -17,6 +18,12 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Open/reveal (Task 15) goes through the official opener plugin —
+        // default-app open and Explorer select, cross-platform.
+        .plugin(tauri_plugin_opener::init())
+        // Global shortcut for the quick window; registration itself
+        // happens in `quick::init` from the user's settings spelling.
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             // DB path = app_data_dir/synso.db, directory created on demand.
             let data_dir = app.path().app_data_dir()?;
@@ -35,6 +42,10 @@ pub fn run() {
             app.manage(app_state);
             events::spawn_forwarder(app.handle().clone(), engine_events);
 
+            // Quick window: placement, focus-loss hide, global shortcut
+            // (reads settings, so after `app.manage`).
+            quick::init(app.handle());
+
             #[cfg(debug_assertions)]
             dev_autoscan(app);
             Ok(())
@@ -44,7 +55,14 @@ pub fn run() {
             commands::start_full_scan,
             commands::settings_get,
             commands::settings_set,
-            commands::list_volumes
+            commands::list_volumes,
+            commands::search,
+            commands::parse_preview,
+            commands::open_path,
+            commands::reveal_path,
+            commands::quick_show,
+            commands::quick_hide,
+            commands::quick_info
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
