@@ -18,6 +18,10 @@ const en = {
     quickInput: "Quick search input",
     modifierChips: "Recognized query modifiers",
     resultsList: "Search results",
+    dedupProgress: "Duplicate analysis progress",
+    prevPage: "Previous page",
+    nextPage: "Next page",
+    confirmDialog: "Delete confirmation",
   },
   dashboard: {
     files: "Files",
@@ -31,6 +35,49 @@ const en = {
     scanning: "Scanning…",
     scanFailed: "Scan failed",
     quickSearch: "Quick search",
+  },
+  tabs: {
+    overview: "Overview",
+    dedup: "Duplicates",
+    flame: "Flame chart",
+    collections: "Collections",
+    comingSoon: "Coming soon",
+  },
+  dedup: {
+    start: "Start analysis",
+    boost: "Boost",
+    rerun: "Re-analyze",
+    phase: {
+      idle: "Not analyzed yet",
+      grouping: "Grouping by size",
+      hashing_first: "Quick hashing (first 4 KiB)",
+      hashing_full: "Full hashing",
+      done: "Analysis complete",
+    },
+    empty: "No duplicate files found",
+    statsGroups: "groups",
+    wasted: "recoverable",
+    members: "files",
+    stale:
+      "Groups from the last analysis — they refresh when the new one finishes.",
+    skippedPrefix: "Skipped",
+    filesUnit: "files",
+    deletedPrefix: "Deleted",
+    keepNewest: "Keep newest",
+    keepOldest: "Keep oldest",
+    keepNewestHint:
+      "Delete the others and keep only the most recently modified file.",
+    keepOldestHint:
+      "Delete the others and keep only the oldest-modified file.",
+    manualDelete: "Delete selected",
+    confirmTitle: "Delete these files?",
+    confirmTrash:
+      "Files move to the Recycle Bin — they can be restored from there.",
+    confirmDelete: "Delete",
+    confirmCancel: "Cancel",
+    confirmAllHint:
+      "Each group must keep at least one file — uncheck something first.",
+    deleteFailed: "Deletion failed",
   },
   wizard: {
     title: "Welcome to Synso",

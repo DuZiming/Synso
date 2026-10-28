@@ -193,7 +193,58 @@ button.primary:disabled {
   cursor: pointer;
 }
 
+/* ---------------- Dashboard tabs (Task 16) ---------------- */
+
+.tabs {
+  display: flex;
+  gap: 6px;
+  margin-top: 14px;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.tab {
+  font: inherit;
+  color: var(--muted);
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 8px 8px 0 0;
+  padding: 8px 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tab:hover:not(:disabled) {
+  color: var(--text);
+}
+
+.tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.tab.soon {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.soon-note {
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 1px 8px;
+}
+
+/* ---------------- Dedup view (Task 16) ---------------- */
+/* The view's own layout lives in DedupView.svelte; only shared bits go
+   here when they outgrow the component. */
+
 /* ---------------- First-run wizard (Task 14) ---------------- */
+
 
 .wizard {
   max-width: 640px;

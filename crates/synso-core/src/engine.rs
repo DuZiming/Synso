@@ -92,6 +92,10 @@ pub struct EngineOptions {
 /// of every new run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// JSON bridges (the app's IPC) spell phases snake_case — the same
+// convention the app's `dedup-progress` event payload uses — so a
+// frontend sees one spelling everywhere.
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum DedupPhase {
     #[default]
     Idle,
@@ -900,6 +904,42 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
+
+    /// The JSON spelling of every phase, as served by the app's
+    /// `dedup_state` IPC (Task 16): snake_case, matching the hand-mapped
+    /// `dedup-progress` event payload in synso-app's events.rs — one
+    /// spelling on both channels, or a frontend's phase switch silently
+    /// never matches. Compiled only under the serde feature (plain
+    /// `cargo test -p synso-core` keeps core dependency-lean; the
+    /// workspace test run builds the feature via synso-app).
+    #[cfg(feature = "serde")]
+    #[test]
+    fn dedup_phase_serializes_snake_case_for_json_bridges() {
+        assert_eq!(
+            serde_json::to_string(&DedupPhase::Idle).unwrap(),
+            "\"idle\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DedupPhase::Grouping).unwrap(),
+            "\"grouping\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DedupPhase::HashingFirst).unwrap(),
+            "\"hashing_first\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DedupPhase::HashingFull).unwrap(),
+            "\"hashing_full\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DedupPhase::Done).unwrap(),
+            "\"done\""
+        );
+        assert_eq!(
+            serde_json::from_str::<DedupPhase>("\"hashing_first\"").unwrap(),
+            DedupPhase::HashingFirst
+        );
+    }
 
     /// Fixture tree: `fixture/{readme.md, docs/{notes.txt, final.pdf,
     /// empty_dir}}` — 3 files, 2 directories.

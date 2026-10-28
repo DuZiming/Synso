@@ -9,6 +9,7 @@
   import { onMount } from "svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { initI18n, t } from "../i18n";
+  import { formatTime, humanBytes } from "../lib/format";
   import {
     engineStats,
     openPath,
@@ -213,26 +214,6 @@
       clearTimeout(debounceTimer);
     };
   });
-
-  function humanBytes(bytes: number): string {
-    if (bytes < 1024) return `${bytes} B`;
-    const units = ["KB", "MB", "GB", "TB"] as const;
-    let value = bytes;
-    let unit = -1;
-    do {
-      value /= 1024;
-      unit++;
-    } while (value >= 1024 && unit < units.length - 1);
-    return `${value >= 100 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
-  }
-
-  const timeFormat = new Intl.DateTimeFormat(undefined, {
-    dateStyle: "short",
-    timeStyle: "short",
-  });
-  function formatTime(unixSecs: number): string {
-    return timeFormat.format(new Date(unixSecs * 1000));
-  }
 </script>
 
 <svelte:window onkeydown={onKeydown} />

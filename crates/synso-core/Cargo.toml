@@ -30,6 +30,9 @@ windows.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Asserts the serde spellings of the facade data types (the JSON contract
+# the app's IPC serves; see the DedupPhase test in engine.rs).
+serde_json = "1"
 
 [target.'cfg(windows)'.dev-dependencies]
 junction.workspace = true

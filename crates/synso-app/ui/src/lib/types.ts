@@ -94,3 +94,32 @@ export interface QuickInfo {
   registered: boolean;
   error: string | null;
 }
+
+/// Mirror of `synso_core::DedupPhase` (serializes snake_case over IPC).
+export type DedupPhase =
+  | "idle"
+  | "grouping"
+  | "hashing_first"
+  | "hashing_full"
+  | "done";
+
+/// Mirror of `synso_core::DedupState` (`dedup_state`'s payload): phase of
+/// the state machine, `done`/`total` of the CURRENT stage (at `done` they
+/// equal this run's hash computations), the last completed run's group
+/// count and the files skipped unreadable / as cloud placeholders.
+export interface DedupState {
+  phase: DedupPhase;
+  done: number;
+  total: number;
+  groups: number;
+  errors: number;
+}
+
+/// Mirror of `synso_core::DupeGroup` (`dedup_groups`' payload): one
+/// content-identical group, size-descending page order, members stable by
+/// files-row id. `hash` is a u64 identity — never treated as a JS number.
+export interface DupeGroup {
+  hash: number;
+  size: number;
+  members: Hit[];
+}

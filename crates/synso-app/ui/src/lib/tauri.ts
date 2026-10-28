@@ -3,6 +3,8 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  DedupState,
+  DupeGroup,
   EngineStats,
   ParsedQuery,
   QuickInfo,
@@ -72,4 +74,33 @@ export function quickHide(): Promise<void> {
 /** Global-shortcut registration info (the dashboard's fallback toast). */
 export function quickInfo(): Promise<QuickInfo> {
   return invoke("quick_info");
+}
+
+// ------------------ Task 16: dedup dashboard -----------------------------
+
+/** Starts a dedup run (a no-op while one is already going). The view's
+ * 加速 button calls this too: persisted hashes speed up later runs. */
+export function dedupStart(): Promise<void> {
+  return invoke("dedup_start");
+}
+
+/** Snapshot of the dedup state machine (phase + progress + group count). */
+export function dedupState(): Promise<DedupState> {
+  return invoke("dedup_state");
+}
+
+/** One page `[offset, offset + limit)` of the last run's dupe groups,
+ * size-descending. Deleted files drop out; groups below 2 members
+ * dissolve. */
+export function dedupGroups(
+  offset: number,
+  limit: number,
+): Promise<DupeGroup[]> {
+  return invoke("dedup_groups", { offset, limit });
+}
+
+/** Moves the entries behind `ids` to the recycle bin (never a permanent
+ * delete); resolves with how many paths actually landed. */
+export function deleteToTrash(ids: number[]): Promise<number> {
+  return invoke("delete_to_trash", { ids });
 }

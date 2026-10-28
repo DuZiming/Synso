@@ -3,7 +3,9 @@
 
 use std::path::PathBuf;
 
-use synso_core::{EngineStats, Hit, ParsedQuery, SearchResult, Settings, VolumeInfo};
+use synso_core::{
+    DedupState, DupeGroup, EngineStats, Hit, ParsedQuery, SearchResult, Settings, VolumeInfo,
+};
 use tauri::{AppHandle, State};
 use tauri_plugin_opener::OpenerExt;
 
@@ -119,4 +121,45 @@ pub fn quick_hide(app: AppHandle) {
 #[tauri::command]
 pub fn quick_info(state: State<'_, quick::QuickState>) -> quick::QuickInfo {
     state.info()
+}
+
+// ---------------------- Task 16: dedup dashboard ----------------------
+
+/// Starts a dedup run (or, while one is already going, is a harmless
+/// no-op — the engine keeps exactly one run at a time). Progress arrives
+/// as the `dedup-progress` / `dedup-finished` events (see `events.rs`).
+/// Calling this is also the view's 加速 button: persisted hashes make
+/// every later run skip I/O on already-hashed files.
+#[tauri::command]
+pub fn dedup_start(state: State<'_, AppState>) {
+    state.engine.dedup_start();
+}
+
+/// Snapshot of the dedup state machine: phase, the current stage's
+/// `done`/`total`, the last completed run's group count and the skipped
+/// (unreadable / cloud-placeholder) file count.
+#[tauri::command]
+pub fn dedup_state(state: State<'_, AppState>) -> DedupState {
+    state.engine.dedup_state()
+}
+
+/// One page `[offset, offset + limit)` of the last completed run's dupe
+/// groups, size-descending, members materialized as search-style hits.
+/// Files deleted since the run drop out; a group below two surviving
+/// members dissolves.
+#[tauri::command]
+pub fn dedup_groups(state: State<'_, AppState>, offset: u32, limit: u32) -> Vec<DupeGroup> {
+    state.engine.dedup_groups(offset, limit)
+}
+
+/// Moves the entries behind `ids` to the OS recycle bin — the engine's
+/// ONLY deletion path, never a permanent delete. Returns how many paths
+/// actually landed (dead ids and already-gone paths are skipped); errors
+/// carry the engine message verbatim.
+#[tauri::command]
+pub fn delete_to_trash(state: State<'_, AppState>, ids: Vec<i64>) -> Result<usize, String> {
+    state
+        .engine
+        .delete_to_trash(&ids)
+        .map_err(|err| err.to_string())
 }
