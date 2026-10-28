@@ -733,11 +733,69 @@ impl HotIndex {
 
     /// Byte length of [`HotIndex::path_of`] for `slot` without building
     /// the string — the ranking pass needs it for every match.
+    #[inline]
     pub fn path_len(&self, slot: usize) -> u64 {
         let mut len = self.names_orig[slot].len() as u64;
         self.walk_chain(slot, |name| len += name.len() as u64 + 1); // + separator
         len
     }
+
+    /// [`HotIndex::path_len`], amortized across one ranking pass by a
+    /// per-dir memo (`query.rs` builds ONE map per pass and threads it
+    /// through every slot): the first slot under a given dir pays the
+    /// ancestor walk, every later slot under the same dir is a single hash
+    /// hit. At 1M matches the per-match chain walk is a measurable budget
+    /// line; per-DIR memoization (not per-slot) keeps the map small —
+    /// a scan-root tree holds orders of magnitude fewer dirs than slots.
+    /// The memo is never reused across passes (a wholesale reload or
+    /// watcher batch can swap dir rows between passes).
+    #[inline]
+    pub(crate) fn path_len_memo(&self, memo: &mut HashMap<FileId, u64>, slot: usize) -> u64 {
+        self.names_orig[slot].len() as u64 + self.dir_chain_bytes(memo, self.parents[slot])
+    }
+
+    /// Total byte length of dir `id`'s reconstructed path — its own name
+    /// plus every PRESENT ancestor plus one separator each, i.e. exactly
+    /// what [`HotIndex::walk_chain`] would add for a slot whose containing
+    /// dir is `id` — computed through `memo` so each dir's chain is walked
+    /// at most once per pass. A missing ancestor row ends the chain where
+    /// [`HotIndex::walk_chain`] stops; a step budget guards against a
+    /// corrupt parent cycle, same as the shared chain walk.
+    fn dir_chain_bytes(&self, memo: &mut HashMap<FileId, u64>, dir: FileId) -> u64 {
+        let mut chain: Vec<FileId> = Vec::new();
+        let mut current = dir;
+        // The chain length the fill starts from: a memo hit (an ancestor
+        // already resolved this pass), 0 for a missing row (the chain
+        // contributes nothing past it), None for a root (fill from 0).
+        let mut seed = None;
+        let mut budget = self.dirs.len() + 1;
+        loop {
+            if let Some(len) = memo.get(&current) {
+                seed = Some(*len);
+                break;
+            }
+            let Some(entry) = self.dirs.get(&current) else {
+                seed = Some(0);
+                break;
+            };
+            chain.push(current);
+            budget -= 1;
+            match entry.parent {
+                Some(parent) if budget > 0 => current = parent,
+                // Root of the chain — or a budget-exhausted (cycled) one,
+                // which terminates the same way walk_chain's budget does.
+                _ => break,
+            }
+        }
+        let mut acc = seed.unwrap_or(0);
+        for id in chain.iter().rev() {
+            let entry = &self.dirs[id];
+            acc += entry.name.len() as u64 + 1;
+            memo.insert(*id, acc);
+        }
+        acc
+    }
+
 
     /// Shared chain walk: `visit(dir_name)` for every dir from `slot`'s
     /// parent up to the root, stopping at a missing row, at a root, or

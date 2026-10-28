@@ -26,7 +26,7 @@
 //! materialization per filter survivor — see `passes_filters`).
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::MAIN_SEPARATOR;
 
 use crate::hotindex::HotIndex;
@@ -396,6 +396,10 @@ fn match_slots(
     let page_len = page_len(offset, limit);
     let mut total = 0u64;
     let mut top: Vec<Scored> = Vec::new();
+    // One per-dir path-length memo for the whole pass (see
+    // `HotIndex::path_len_memo`): matches under the same dir pay the
+    // ancestor walk once.
+    let mut path_lens: HashMap<FileId, u64> = HashMap::new();
     for slot in 0..hot.slot_count() {
         if !passes_filters(hot, q, ext_id, coll_members, path_needle, slot) {
             continue;
@@ -407,7 +411,7 @@ fn match_slots(
         insert_top_k(&mut top, page_len, Scored {
             class,
             recent: hot.mtime(slot) >= now - RECENCY_WINDOW_SECS,
-            path_len: hot.path_len(slot),
+            path_len: hot.path_len_memo(&mut path_lens, slot),
             slot,
         }, |a, b| cmp_scored(hot, a, b));
     }
@@ -506,6 +510,7 @@ fn recent_slots(
     let page_len = page_len(offset, limit);
     let mut total = 0u64;
     let mut top: Vec<Recent> = Vec::new();
+    let mut path_lens: HashMap<FileId, u64> = HashMap::new();
     for slot in 0..hot.slot_count() {
         if !passes_filters(hot, q, ext_id, coll_members, path_needle, slot) {
             continue;
@@ -513,7 +518,7 @@ fn recent_slots(
         total += 1;
         insert_top_k(&mut top, page_len, Recent {
             mtime: hot.mtime(slot),
-            path_len: hot.path_len(slot),
+            path_len: hot.path_len_memo(&mut path_lens, slot),
             slot,
         }, |a, b| {
             b.mtime
