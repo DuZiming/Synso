@@ -15,6 +15,14 @@
 //! [`HotIndex::interned_bytes`] sums the bytes those arenas hold (plus
 //! dir names) so the memory budget test (Task 20) has a concrete number
 //! to assert against.
+//!
+//! Visibility split (Task 20 facade audit): the type re-exports publicly
+//! for readers (search/harness embedders), but every WRITE path —
+//! [`HotIndex::upsert_slot`], [`HotIndex::remove_by_dir_name`] and the
+//! store-backed [`HotIndex::load`] — stays `pub(crate)`: the engine owns
+//! index mutation (scan reload / watcher batches / trash), and the
+//! locked facade must not hand embedders write access to it. The public
+//! constructors build STANDALONE indexes only.
 
 use std::collections::{HashMap, HashSet};
 use std::path::MAIN_SEPARATOR;
@@ -333,7 +341,7 @@ impl HotIndex {
     /// Loads the full `dirs`, `extensions` and `files` tables from `store`
     /// into a fresh, warm index. Whole-table read by design (see module
     /// docs).
-    pub fn load(store: &Store) -> Result<HotIndex> {
+    pub(crate) fn load(store: &Store) -> Result<HotIndex> {
         let mut index = HotIndex {
             warm: true,
             ..HotIndex::default()
@@ -387,7 +395,7 @@ impl HotIndex {
     /// holds one, or appends a new slot otherwise. Store errors abort this
     /// row's hot update (logged by the caller); the store itself stays
     /// authoritative and the next wholesale reload resyncs.
-    pub fn upsert_slot(&mut self, store: &Store, rec: &FileRecord) -> Result<()> {
+    pub(crate) fn upsert_slot(&mut self, store: &Store, rec: &FileRecord) -> Result<()> {
         // Ancestor chain first, so the new/updated slot's paths resolve.
         for (id, parent, name) in store.dir_ancestors(rec.parent)? {
             if !self.dirs.contains_key(&id) {
@@ -456,7 +464,7 @@ impl HotIndex {
     /// `dir_tree_len` and `interned_bytes` stay honest. Returns the removed
     /// row id, or `None` when nothing matched (a normal outcome: the row
     /// may never have been indexed).
-    pub fn remove_by_dir_name(&mut self, segments: &[&str], name: &str) -> Option<FileId> {
+    pub(crate) fn remove_by_dir_name(&mut self, segments: &[&str], name: &str) -> Option<FileId> {
         let parent_id = self.resolve_dir(segments)?;
         let removed = self.remove_slot(parent_id, name);
         let mut with_name: Vec<&str> = segments.to_vec();

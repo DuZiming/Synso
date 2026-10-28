@@ -389,10 +389,12 @@ fn perf_obs_churn_search_latency() {
     report_churn_phase("baseline", &baseline);
     report_churn_phase("churn", &churn);
     // No latency assert: this test OBSERVES lock contention and reports.
-    // The settle pause lets the OS's on-access scanning of the ~8000
-    // churned files drain before the next test in this binary starts
-    // timing (observed: without it, the search test that follows in a
-    // combined run can catch the drain and flake over budget).
+    // Settle before yielding the process: the OS's on-access scanning of
+    // the ~8000 churned files drains for a while after the last burst, and
+    // the alphabetically-next test in this binary (perf_scan_throughput_100k)
+    // owns a hard throughput assert that the drain can break. Observed as a
+    // one-off flake before this sleep existed.
+    thread::sleep(Duration::from_secs(2));
 }
 
 /// Like [`sample_engine`], but bounded by wall time instead of rounds.
