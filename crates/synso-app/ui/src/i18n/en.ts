@@ -45,7 +45,6 @@ const en = {
   },
   dedup: {
     start: "Start analysis",
-    boost: "Boost",
     rerun: "Re-analyze",
     phase: {
       idle: "Not analyzed yet",

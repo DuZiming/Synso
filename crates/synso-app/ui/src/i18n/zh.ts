@@ -46,7 +46,6 @@ const zh: Dict = {
   },
   dedup: {
     start: "启动分析",
-    boost: "加速",
     rerun: "重新分析",
     phase: {
       idle: "尚未分析",

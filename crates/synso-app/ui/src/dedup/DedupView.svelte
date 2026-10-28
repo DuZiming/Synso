@@ -284,10 +284,6 @@
       >
         {phase === "idle" ? $t("dedup.start") : $t("dedup.rerun")}
       </button>
-    {:else}
-      <button class="ghost" onclick={startAnalysis} disabled={starting}>
-        {$t("dedup.boost")}
-      </button>
     {/if}
   </header>
 

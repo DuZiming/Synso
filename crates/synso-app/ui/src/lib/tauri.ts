@@ -78,8 +78,9 @@ export function quickInfo(): Promise<QuickInfo> {
 
 // ------------------ Task 16: dedup dashboard -----------------------------
 
-/** Starts a dedup run (a no-op while one is already going). The view's
- * 加速 button calls this too: persisted hashes speed up later runs. */
+/** Starts a dedup run (a no-op while one is already going). The real
+ * "boost" is calling this NOW instead of waiting for the engine's 30s
+ * post-scan auto-start; persisted hashes speed up later runs. */
 export function dedupStart(): Promise<void> {
   return invoke("dedup_start");
 }

@@ -128,8 +128,9 @@ pub fn quick_info(state: State<'_, quick::QuickState>) -> quick::QuickInfo {
 /// Starts a dedup run (or, while one is already going, is a harmless
 /// no-op — the engine keeps exactly one run at a time). Progress arrives
 /// as the `dedup-progress` / `dedup-finished` events (see `events.rs`).
-/// Calling this is also the view's 加速 button: persisted hashes make
-/// every later run skip I/O on already-hashed files.
+/// The view's real "boost" semantic is calling this NOW instead of
+/// waiting for the engine's 30s post-scan auto-start; persisted hashes
+/// make every later run skip I/O on already-hashed files.
 #[tauri::command]
 pub fn dedup_start(state: State<'_, AppState>) {
     state.engine.dedup_start();
