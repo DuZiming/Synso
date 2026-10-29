@@ -313,8 +313,13 @@ pub async fn size_tree(
     root: String,
     depth: u8,
     max_children: u8,
+    include_files: bool,
 ) -> Result<Option<SizeNode>, String> {
-    Ok(state.engine.size_tree(&root, depth, max_children))
+    Ok(if include_files {
+        state.engine.size_tree(&root, depth, max_children)
+    } else {
+        state.engine.size_tree_dirs(&root, depth, max_children)
+    })
 }
 
 /// Reveals an INDEX path (the `Hit::path` spelling — flame-chart nodes

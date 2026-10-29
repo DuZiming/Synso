@@ -224,7 +224,22 @@ fn resolve_root(hot: &HotIndex, root: &str) -> Option<RootTarget> {
 /// stays a complete partition of its parent (no bytes silently lost).
 pub fn build_tree(hot: &HotIndex, root: &str, depth: u8, max_children: u8) -> Option<SizeNode> {
     let mut remaining = MAX_TREE_NODES;
-    build_tree_with_budget(hot, root, depth, max_children, &mut remaining)
+    build_tree_with_budget(hot, root, depth, max_children, true, &mut remaining)
+}
+
+/// Dir-only variant for the flame chart (user requirement: files are not
+/// drawn): file children are skipped entirely — their bytes still count
+/// in every dir's aggregate, so the gap between a dir's block and its
+/// children's combined width IS that dir's direct-file share (the source
+/// of the "mountain" taper).
+pub fn build_tree_dirs(
+    hot: &HotIndex,
+    root: &str,
+    depth: u8,
+    max_children: u8,
+) -> Option<SizeNode> {
+    let mut remaining = MAX_TREE_NODES;
+    build_tree_with_budget(hot, root, depth, max_children, false, &mut remaining)
 }
 
 /// Hard cap on nodes materialized per `size_tree` call. A real-disk root
@@ -238,6 +253,7 @@ fn build_tree_with_budget(
     root: &str,
     depth: u8,
     max_children: u8,
+    include_files: bool,
     remaining: &mut usize,
 ) -> Option<SizeNode> {
     match resolve_root(hot, root)? {
@@ -255,7 +271,16 @@ fn build_tree_with_budget(
                 name: "(all)".to_string(),
                 size,
                 file_count,
-                children: child_nodes(hot, &aggregates, None, "", depth, max_children, remaining),
+                children: child_nodes(
+                    hot,
+                    &aggregates,
+                    None,
+                    "",
+                    depth,
+                    max_children,
+                    include_files,
+                    remaining,
+                ),
             })
         }
         RootTarget::Dir(id) => {
@@ -272,6 +297,7 @@ fn build_tree_with_budget(
                 path,
                 depth,
                 max_children,
+                include_files,
                 remaining,
             ))
         }
@@ -296,6 +322,7 @@ fn dir_node(
     path: String,
     levels: u8,
     max_children: u8,
+    include_files: bool,
     remaining: &mut usize,
 ) -> SizeNode {
     let agg = aggregates.per_dir.get(&id).copied().unwrap_or_default();
@@ -306,6 +333,7 @@ fn dir_node(
         &path,
         levels,
         max_children,
+        include_files,
         remaining,
     );
     SizeNode {
@@ -347,6 +375,7 @@ fn child_nodes(
     parent_path: &str,
     levels: u8,
     max_children: u8,
+    include_files: bool,
     remaining: &mut usize,
 ) -> Vec<SizeNode> {
     if levels == 0 || max_children == 0 {
@@ -378,13 +407,18 @@ fn child_nodes(
             kind: ChildKind::Dir(child),
         });
     }
-    for &slot in file_slots {
-        entries.push(ChildEntry {
-            name: hot.name_original(slot).to_string(),
-            size: hot.size(slot),
-            file_count: 1,
-            kind: ChildKind::File(slot),
-        });
+    // Dir-only mode (flame chart) simply never materializes file leaves;
+    // their bytes remain inside every dir aggregate, which is what leaves
+    // the visible taper between a dir and its children.
+    if include_files {
+        for &slot in file_slots {
+            entries.push(ChildEntry {
+                name: hot.name_original(slot).to_string(),
+                size: hot.size(slot),
+                file_count: 1,
+                kind: ChildKind::File(slot),
+            });
+        }
     }
     // A total order — same-parent entries cannot share a name — so the
     // sort is deterministic despite being unstable.
@@ -410,6 +444,7 @@ fn child_nodes(
             parent_path,
             levels - 1,
             max_children,
+            include_files,
             remaining,
         ));
     }
@@ -439,6 +474,7 @@ fn child_node(
     parent_path: &str,
     levels: u8,
     max_children: u8,
+    include_files: bool,
     remaining: &mut usize,
 ) -> SizeNode {
     let path = child_path(parent_path, &entry.name);
@@ -453,6 +489,7 @@ fn child_node(
                 path,
                 levels,
                 max_children,
+                include_files,
                 remaining,
             )
         }
@@ -493,7 +530,8 @@ mod tests {
         let hot = HotIndex::synthetic(60);
         // Exhaust almost immediately — far fewer slots than the corpus.
         let mut remaining = 5usize;
-        let tree = build_tree_with_budget(&hot, "", 30, 40, &mut remaining).expect("virtual root");
+        let tree =
+            build_tree_with_budget(&hot, "", 30, 40, true, &mut remaining).expect("virtual root");
         assert_eq!(remaining, 0, "budget must be fully consumed");
         // Partition invariant survives exhaustion: children (subtrees +
         // "(other)") still sum exactly to the parent.
@@ -510,7 +548,7 @@ mod tests {
     fn partition_invariant_holds_without_budget_pressure() {
         let hot = HotIndex::synthetic(60);
         let mut remaining = usize::MAX;
-        let tree = build_tree_with_budget(&hot, "", 30, 40, &mut remaining).expect("root");
+        let tree = build_tree_with_budget(&hot, "", 30, 40, true, &mut remaining).expect("root");
         let (s, c) = subtree_sum(&tree);
         assert_eq!((tree.size, tree.file_count), (s, c));
     }

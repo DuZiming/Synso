@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use std::collections::HashMap;
+
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::model::{FileId, FileRecord};
@@ -51,7 +53,19 @@ pub struct HashUpdate {
 /// Persistent index store over a single SQLite database file.
 pub struct Store {
     conn: Connection,
+    /// Hash cache filled by a rescan's purge step (`snapshot_subtree_hashes`):
+    /// full path -> (mtime, size, hash_first, hash_full) of the row that is
+    /// about to be deleted. The rebuild's inserts consult it so an
+    /// unchanged file (mtime AND size equal) is re-inserted WITH its
+    /// persisted hashes instead of losing them to the purge — the
+    /// "mtime unchanged → never recompute" rule across rescans. Cleared
+    /// when the scan finishes (`clear_rescan_hash_cache`).
+    rescan_hashes: HashMap<String, (i64, i64, Option<u64>, Option<u64>)>,
 }
+
+/// The rescan hash cache's value shape: (mtime, size, hash_first,
+/// hash_full), size stored as the same signed cast the columns use.
+pub(crate) type HashCacheEntry = (i64, i64, Option<u64>, Option<u64>);
 
 impl Store {
     /// Opens (creating if needed) the database at `path` and brings its
@@ -64,7 +78,10 @@ impl Store {
         // immediate SQLITE_BUSY error.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         migrate(&mut conn)?;
-        Ok(Store { conn })
+        Ok(Store {
+            conn,
+            rescan_hashes: HashMap::new(),
+        })
     }
 
     /// Inserts `rec` under the directory built from `dir_path` segments
@@ -74,7 +91,102 @@ impl Store {
     /// `rec.py_init` hold the pinyin keys computed here from the name —
     /// the single choke point, so callers never pass pinyin in.
     pub fn upsert_file(&mut self, dir_path: &[&str], rec: &mut FileRecord) -> Result<()> {
-        upsert_file_on(&self.conn, dir_path, rec)
+        upsert_file_on(&self.conn, &self.rescan_hashes, dir_path, rec)
+    }
+
+    /// Read-only view of the rescan hash cache for the scanner's
+    /// transactional batch path (`upsert_file_on` on a `Transaction`).
+    pub(crate) fn rescan_hashes(&self) -> &HashMap<String, HashCacheEntry> {
+        &self.rescan_hashes
+    }
+
+    /// Takes the rescan hash cache out (empty map back), for the scanner's
+    /// transaction path: `conn_mut()`'s mutable borrow and a shared
+    /// `rescan_hashes()` read cannot coexist, so the batch TAKES the map,
+    /// uses it for the transaction, and restores it via
+    /// [`restore_rescan_hashes`] when done (every path restores).
+    pub(crate) fn take_rescan_hashes(&mut self) -> HashMap<String, HashCacheEntry> {
+        std::mem::take(&mut self.rescan_hashes)
+    }
+
+    /// Puts a taken cache back ([`take_rescan_hashes`]).
+    pub(crate) fn restore_rescan_hashes(&mut self, map: HashMap<String, HashCacheEntry>) {
+        self.rescan_hashes = map;
+    }
+
+    /// Snapshots the persisted hashes of every file row under `dir_path`
+    /// into the rescan cache, so the purge+reinsert that follows can
+    /// restore them for unchanged files. Call immediately BEFORE
+    /// `delete_subtree` for the same path.
+    pub fn snapshot_subtree_hashes(&mut self, dir_path: &[&str]) -> Result<usize> {
+        let Some(root_id) = find_dir(&self.conn, dir_path)? else {
+            return Ok(0);
+        };
+        // Dir rows: parent/name maps for chain walks (cycle-budgeted like
+        // every other parent walk in the crate).
+        let dirs = self.all_dirs()?;
+        let mut parent_of: HashMap<FileId, Option<FileId>> = HashMap::new();
+        let mut name_of: HashMap<FileId, String> = HashMap::new();
+        for (id, parent, name) in &dirs {
+            parent_of.insert(*id, *parent);
+            name_of.insert(*id, name.clone());
+        }
+
+        // Full path per dir in the root's subtree (root-exclusive: the
+        // caller passes the ROOT's segments, so the root's own path is
+        // dir_path itself and descendants extend it).
+        let mut path_of: HashMap<FileId, String> = HashMap::new();
+        let root_prefix = dir_path.join(&std::path::MAIN_SEPARATOR.to_string());
+        for &(id, _, _) in &dirs {
+            let mut segs: Vec<&str> = Vec::new();
+            let mut cur = Some(id);
+            let mut walks = dirs.len() + 1;
+            let mut under_root = false;
+            while let Some(cid) = cur {
+                if walks == 0 {
+                    break; // corrupt parent cycle guard
+                }
+                walks -= 1;
+                if cid == root_id {
+                    under_root = true;
+                    break;
+                }
+                if let Some(n) = name_of.get(&cid) {
+                    segs.push(n);
+                }
+                cur = parent_of.get(&cid).copied().flatten();
+            }
+            if !under_root {
+                continue;
+            }
+            segs.reverse();
+            let mut full = root_prefix.clone();
+            for s in segs {
+                full.push(std::path::MAIN_SEPARATOR);
+                full.push_str(s);
+            }
+            path_of.insert(id, full);
+        }
+
+        let mut count = 0usize;
+        for rec in self.all_files()? {
+            if let Some(dir_path_str) = path_of.get(&rec.parent) {
+                let key = format!("{dir_path_str}{}{}", std::path::MAIN_SEPARATOR, rec.name);
+                self.rescan_hashes.insert(
+                    key,
+                    (rec.mtime, rec.size as i64, rec.hash_first, rec.hash_full),
+                );
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Drops the rescan hash cache. The engine calls this when a scan
+    /// finishes (success or failure) so the transient snapshot does not
+    /// pin memory between scans.
+    pub fn clear_rescan_hash_cache(&mut self) {
+        self.rescan_hashes.clear();
     }
 
     /// Deletes the `files` row `id`; `Err(NotFound)` if it does not exist.
@@ -369,14 +481,39 @@ fn backfill_pinyin_keys(conn: &Connection) -> Result<()> {
 /// flush is the transactional caller.
 pub(crate) fn upsert_file_on(
     conn: &Connection,
+    rescan_hashes: &HashMap<String, HashCacheEntry>,
     dir_path: &[&str],
     rec: &mut FileRecord,
 ) -> Result<()> {
     let dir_id = resolve_dir(conn, dir_path)?;
     let ext_id = intern_extension(conn, &rec.name)?;
     let (py_full, py_init) = pinyin_keys(&rec.name);
+    // Rescan cache hit: this exact path existed before the purge with the
+    // same mtime AND size — the file is unchanged, so its persisted hashes
+    // ride along into the fresh insert (they arrive via rec below, making
+    // the conflict arm's CASE a no-op keep). A miss or a mismatch leaves
+    // the hashes None, which is the correct "unknown, recompute" state.
+    if rec.hash_first.is_none() {
+        let key = format!(
+            "{}{}{}",
+            dir_path.join(&std::path::MAIN_SEPARATOR.to_string()),
+            std::path::MAIN_SEPARATOR,
+            rec.name
+        );
+        if let Some(&(mtime, size, hash_first, hash_full)) = rescan_hashes.get(&key) {
+            if mtime == rec.mtime && size == rec.size as i64 {
+                rec.hash_first = hash_first;
+                rec.hash_full = hash_full;
+            }
+        }
+    }
     // u64 columns (size, hashes) are stored as SQLite's signed 64-bit
     // integers via a bit-preserving cast.
+    // Hash-cache rule in the conflict arm below (user requirement: mtime
+    // unchanged means never recompute): an unchanged file (mtime AND size
+    // match the row being replaced) keeps its persisted hashes across
+    // rescans; any change invalidates them to NULL. See the comment above
+    // `update_file_hashes` for the same-second residual.
     let id: FileId = conn.query_row(
         "INSERT INTO files(dir, name, size, mtime, ctime, atime, ext_id, is_dir, hash_first, hash_full, py_full, py_init)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
@@ -387,8 +524,12 @@ pub(crate) fn upsert_file_on(
            atime = excluded.atime,
            ext_id = excluded.ext_id,
            is_dir = excluded.is_dir,
-           hash_first = excluded.hash_first,
-           hash_full = excluded.hash_full,
+           hash_first = CASE
+             WHEN files.mtime = excluded.mtime AND files.size = excluded.size
+             THEN files.hash_first ELSE NULL END,
+           hash_full = CASE
+             WHEN files.mtime = excluded.mtime AND files.size = excluded.size
+             THEN files.hash_full ELSE NULL END,
            py_full = excluded.py_full,
            py_init = excluded.py_init
          RETURNING id",
@@ -614,7 +755,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(size, 2048, "size must be updated");
-        assert_eq!(hash_first, Some(0x00ff_00ff_u64 as i64));
+        // Hash-cache rule: the re-upsert carries the same mtime but a
+        // DIFFERENT size — the file changed, so the stale hash must be
+        // dropped (the engine re-hashes on the next dedup run).
+        assert_eq!(hash_first, None, "size changed: stale hash must be dropped");
         assert_eq!(hash_full, None);
 
         // dir_path segments resolved as a -> b with correct parent links.

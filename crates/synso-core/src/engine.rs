@@ -55,7 +55,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
@@ -71,11 +71,6 @@ use crate::store::Store;
 use crate::trash;
 use crate::watcher::{self, Watcher};
 use crate::Result;
-
-/// Delay between the first successful `ScanFinished` and the engine's
-/// automatic dedup kick-off (the design's "idle-time start"; the dedup
-/// view calls `dedup_start()` to run it right now instead).
-const DEDUP_AUTOSTART_DELAY: Duration = Duration::from_secs(30);
 
 /// What the engine scans and what it skips. Empty `volumes` means "all
 /// fixed local volumes" (`crate::volumes::fixed_volumes`); `exclusions`
@@ -174,9 +169,6 @@ pub struct Engine {
     /// Dedup state machine + worker plumbing (Task 9). Threads and the
     /// auto-start timer own `Arc`s of this, never of the engine.
     dedup: Arc<DedupShared>,
-    /// Set on the first successful `ScanFinished` so the automatic dedup
-    /// kick-off happens exactly once per engine.
-    dedup_autostarted: Arc<AtomicBool>,
 }
 
 /// State shared between the engine, the dedup worker thread and the
@@ -237,7 +229,6 @@ impl Engine {
             db_path: db_path.to_path_buf(),
             watcher: Mutex::new(None),
             dedup,
-            dedup_autostarted: Arc::new(AtomicBool::new(false)),
         };
         if let Err(err) = thread::Builder::new()
             .name("synso-hot-load".into())
@@ -283,8 +274,7 @@ impl Engine {
             // mid-scan takes effect on the next scan, not this one.
             let opts = lock_unpoisoned(&self.scan_opts).clone();
             let dedup = Arc::clone(&self.dedup);
-            let autostarted = Arc::clone(&self.dedup_autostarted);
-            move || scan_cycle(store, hot, subscribers, scanning, opts, dedup, autostarted)
+            move || scan_cycle(store, hot, subscribers, scanning, opts, dedup)
         });
         if let Err(err) = spawn {
             log::error!("synso: failed to spawn the scan thread: {err}");
@@ -632,6 +622,14 @@ impl Engine {
         sizeagg::build_tree(&hot, root, depth, max_children)
     }
 
+    /// Dir-only `size_tree` for the flame chart: file leaves are never
+    /// materialized (their bytes still shape every dir's aggregate, which
+    /// is the taper the chart draws).
+    pub fn size_tree_dirs(&self, root: &str, depth: u8, max_children: u8) -> Option<SizeNode> {
+        let hot = read_unpoisoned(&self.hot);
+        sizeagg::build_tree_dirs(&hot, root, depth, max_children)
+    }
+
     /// Removes one member row (alive or tombstoned) from a collection.
     pub fn coll_remove(&self, id: i64, member: FileId) -> Result<()> {
         collections::remove(&mut lock_unpoisoned(&self.store), id, member)
@@ -819,9 +817,9 @@ impl Drop for SlotGuard<'_> {
 
 /// One full scan cycle on its own thread: purge each root's subtree, walk,
 /// reload the hot index, broadcast the outcome. The scan slot is released
-/// by [`SlotGuard`] on every exit path, panic included. On success this is
-/// ALSO where the engine's one-time automatic dedup kick-off is scheduled
-/// (30s later, see [`DEDUP_AUTOSTART_DELAY`]).
+/// by [`SlotGuard`] on every exit path, panic included. Dedup is
+/// MANUAL-only (user requirement): scans never kick off hashing — the
+/// dedup view's 启动分析 button is the only trigger.
 #[allow(clippy::too_many_arguments)]
 fn scan_cycle(
     store: Arc<Mutex<Store>>,
@@ -829,17 +827,19 @@ fn scan_cycle(
     subscribers: Arc<Mutex<Vec<Sender<EngineEvent>>>>,
     scanning: Arc<AtomicBool>,
     opts: ScanOptions,
-    dedup: Arc<DedupShared>,
-    autostarted: Arc<AtomicBool>,
+    _dedup: Arc<DedupShared>,
 ) {
     let _slot = SlotGuard(&scanning);
     let outcome = {
         let mut guard = lock_unpoisoned(&store);
         purge_root_subtrees(&mut guard, &opts);
-        scanner::scan(&mut guard, &opts, &|done| {
+        let scanned = scanner::scan(&mut guard, &opts, &|done| {
             broadcast(&subscribers, EngineEvent::ScanProgress { done, total: 0 });
-        })
-        .map(|stats| {
+        });
+        // The rescan hash snapshot lived only for the walk — drop it so it
+        // does not pin memory between scans (success and failure alike).
+        guard.clear_rescan_hash_cache();
+        scanned.map(|stats| {
             // Success only: swap in the fresh snapshot while still holding
             // the store lock (see module docs), so subscribers reacting to
             // ScanFinished already see fresh stats. On failure the hot
@@ -859,22 +859,6 @@ fn scan_cycle(
     match outcome {
         Ok((files, dirs)) => {
             broadcast(&subscribers, EngineEvent::ScanFinished { files, dirs });
-            // Auto-start (Task 9): exactly one run, 30s after the FIRST
-            // successful scan. The timer holds only a `Weak` to the dedup
-            // state — an engine dropped meanwhile cancels the kick-off (the
-            // upgrade fails) instead of hashing behind the app's back. A
-            // spawn failure just loses this best-effort kick-off.
-            if !autostarted.swap(true, Ordering::AcqRel) {
-                let dedup = Arc::downgrade(&dedup);
-                let _ = thread::Builder::new()
-                    .name("synso-dedup-autostart".into())
-                    .spawn(move || {
-                        thread::sleep(DEDUP_AUTOSTART_DELAY);
-                        if let Some(dedup) = dedup.upgrade() {
-                            launch_dedup(&dedup);
-                        }
-                    });
-            }
         }
         // The failure description travels in the event (no ScanFinished is
         // emitted); nothing else to do — the store stays partial until the
@@ -979,9 +963,15 @@ fn dedup_cycle(dedup: Arc<DedupShared>) {
 /// from the scanner's own `root_segment`; roots must be non-overlapping
 /// (see its docs). Purging every root up front still satisfies "purged
 /// before walking that root" for each root, since nothing is walked yet.
+/// Each purge first snapshots the subtree's persisted hashes into the
+/// store's rescan cache so unchanged files keep them through the rebuild
+/// (user requirement: mtime unchanged — never recompute).
 fn purge_root_subtrees(store: &mut Store, opts: &ScanOptions) {
     for root in effective_roots(&opts.roots) {
         let segment = root_segment(Path::new(&root));
+        if let Err(err) = store.snapshot_subtree_hashes(&[segment.as_str()]) {
+            log::warn!("synso: hash snapshot for {root:?} failed: {err}");
+        }
         if let Err(err) = store.delete_subtree(&[segment.as_str()]) {
             log::error!("synso: failed to purge the index subtree of {root:?}: {err}");
         }
@@ -1688,6 +1678,114 @@ mod tests {
             (0, 0),
             "done does not grow: already-hashed files are skipped"
         );
+    }
+
+    /// User requirement: dedup is manual-only — a completed scan must NOT
+    /// kick off hashing. Give the (removed) 30s autostart an order of
+    /// magnitude less than its old delay and assert nothing ran.
+    #[test]
+    fn scan_does_not_autostart_dedup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"x").unwrap();
+        fs::write(root.join("b.txt"), b"x").unwrap();
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            engine.dedup_state().phase,
+            DedupPhase::Idle,
+            "dedup must stay Idle after a scan — it is manual-trigger only"
+        );
+        // RecvTimeoutError::Timeout is the expected outcome; any event
+        // would be a DedupProgress we must not see.
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+    }
+
+    /// User requirement: "mtime unchanged → never recompute" across
+    /// RESCANS too — the upsert's conflict path preserves persisted hashes
+    /// for unchanged files (the purge+reinsert of a rescan used to wipe
+    /// them, forcing a full re-hash every time).
+    #[test]
+    fn rescan_preserves_hashes_of_unchanged_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("same1.bin"), b"hash cache me").unwrap();
+        fs::write(root.join("same2.bin"), b"hash cache me").unwrap();
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        engine.dedup_start();
+        let (groups, _) = wait_dedup_finished(&rx);
+        assert_eq!(groups, 1);
+        let first_done = engine.dedup_state().done;
+        assert!(first_done > 0);
+
+        // A rescan purges and re-inserts every row; unchanged files must
+        // keep their hashes through the upsert's COALESCE-style conflict.
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+        let store = Store::open(&db_path).unwrap();
+        for row in store.all_files().unwrap() {
+            assert!(
+                row.hash_full.is_some(),
+                "{} lost its hash in the rescan",
+                row.name
+            );
+        }
+
+        // And the next dedup run has nothing to hash.
+        engine.dedup_start();
+        let (groups2, _) = wait_dedup_finished(&rx);
+        assert_eq!(groups2, 1);
+        assert_eq!(
+            engine.dedup_state().done,
+            0,
+            "recompute skipped entirely after rescan"
+        );
+    }
+
+    /// The other half of the cache rule: a file that CHANGED (size/mtime)
+    /// loses its stale hash in the rescan and gets re-hashed.
+    #[test]
+    fn changed_file_invalidates_its_hash_on_rescan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("mutant.bin"), b"old content").unwrap();
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+        engine.dedup_start();
+        wait_dedup_finished(&rx);
+
+        // Grow the file, bump its mtime, rescan.
+        thread::sleep(Duration::from_millis(1100)); // mtime second granularity
+        fs::write(root.join("mutant.bin"), b"new longer content!").unwrap();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        let store = Store::open(&db_path).unwrap();
+        let row = store
+            .all_files()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.name == "mutant.bin")
+            .unwrap();
+        assert!(row.hash_full.is_none(), "changed file must drop its hash");
     }
 
     /// The absolute-path resolution the dedup hashing (and Task 10 trash /

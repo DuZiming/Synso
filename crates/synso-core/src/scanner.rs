@@ -375,13 +375,20 @@ fn flush_batch(store: &mut Store, batch: &mut Vec<(Vec<String>, FileRecord)>) ->
     if batch.is_empty() {
         return Ok(());
     }
-    let tx = store.conn_mut().transaction()?;
-    for (segments, mut rec) in batch.drain(..) {
-        let dir_path: Vec<&str> = segments.iter().map(String::as_str).collect();
-        crate::store::upsert_file_on(&tx, &dir_path, &mut rec)?;
-    }
-    tx.commit()?;
-    Ok(())
+    // The cache is TAKEN for the transaction (a shared read would clash
+    // with conn_mut's mutable borrow) and restored on every exit path.
+    let cache = store.take_rescan_hashes();
+    let result = (|| -> Result<()> {
+        let tx = store.conn_mut().transaction()?;
+        for (segments, mut rec) in batch.drain(..) {
+            let dir_path: Vec<&str> = segments.iter().map(String::as_str).collect();
+            crate::store::upsert_file_on(&tx, &cache, &dir_path, &mut rec)?;
+        }
+        tx.commit()?;
+        Ok(())
+    })();
+    store.restore_rescan_hashes(cache);
+    result
 }
 
 /// `opts.roots`, or the mount points of all fixed volumes when empty.

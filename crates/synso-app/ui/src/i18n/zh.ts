@@ -119,6 +119,8 @@ const zh: Dict = {
     depth: "层数",
     depthLess: "减少层数",
     depthMore: "增加层数",
+    noDirs: "此范围没有子目录",
+    resetZoom: "重置缩放",
     loading: "加载中…",
     missing: "路径不存在",
     loadFailed: "加载失败",

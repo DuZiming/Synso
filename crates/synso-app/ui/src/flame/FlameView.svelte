@@ -90,7 +90,7 @@
     pane.loading = true;
     pane.error = null;
     try {
-      const tree = await sizeTree(pane.root, depth, MAX_CHILDREN);
+      const tree = await sizeTree(pane.root, depth, MAX_CHILDREN, false);
       if (seq !== pane.seq) return; // a newer request superseded this one
       if (tree) {
         pane.tree = tree;
@@ -343,7 +343,11 @@
     flex-wrap: wrap;
     gap: 14px;
     margin-top: 14px;
-    align-items: flex-start;
+    align-items: stretch;
+    /* User requirement: the chart uses the remaining window height —
+       anchor the panes to the viewport instead of content height. */
+    height: calc(100vh - 240px);
+    min-height: 320px;
   }
 
   .pane {
@@ -352,6 +356,11 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
+  }
+
+  .pane > :global(.flame-wrap) {
+    flex: 1 1 auto;
+    min-height: 0;
   }
 
   .crumbs {

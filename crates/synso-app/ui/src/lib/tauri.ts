@@ -153,8 +153,14 @@ export function sizeTree(
   root: string,
   depth: number,
   maxChildren: number,
+  includeFiles: boolean,
 ): Promise<SizeNode | null> {
-  return invoke("size_tree", { root, depth, maxChildren });
+  return invoke("size_tree", {
+    root,
+    depth,
+    maxChildren,
+    includeFiles,
+  });
 }
 
 /** Reveals an INDEX path in the OS file manager (Explorer with the item

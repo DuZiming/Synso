@@ -126,6 +126,8 @@ const en = {
     depth: "Depth",
     depthLess: "Fewer layers",
     depthMore: "More layers",
+    noDirs: "No subdirectories in this scope",
+    resetZoom: "Reset zoom",
     loading: "Loading…",
     missing: "Path not found",
     loadFailed: "Failed to load",
