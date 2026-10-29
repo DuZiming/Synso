@@ -1,0 +1,100 @@
+# Synso CI (Task 21): three-platform matrix.
+#
+# - windows: the full gate (fmt / clippy / tests + svelte-check / i18n / vite)
+#   and, on a v* tag push, the NSIS installer bundle + artifact upload.
+# - cross-check: the engine must stay compilable on linux + macos (the app
+#   crate is Windows-first and is NOT covered here — its Tauri stack tracks
+#   a newer Rust floor, see crates/synso-app/Cargo.toml).
+# - msrv: the engine's declared 1.83 floor against the pinned dependency
+#   tree (--locked: the workspace pins the MSRV-raising transitive deps,
+#   see the comments in the root Cargo.toml).
+#
+# No paths-ignore: the repo is small, every change is worth a full run.
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Cancel superseded runs on PRs only; a tag build must never be cancelled.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  windows:
+    name: windows gate
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Frontend BEFORE cargo: tauri's generate_context! embeds ui/dist, so
+      # a fresh checkout without a built frontend fails to compile the app
+      # crate (the dist dir must exist at macro expansion).
+      - name: Install frontend deps
+        working-directory: crates/synso-app/ui
+        run: npm ci
+
+      - name: Frontend gates
+        working-directory: crates/synso-app
+        run: |
+          npm run check
+          npm run check:i18n
+          npm run build
+
+      - name: Rust gates
+        run: |
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
+      - name: Bundle NSIS installer (tag builds only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: crates/synso-app
+        run: npm run tauri build
+
+      - name: Upload NSIS installer
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: Synso-NSIS-${{ github.ref_name }}
+          path: target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  cross-check:
+    name: cross-check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # No apt packages needed: rusqlite uses the `bundled` feature (it
+      # compiles its own SQLite via the cc crate; gcc/clang are preinstalled
+      # on the runners) and the rest of the engine's linux-side dependency
+      # tree is pure Rust (verified against Cargo.lock: trash 5.1.1's linux
+      # deps are chrono/libc/urlencoding — no dbus; sysinfo needs only
+      # libc; nothing in the graph links openssl).
+      - name: cargo check (engine)
+        run: cargo check -p synso-core
+
+  msrv:
+    name: msrv 1.83 (engine)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install 1.83 toolchain
+        run: rustup toolchain install 1.83.0 --profile minimal --no-self-update
+
+      - name: cargo check on 1.83
+        run: cargo +1.83.0 check -p synso-core --all-targets --locked

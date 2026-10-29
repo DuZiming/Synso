@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/synso-core", "crates/synso-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+
+[workspace.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "2"
+crossbeam-channel = "0.5"
+# Pinned (`=`) where a newer release raised its MSRV above the workspace's
+# 1.83: globset 0.4.20 declares 1.88, junction 2.1.0 declares 1.85, and
+# tempfile 3.24+ pulls getrandom 0.4 (edition 2024, needs cargo 1.85).
+jwalk = "0.8.1"
+globset = "=0.4.15"
+# Logging facade only — a no-op unless the app installs a backend (Task 19
+# adds the file logger; this crate never pulls one in).
+log = "0.4"
+# Pinned: notify 8.2.1 raised its MSRV to 1.85 (> our 1.83); 8.2.0 declares
+# 1.77. Its transitive notify-types is locked to 2.0.0 for the same reason
+# (2.1.0 declares 1.85).
+notify = "=8.2.0"
+pinyin = "0.11"
+sysinfo = { version = "0.36", default-features = false, features = ["disk"] }
+# Pure-Rust, no_std, dependency-free xxHash (verified to build on 1.83).
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+windows = { version = "0.62", features = ["Win32_Storage_FileSystem"] }
+junction = "=2.0.0"
+tempfile = "=3.23.0"
+# Pinned (`=`): trash 5.2+ declares rust-version 1.85 (> the workspace's
+# 1.83); 5.1.1 declares none and compiles on 1.83 (its Windows backend rides
+# windows 0.56, a separate crate from our own windows 0.62 in Cargo's graph).
+trash = "=5.1.1"

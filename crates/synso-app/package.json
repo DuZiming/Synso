@@ -1,0 +1,13 @@
+{
+  "name": "synso-app",
+  "private": true,
+  "version": "0.1.0",
+  "description": "npm shell for the Synso Tauri app. Tauri CLI commands run from HERE (the CLI discovers tauri.conf.json downward); frontend sources and node_modules live in ui/.",
+  "scripts": {
+    "tauri": "node ui/node_modules/@tauri-apps/cli/tauri.js",
+    "dev": "npm --prefix ui run dev",
+    "build": "npm --prefix ui run build",
+    "check": "npm --prefix ui run check",
+    "check:i18n": "npm --prefix ui run check:i18n"
+  }
+}
