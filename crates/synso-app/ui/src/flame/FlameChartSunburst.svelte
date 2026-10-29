@@ -117,8 +117,17 @@
         });
         resizeObserver.observe(el);
       }
-      const data = toSun(root, root.size, []);
-      decorate(data, 0);
+      // The virtual "(all)" root names no real directory and adds a
+      // useless full-circle base ring — promote the scan roots straight
+      // to the top level instead (each root gets its share of the ring).
+      const promote =
+        root.name === "(all)" && root.children.length > 0;
+      const roots = promote
+        ? root.children.map((c) => toSun(c, root.size, []))
+        : [toSun(root, root.size, [])];
+      for (const r of roots) {
+        decorate(r, 0);
+      }
       chart.setOption(
         {
           backgroundColor: "transparent",
@@ -141,7 +150,7 @@
               type: "sunburst",
               // series.data is an ARRAY of roots — a bare object renders
               // as a single childless disc (the blank-cake bug).
-              data: [data],
+              data: roots,
               radius: ["6%", "94%"],
               nodeClick: false, // we drill via our own click handler
               // No labels (user preference): on a radial map they rotate

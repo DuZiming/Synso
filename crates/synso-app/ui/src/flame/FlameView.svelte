@@ -296,9 +296,10 @@
             <aside class="path-panel" aria-label={$t("flame.pathPanel")}>
               {#if pane.hoverChain && pane.hoverChain.length > 0}
                 <h3>{$t("flame.pathPanel")}</h3>
+                <!-- Hovered first, then each parent up to the root. -->
                 <ol>
-                  {#each pane.hoverChain as level, i (i)}
-                    <li class:current={i === pane.hoverChain.length - 1}>
+                  {#each [...pane.hoverChain].reverse() as level, i (i)}
+                    <li class:current={i === 0}>
                       <span class="lvl-name" title={level.name}>{level.name}</span>
                       <span class="lvl-size">{humanBytes(level.size)}</span>
                     </li>
