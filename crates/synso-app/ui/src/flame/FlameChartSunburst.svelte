@@ -24,10 +24,14 @@
     onDrill: (path: string) => void;
     onReveal: (path: string) => void;
     onAddToCollection: (path: string) => void;
-    /// Hover reporting for the parent's right-side path panel: the full
-    /// root-first chain of the hovered block (null on leave). The chart's
-    /// rendering options are untouched by this — pure event tap.
-    onHover?: (chain: { name: string; size: number }[] | null) => void;
+    /// Hover reporting for the parent's side panels: the hovered block's
+    /// root-first chain (right panel) and its subdirectories sorted by
+    /// size desc (left panel). Null on leave. The chart's rendering
+    /// options are untouched by this — pure event tap.
+    onHover?: (info: {
+      chain: { name: string; size: number }[];
+      children: { name: string; size: number }[];
+    } | null) => void;
   } = $props();
 
   interface SunDatum {
@@ -107,7 +111,19 @@
         });
         chart.on("mouseover", (params) => {
           const datum = params.data as SunDatum | undefined;
-          onHover?.(datum?.chain ?? null);
+          if (!datum) {
+            onHover?.(null);
+            return;
+          }
+          // Children arrive engine-sorted (size desc); sort again so the
+          // promoted-roots path is covered too.
+          const children = [...(datum.children ?? [])].sort(
+            (a, b) => b.value - a.value,
+          );
+          onHover?.({
+            chain: datum.chain,
+            children: children.map((c) => ({ name: c.name, size: c.value })),
+          });
         });
         chart.on("globalout", () => {
           onHover?.(null);

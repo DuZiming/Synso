@@ -34,11 +34,17 @@
     size: number;
   }
 
+  /// What the side panels show for the hovered block.
+  interface HoverInfo {
+    chain: ChainLevel[];
+    children: ChainLevel[];
+  }
+
   /// Per-pane view state: `root` is the requested index path ("" = the
   /// virtual root), `tree` the last successful fetch, `seq` a race guard
   /// so a slow response can never overwrite a newer request, `picker` the
-  /// text input's draft, `hoverChain` the hovered block's root-first
-  /// chain feeding the right-side path panel.
+  /// text input's draft, `hover` the hovered block's chain (right panel)
+  /// and subdirectories (left panel).
   interface Pane {
     root: string;
     tree: SizeNode | null;
@@ -47,7 +53,7 @@
     error: string | null;
     seq: number;
     picker: string;
-    hoverChain: ChainLevel[] | null;
+    hover: HoverInfo | null;
   }
 
   function newPane(root: string): Pane {
@@ -59,7 +65,7 @@
       error: null,
       seq: 0,
       picker: root,
-      hoverChain: null,
+      hover: null,
     };
   }
 
@@ -304,19 +310,36 @@
 
         {#if pane.tree}
           <div class="pane-body">
+            <aside class="side-panel" aria-label={$t("flame.childrenPanel")}>
+              {#if pane.hover && pane.hover.children.length > 0}
+                <h3>{$t("flame.childrenPanel")}</h3>
+                <ol>
+                  {#each pane.hover.children as child (child.name)}
+                    <li>
+                      <span class="lvl-name" title={child.name}>{child.name}</span>
+                      <span class="lvl-size">{humanBytes(child.size)}</span>
+                    </li>
+                  {/each}
+                </ol>
+              {:else if pane.hover}
+                <p class="path-hint">{$t("flame.childrenEmpty")}</p>
+              {:else}
+                <p class="path-hint">{$t("flame.childrenHint")}</p>
+              {/if}
+            </aside>
             <FlameChartSunburst
               root={pane.tree}
               onDrill={(path) => drill(pane, path)}
               onReveal={(path) => void reveal(path)}
               onAddToCollection={(path) => void addToCollection(path)}
-              onHover={(chain) => (pane.hoverChain = chain)}
+              onHover={(info) => (pane.hover = info)}
             />
-            <aside class="path-panel" aria-label={$t("flame.pathPanel")}>
-              {#if pane.hoverChain && pane.hoverChain.length > 0}
+            <aside class="side-panel" aria-label={$t("flame.pathPanel")}>
+              {#if pane.hover && pane.hover.chain.length > 0}
                 <h3>{$t("flame.pathPanel")}</h3>
                 <!-- Hovered first, then each parent up to the root. -->
                 <ol>
-                  {#each [...pane.hoverChain].reverse() as level, i (i)}
+                  {#each [...pane.hover.chain].reverse() as level, i (i)}
                     <li class:current={i === 0}>
                       <span class="lvl-name" title={level.name}>{level.name}</span>
                       <span class="lvl-size">{humanBytes(level.size)}</span>
@@ -431,7 +454,7 @@
     min-width: 0;
   }
 
-  .path-panel {
+  .side-panel {
     flex: 0 0 200px;
     border: 1px solid var(--border);
     border-radius: 10px;
@@ -441,14 +464,14 @@
     overflow-y: auto;
   }
 
-  .path-panel h3 {
+  .side-panel h3 {
     margin: 0 0 6px;
     font-size: 12px;
     font-weight: 600;
     opacity: 0.7;
   }
 
-  .path-panel ol {
+  .side-panel ol {
     list-style: none;
     margin: 0;
     padding: 0;
@@ -457,7 +480,7 @@
     gap: 3px;
   }
 
-  .path-panel li {
+  .side-panel li {
     display: flex;
     align-items: baseline;
     gap: 6px;
@@ -465,7 +488,7 @@
     border-radius: 4px;
   }
 
-  .path-panel li.current {
+  .side-panel li.current {
     background: var(--bg);
     font-weight: 600;
   }
