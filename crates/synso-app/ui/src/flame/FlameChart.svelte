@@ -324,15 +324,23 @@
           oncontextmenu={(e) => onBlockMenu(block, e)}
         ></rect>
         {#if block.w >= MIN_LABEL_PX && layout.rowH >= 12}
-          <text
-            x={block.x + PAD + 4}
-            y={blockY(block.depth) + layout.rowH / 2 + 3.5}
-            class="block-label"
-          >
-            {block.w > block.node.name.length * 7 + 10
-              ? block.node.name
-              : block.node.name.slice(0, Math.max(1, Math.floor(block.w / 7)))}
-          </text>
+          {#if block.w > block.node.name.length * 7 + 14}
+            <text
+              x={block.x + PAD + block.w / 2}
+              y={blockY(block.depth) + layout.rowH / 2 + 3.5}
+              class="block-label"
+            >
+              {block.node.name}
+            </text>
+          {:else}
+            <text
+              x={block.x + PAD + block.w / 2}
+              y={blockY(block.depth) + layout.rowH / 2 + 3.5}
+              class="block-label"
+            >
+              {block.node.name.slice(0, Math.max(1, Math.floor((block.w - 14) / 7)))}…
+            </text>
+          {/if}
         {/if}
       {/each}
     </svg>
@@ -402,6 +410,7 @@
     overflow: hidden;
     cursor: grab;
     touch-action: none;
+    box-shadow: inset 0 0 32px rgb(0 0 0 / 0.05);
   }
 
   .flame-wrap:active {
@@ -413,14 +422,22 @@
   }
 
   .block {
-    stroke: rgb(0 0 0 / 0.25);
-    stroke-width: 0.6;
+    stroke: rgb(0 0 0 / 0.22);
+    stroke-width: 0.5;
     cursor: pointer;
+    rx: 3;
+    transition: filter 90ms ease, stroke 90ms ease;
+  }
+
+  .block:hover {
+    filter: brightness(1.14) saturate(1.05);
+    stroke: var(--accent);
+    stroke-width: 1.2;
   }
 
   @media (prefers-color-scheme: dark) {
     .block {
-      stroke: rgb(255 255 255 / 0.22);
+      stroke: rgb(255 255 255 / 0.2);
     }
   }
 
@@ -428,6 +445,7 @@
     font-family: inherit;
     font-size: 11px;
     fill: var(--text);
+    text-anchor: middle;
     paint-order: stroke;
     stroke: var(--panel);
     stroke-width: 2.5px;

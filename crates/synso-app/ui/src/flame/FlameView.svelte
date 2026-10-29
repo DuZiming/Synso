@@ -24,7 +24,16 @@
   import { collAdd, fileIdOf, revealIndexPath, sizeTree } from "../lib/tauri";
   import type { Collection, SizeNode } from "../lib/types";
   import FlameChart from "./FlameChart.svelte";
+  import FlameChartD3 from "./FlameChartD3.svelte";
+  import FlameChartSunburst from "./FlameChartSunburst.svelte";
   import CollectionPicker from "../collections/CollectionPicker.svelte";
+
+  /// Renderer mode: mountain (custom centered towers) | flame (classic
+  /// d3-flame-graph) | sunburst (ECharts radial cake tower). The user
+  /// compares all three live before picking a keeper; persisted per
+  /// browser like the depth preference.
+  type ChartMode = "mountain" | "flame" | "sunburst";
+  const MODE_KEY = "synso.flame.mode";
 
   /// Per-pane view state: `root` is the requested index path ("" = the
   /// virtual root), `tree` the last successful fetch, `seq` a race guard
@@ -53,7 +62,21 @@
     return raw;
   }
 
+  function loadMode(): ChartMode {
+    const raw = localStorage.getItem(MODE_KEY);
+    return raw === "flame" || raw === "sunburst" || raw === "mountain"
+      ? raw
+      : "mountain";
+  }
+
   let depth = $state(loadDepth());
+  let mode = $state<ChartMode>(loadMode());
+
+  function setMode(next: ChartMode): void {
+    if (next === mode) return;
+    mode = next;
+    localStorage.setItem(MODE_KEY, next);
+  }
 
   function setDepth(next: number): void {
     const clamped = Math.max(1, Math.min(30, next));
@@ -218,6 +241,32 @@
       <input type="checkbox" checked={compare} onchange={toggleCompare} />
       {$t("flame.compare")}
     </label>
+    <div class="mode-switch" role="group" aria-label={$t("flame.mode")}>
+      <button
+        class="ghost mode-btn"
+        class:active={mode === "mountain"}
+        aria-pressed={mode === "mountain"}
+        onclick={() => setMode("mountain")}
+      >
+        {$t("flame.modeMountain")}
+      </button>
+      <button
+        class="ghost mode-btn"
+        class:active={mode === "flame"}
+        aria-pressed={mode === "flame"}
+        onclick={() => setMode("flame")}
+      >
+        {$t("flame.modeFlame")}
+      </button>
+      <button
+        class="ghost mode-btn"
+        class:active={mode === "sunburst"}
+        aria-pressed={mode === "sunburst"}
+        onclick={() => setMode("sunburst")}
+      >
+        {$t("flame.modeSunburst")}
+      </button>
+    </div>
     <div class="depth-stepper" role="group" aria-label={$t("flame.depth")}>
       <button
         class="ghost"
@@ -275,12 +324,28 @@
         />
 
         {#if pane.tree}
-          <FlameChart
-            root={pane.tree}
-            onDrill={(path) => drill(pane, path)}
-            onReveal={(path) => void reveal(path)}
-            onAddToCollection={(path) => void addToCollection(path)}
-          />
+          {#if mode === "mountain"}
+            <FlameChart
+              root={pane.tree}
+              onDrill={(path) => drill(pane, path)}
+              onReveal={(path) => void reveal(path)}
+              onAddToCollection={(path) => void addToCollection(path)}
+            />
+          {:else if mode === "sunburst"}
+            <FlameChartSunburst
+              root={pane.tree}
+              onDrill={(path) => drill(pane, path)}
+              onReveal={(path) => void reveal(path)}
+              onAddToCollection={(path) => void addToCollection(path)}
+            />
+          {:else}
+            <FlameChartD3
+              root={pane.tree}
+              onDrill={(path) => drill(pane, path)}
+              onReveal={(path) => void reveal(path)}
+              onAddToCollection={(path) => void addToCollection(path)}
+            />
+          {/if}
         {:else if pane.loading}
           <div class="pane-state muted">{$t("flame.loading")}</div>
         {:else if pane.missing}
@@ -322,6 +387,38 @@
     justify-content: space-between;
     gap: 12px;
     flex-wrap: wrap;
+  }
+
+  .mode-switch {
+    display: inline-flex;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .mode-btn {
+    padding: 5px 12px;
+    font-size: 12.5px;
+    border-radius: 0;
+    border: none;
+  }
+
+  .mode-btn.active {
+    background: var(--accent);
+    color: var(--accent-contrast, #fff);
+  }
+
+  .depth-stepper {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .depth-value {
+    font-size: 12.5px;
+    min-width: 64px;
+    text-align: center;
+    color: var(--text);
   }
 
   .compare-toggle {
