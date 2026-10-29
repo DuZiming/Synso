@@ -123,12 +123,9 @@
               data: [data],
               radius: ["6%", "94%"],
               nodeClick: false, // we drill via our own click handler
-              label: {
-                color: "#ffffff",
-                textBorderColor: isDark ? "#1d2129" : "#ffffff",
-                textBorderWidth: 2,
-                minAngle: 8,
-              },
+              // No labels (user preference): on a radial map they rotate
+              // with the arcs and read badly; the tooltip carries names.
+              label: { show: false },
               emphasis: { focus: "ancestor" },
             },
           ],

@@ -444,12 +444,10 @@
   .block-label {
     font-family: inherit;
     font-size: 11px;
+    /* Plain text, no halo (user preference): match the classic flame
+       graph's label look instead of a stroke-outlined one. */
     fill: var(--text);
     text-anchor: middle;
-    paint-order: stroke;
-    stroke: var(--panel);
-    stroke-width: 2.5px;
-    stroke-linejoin: round;
     pointer-events: none;
     user-select: none;
   }
