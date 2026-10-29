@@ -18,11 +18,16 @@
   let {
     root,
     onDrill,
+    onHover,
   }: {
     root: SizeNode;
     onDrill: (path: string) => void;
     onReveal: (path: string) => void;
     onAddToCollection: (path: string) => void;
+    /// Hover reporting for the parent's right-side path panel: the full
+    /// root-first chain of the hovered block (null on leave). The chart's
+    /// rendering options are untouched by this — pure event tap.
+    onHover?: (chain: { name: string; size: number }[] | null) => void;
   } = $props();
 
   interface SunDatum {
@@ -31,20 +36,29 @@
     path: string;
     fileCount: number;
     pctOfParent: number;
+    // Root-first ancestor chain INCLUDING this node (extra field —
+    // ECharts ignores unknown data fields).
+    chain: { name: string; size: number }[];
     itemStyle?: { color: string; borderColor: string; borderWidth: number };
     children?: SunDatum[];
   }
 
-  function toSun(node: SizeNode, parentSize: number): SunDatum {
+  function toSun(
+    node: SizeNode,
+    parentSize: number,
+    ancestors: { name: string; size: number }[],
+  ): SunDatum {
+    const chain = [...ancestors, { name: node.name, size: node.size }];
     const datum: SunDatum = {
       name: node.name,
       value: node.size,
       path: node.path,
       fileCount: node.file_count,
       pctOfParent: parentSize > 0 ? (node.size / parentSize) * 100 : 100,
+      chain,
     };
     if (node.children.length > 0) {
-      datum.children = node.children.map((c) => toSun(c, node.size));
+      datum.children = node.children.map((c) => toSun(c, node.size, chain));
     }
     return datum;
   }
@@ -91,12 +105,19 @@
           const datum = params.data as SunDatum | undefined;
           if (datum && datum.path !== undefined) onDrill(datum.path);
         });
+        chart.on("mouseover", (params) => {
+          const datum = params.data as SunDatum | undefined;
+          onHover?.(datum?.chain ?? null);
+        });
+        chart.on("globalout", () => {
+          onHover?.(null);
+        });
         resizeObserver = new ResizeObserver(() => {
           chart?.resize();
         });
         resizeObserver.observe(el);
       }
-      const data = toSun(root, root.size);
+      const data = toSun(root, root.size, []);
       decorate(data, 0);
       chart.setOption(
         {

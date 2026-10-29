@@ -121,6 +121,8 @@ const zh: Dict = {
     depthMore: "增加层数",
     noDirs: "此范围没有子目录",
     resetZoom: "重置缩放",
+    pathPanel: "目录路径",
+    pathHint: "把鼠标放到图中的目录块上，这里会显示它的完整路径和占用空间",
     loading: "加载中…",
     missing: "路径不存在",
     loadFailed: "加载失败",

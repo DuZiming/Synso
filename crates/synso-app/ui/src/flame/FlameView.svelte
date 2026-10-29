@@ -25,11 +25,19 @@
   import type { Collection, SizeNode } from "../lib/types";
   import FlameChartSunburst from "./FlameChartSunburst.svelte";
   import CollectionPicker from "../collections/CollectionPicker.svelte";
+  import { humanBytes } from "../lib/format";
+
+  /// One level of the hover path chain (name + size, root first).
+  interface ChainLevel {
+    name: string;
+    size: number;
+  }
 
   /// Per-pane view state: `root` is the requested index path ("" = the
   /// virtual root), `tree` the last successful fetch, `seq` a race guard
   /// so a slow response can never overwrite a newer request, `picker` the
-  /// text input's draft.
+  /// text input's draft, `hoverChain` the hovered block's root-first
+  /// chain feeding the right-side path panel.
   interface Pane {
     root: string;
     tree: SizeNode | null;
@@ -38,6 +46,20 @@
     error: string | null;
     seq: number;
     picker: string;
+    hoverChain: ChainLevel[] | null;
+  }
+
+  function newPane(root: string): Pane {
+    return {
+      root,
+      tree: null,
+      loading: false,
+      missing: false,
+      error: null,
+      seq: 0,
+      picker: root,
+      hoverChain: null,
+    };
   }
 
   const MAX_CHILDREN = 40;
@@ -72,18 +94,6 @@
   let pickerIds = $state<number[] | null>(null);
 
   const visiblePanes = $derived(compare ? panes : panes.slice(0, 1));
-
-  function newPane(root: string): Pane {
-    return {
-      root,
-      tree: null,
-      loading: false,
-      missing: false,
-      error: null,
-      seq: 0,
-      picker: root,
-    };
-  }
 
   async function load(pane: Pane): Promise<void> {
     const seq = ++pane.seq;
@@ -275,12 +285,30 @@
         />
 
         {#if pane.tree}
-          <FlameChartSunburst
-            root={pane.tree}
-            onDrill={(path) => drill(pane, path)}
-            onReveal={(path) => void reveal(path)}
-            onAddToCollection={(path) => void addToCollection(path)}
-          />
+          <div class="pane-body">
+            <FlameChartSunburst
+              root={pane.tree}
+              onDrill={(path) => drill(pane, path)}
+              onReveal={(path) => void reveal(path)}
+              onAddToCollection={(path) => void addToCollection(path)}
+              onHover={(chain) => (pane.hoverChain = chain)}
+            />
+            <aside class="path-panel" aria-label={$t("flame.pathPanel")}>
+              {#if pane.hoverChain && pane.hoverChain.length > 0}
+                <h3>{$t("flame.pathPanel")}</h3>
+                <ol>
+                  {#each pane.hoverChain as level, i (i)}
+                    <li class:current={i === pane.hoverChain.length - 1}>
+                      <span class="lvl-name" title={level.name}>{level.name}</span>
+                      <span class="lvl-size">{humanBytes(level.size)}</span>
+                    </li>
+                  {/each}
+                </ol>
+              {:else}
+                <p class="path-hint">{$t("flame.pathHint")}</p>
+              {/if}
+            </aside>
+          </div>
         {:else if pane.loading}
           <div class="pane-state muted">{$t("flame.loading")}</div>
         {:else if pane.missing}
@@ -371,9 +399,77 @@
     gap: 8px;
   }
 
-  .pane > :global(.flame-wrap) {
+  .pane-body {
     flex: 1 1 auto;
     min-height: 0;
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+  }
+
+  .pane-body > :global(.flame-wrap) {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .path-panel {
+    flex: 0 0 200px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+    padding: 10px 12px;
+    font-size: 12px;
+    overflow-y: auto;
+  }
+
+  .path-panel h3 {
+    margin: 0 0 6px;
+    font-size: 12px;
+    font-weight: 600;
+    opacity: 0.7;
+  }
+
+  .path-panel ol {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .path-panel li {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 2px 4px;
+    border-radius: 4px;
+  }
+
+  .path-panel li.current {
+    background: var(--bg);
+    font-weight: 600;
+  }
+
+  .lvl-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .lvl-size {
+    color: var(--text);
+    opacity: 0.85;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .path-hint {
+    margin: 6px 0 0;
+    opacity: 0.5;
+    line-height: 1.6;
   }
 
   .crumbs {

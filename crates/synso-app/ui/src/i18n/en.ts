@@ -128,6 +128,8 @@ const en = {
     depthMore: "More layers",
     noDirs: "No subdirectories in this scope",
     resetZoom: "Reset zoom",
+    pathPanel: "Directory path",
+    pathHint: "Hover a block in the chart to see its full path and size here",
     loading: "Loading…",
     missing: "Path not found",
     loadFailed: "Failed to load",
