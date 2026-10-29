@@ -832,14 +832,23 @@ fn scan_cycle(
     let _slot = SlotGuard(&scanning);
     let outcome = {
         let mut guard = lock_unpoisoned(&store);
-        purge_root_subtrees(&mut guard, &opts);
+        // Generation-based rescan (replaces the purge-and-reinsert that
+        // needed a full in-memory hash snapshot — the ~0.5GB-at-1M-files
+        // transient): bump the generation, walk (every upsert re-stamps
+        // its row), then on SUCCESS sweep rows still on an older
+        // generation — the paths the walk did not touch are the ones that
+        // vanished while the app was closed. Unchanged rows are UPDATED
+        // in place, so their persisted hashes survive by construction.
+        let generation = guard.next_scan_generation();
         let scanned = scanner::scan(&mut guard, &opts, &|done| {
             broadcast(&subscribers, EngineEvent::ScanProgress { done, total: 0 });
         });
-        // The rescan hash snapshot lived only for the walk — drop it so it
-        // does not pin memory between scans (success and failure alike).
-        guard.clear_rescan_hash_cache();
         scanned.map(|stats| {
+            if let Err(err) = guard.sweep_stale(generation) {
+                // Not fatal: the sweep is reconciliation; a failed one
+                // leaves vanished rows indexed until the next rescan.
+                log::warn!("synso: stale-generation sweep failed: {err}");
+            }
             // Success only: swap in the fresh snapshot while still holding
             // the store lock (see module docs), so subscribers reacting to
             // ScanFinished already see fresh stats. On failure the hot
@@ -956,26 +965,6 @@ fn dedup_cycle(dedup: Arc<DedupShared>) {
         book.groups = Arc::new(outcome.groups);
     }
     broadcast(&subscribers, EngineEvent::DedupFinished { groups });
-}
-
-/// Rescan reconciliation: delete each root's whole index subtree before
-/// walking it, so the root is rebuilt from disk truth. Root segments come
-/// from the scanner's own `root_segment`; roots must be non-overlapping
-/// (see its docs). Purging every root up front still satisfies "purged
-/// before walking that root" for each root, since nothing is walked yet.
-/// Each purge first snapshots the subtree's persisted hashes into the
-/// store's rescan cache so unchanged files keep them through the rebuild
-/// (user requirement: mtime unchanged — never recompute).
-fn purge_root_subtrees(store: &mut Store, opts: &ScanOptions) {
-    for root in effective_roots(&opts.roots) {
-        let segment = root_segment(Path::new(&root));
-        if let Err(err) = store.snapshot_subtree_hashes(&[segment.as_str()]) {
-            log::warn!("synso: hash snapshot for {root:?} failed: {err}");
-        }
-        if let Err(err) = store.delete_subtree(&[segment.as_str()]) {
-            log::error!("synso: failed to purge the index subtree of {root:?}: {err}");
-        }
-    }
 }
 
 /// Loads a fresh hot index from the store and swaps it in, under the store
@@ -1392,12 +1381,15 @@ mod tests {
         let stats = engine.stats();
         assert_eq!(stats.files, 3);
         assert!(stats.warm);
-        // ...even though the store is now partial: purged, never re-walked.
+        // ...and with generation-based rescans the STORE keeps its rows
+        // too: nothing is deleted up front anymore (the old purge left a
+        // partial store behind; the failed walk now simply re-stamps
+        // nothing and sweeps nothing).
         let store = Store::open(&db_path).unwrap();
         assert_eq!(
             store.all_files().unwrap().len(),
-            0,
-            "the store stays partial until a successful rescan"
+            5,
+            "a failed scan must not destroy the previous index"
         );
 
         // The scan slot was released on the failure path: a second scan

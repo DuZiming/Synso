@@ -2,8 +2,6 @@
 
 use std::path::Path;
 
-use std::collections::HashMap;
-
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::model::{FileId, FileRecord};
@@ -32,8 +30,19 @@ ALTER TABLE files ADD COLUMN py_full TEXT NOT NULL DEFAULT '';
 ALTER TABLE files ADD COLUMN py_init TEXT NOT NULL DEFAULT '';
 ";
 
+/// Schema of `user_version` 3: the scan-generation columns. A rescan no
+/// longer purges-and-reinserts rows (that forced a full in-memory hash
+/// snapshot to preserve hashes — ~0.5GB transient at 1M files); instead
+/// every upsert stamps the current generation and a post-scan sweep
+/// deletes rows the walk did not touch. Unchanged rows survive in place,
+/// so their persisted hashes survive with them.
+const SCHEMA_V3_SQL: &str = "\
+ALTER TABLE files ADD COLUMN scan_gen INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE dirs ADD COLUMN scan_gen INTEGER NOT NULL DEFAULT 0;
+";
+
 /// Current schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// One row's freshly computed hashes, together with the snapshot identity
 /// the write is guarded by (`mtime` AND `size` from the dedup snapshot the
@@ -53,19 +62,10 @@ pub struct HashUpdate {
 /// Persistent index store over a single SQLite database file.
 pub struct Store {
     conn: Connection,
-    /// Hash cache filled by a rescan's purge step (`snapshot_subtree_hashes`):
-    /// full path -> (mtime, size, hash_first, hash_full) of the row that is
-    /// about to be deleted. The rebuild's inserts consult it so an
-    /// unchanged file (mtime AND size equal) is re-inserted WITH its
-    /// persisted hashes instead of losing them to the purge — the
-    /// "mtime unchanged → never recompute" rule across rescans. Cleared
-    /// when the scan finishes (`clear_rescan_hash_cache`).
-    rescan_hashes: HashMap<String, (i64, i64, Option<u64>, Option<u64>)>,
+    /// The scan generation new upserts stamp (see [`SCHEMA_V3_SQL`]).
+    /// Bumped once per full scan by [`Store::next_scan_generation`].
+    scan_gen: i64,
 }
-
-/// The rescan hash cache's value shape: (mtime, size, hash_first,
-/// hash_full), size stored as the same signed cast the columns use.
-pub(crate) type HashCacheEntry = (i64, i64, Option<u64>, Option<u64>);
 
 impl Store {
     /// Opens (creating if needed) the database at `path` and brings its
@@ -78,9 +78,15 @@ impl Store {
         // immediate SQLITE_BUSY error.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         migrate(&mut conn)?;
+        // Generation resumes above anything a previous run ever stamped, so
+        // a stale row from an interrupted scan can never look current.
+        let last_gen: i64 =
+            conn.query_row("SELECT COALESCE(MAX(scan_gen), 0) FROM files", [], |row| {
+                row.get(0)
+            })?;
         Ok(Store {
             conn,
-            rescan_hashes: HashMap::new(),
+            scan_gen: last_gen,
         })
     }
 
@@ -91,102 +97,38 @@ impl Store {
     /// `rec.py_init` hold the pinyin keys computed here from the name —
     /// the single choke point, so callers never pass pinyin in.
     pub fn upsert_file(&mut self, dir_path: &[&str], rec: &mut FileRecord) -> Result<()> {
-        upsert_file_on(&self.conn, &self.rescan_hashes, dir_path, rec)
+        upsert_file_on(&mut self.conn, self.scan_gen, dir_path, rec)
     }
 
-    /// Read-only view of the rescan hash cache for the scanner's
-    /// transactional batch path (`upsert_file_on` on a `Transaction`).
-    pub(crate) fn rescan_hashes(&self) -> &HashMap<String, HashCacheEntry> {
-        &self.rescan_hashes
+    /// Advances and returns the scan generation. The engine calls this
+    /// once per full scan; every upsert during the walk stamps the new
+    /// generation, and [`sweep_stale`] afterwards deletes rows still on
+    /// older ones (files that vanished while the app was closed).
+    pub fn next_scan_generation(&mut self) -> i64 {
+        self.scan_gen += 1;
+        self.scan_gen
     }
 
-    /// Takes the rescan hash cache out (empty map back), for the scanner's
-    /// transaction path: `conn_mut()`'s mutable borrow and a shared
-    /// `rescan_hashes()` read cannot coexist, so the batch TAKES the map,
-    /// uses it for the transaction, and restores it via
-    /// [`restore_rescan_hashes`] when done (every path restores).
-    pub(crate) fn take_rescan_hashes(&mut self) -> HashMap<String, HashCacheEntry> {
-        std::mem::take(&mut self.rescan_hashes)
+    /// The generation new upserts currently stamp (a scan in progress, or
+    /// the last finished one — watcher upserts between scans stamp the
+    /// latest generation so a later sweep never eats them).
+    pub fn current_scan_generation(&self) -> i64 {
+        self.scan_gen
     }
 
-    /// Puts a taken cache back ([`take_rescan_hashes`]).
-    pub(crate) fn restore_rescan_hashes(&mut self, map: HashMap<String, HashCacheEntry>) {
-        self.rescan_hashes = map;
-    }
-
-    /// Snapshots the persisted hashes of every file row under `dir_path`
-    /// into the rescan cache, so the purge+reinsert that follows can
-    /// restore them for unchanged files. Call immediately BEFORE
-    /// `delete_subtree` for the same path.
-    pub fn snapshot_subtree_hashes(&mut self, dir_path: &[&str]) -> Result<usize> {
-        let Some(root_id) = find_dir(&self.conn, dir_path)? else {
-            return Ok(0);
-        };
-        // Dir rows: parent/name maps for chain walks (cycle-budgeted like
-        // every other parent walk in the crate).
-        let dirs = self.all_dirs()?;
-        let mut parent_of: HashMap<FileId, Option<FileId>> = HashMap::new();
-        let mut name_of: HashMap<FileId, String> = HashMap::new();
-        for (id, parent, name) in &dirs {
-            parent_of.insert(*id, *parent);
-            name_of.insert(*id, name.clone());
-        }
-
-        // Full path per dir in the root's subtree (root-exclusive: the
-        // caller passes the ROOT's segments, so the root's own path is
-        // dir_path itself and descendants extend it).
-        let mut path_of: HashMap<FileId, String> = HashMap::new();
-        let root_prefix = dir_path.join(&std::path::MAIN_SEPARATOR.to_string());
-        for &(id, _, _) in &dirs {
-            let mut segs: Vec<&str> = Vec::new();
-            let mut cur = Some(id);
-            let mut walks = dirs.len() + 1;
-            let mut under_root = false;
-            while let Some(cid) = cur {
-                if walks == 0 {
-                    break; // corrupt parent cycle guard
-                }
-                walks -= 1;
-                if cid == root_id {
-                    under_root = true;
-                    break;
-                }
-                if let Some(n) = name_of.get(&cid) {
-                    segs.push(n);
-                }
-                cur = parent_of.get(&cid).copied().flatten();
-            }
-            if !under_root {
-                continue;
-            }
-            segs.reverse();
-            let mut full = root_prefix.clone();
-            for s in segs {
-                full.push(std::path::MAIN_SEPARATOR);
-                full.push_str(s);
-            }
-            path_of.insert(id, full);
-        }
-
-        let mut count = 0usize;
-        for rec in self.all_files()? {
-            if let Some(dir_path_str) = path_of.get(&rec.parent) {
-                let key = format!("{dir_path_str}{}{}", std::path::MAIN_SEPARATOR, rec.name);
-                self.rescan_hashes.insert(
-                    key,
-                    (rec.mtime, rec.size as i64, rec.hash_first, rec.hash_full),
-                );
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
-
-    /// Drops the rescan hash cache. The engine calls this when a scan
-    /// finishes (success or failure) so the transient snapshot does not
-    /// pin memory between scans.
-    pub fn clear_rescan_hash_cache(&mut self) {
-        self.rescan_hashes.clear();
+    /// Deletes every `files` and `dirs` row stamped below `generation`
+    /// — the reconciliation half of a generation-based rescan: rows the
+    /// walk touched were re-stamped, so survivors below `generation` are
+    /// paths that no longer exist on disk. Returns files rows deleted.
+    /// Call ONLY on scan success (a failed walk has not re-stamped the
+    /// roots it never reached; the next successful scan sweeps them).
+    pub fn sweep_stale(&mut self, generation: i64) -> Result<u64> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM files WHERE scan_gen < ?1", params![generation])?;
+        let files_deleted = tx.changes() as u64;
+        tx.execute("DELETE FROM dirs WHERE scan_gen < ?1", params![generation])?;
+        tx.commit()?;
+        Ok(files_deleted)
     }
 
     /// Deletes the `files` row `id`; `Err(NotFound)` if it does not exist.
@@ -446,7 +388,13 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         tx.execute_batch(SCHEMA_V2_SQL)?;
         backfill_pinyin_keys(&tx)?;
     }
-    // Later schema steps append `if version < 3 { ... }` blocks here.
+    if version < 3 {
+        // No backfill: pre-v3 rows all sit at the default generation 0,
+        // and the store's scan_gen resumes above MAX(scan_gen), so the
+        // first generation-based rescan re-stamps everything it walks
+        // and the first sweep carries off whatever it did not.
+        tx.execute_batch(SCHEMA_V3_SQL)?;
+    }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
     Ok(())
@@ -481,42 +429,26 @@ fn backfill_pinyin_keys(conn: &Connection) -> Result<()> {
 /// flush is the transactional caller.
 pub(crate) fn upsert_file_on(
     conn: &Connection,
-    rescan_hashes: &HashMap<String, HashCacheEntry>,
+    scan_gen: i64,
     dir_path: &[&str],
     rec: &mut FileRecord,
 ) -> Result<()> {
-    let dir_id = resolve_dir(conn, dir_path)?;
+    let dir_id = resolve_dir(conn, scan_gen, dir_path)?;
     let ext_id = intern_extension(conn, &rec.name)?;
     let (py_full, py_init) = pinyin_keys(&rec.name);
-    // Rescan cache hit: this exact path existed before the purge with the
-    // same mtime AND size — the file is unchanged, so its persisted hashes
-    // ride along into the fresh insert (they arrive via rec below, making
-    // the conflict arm's CASE a no-op keep). A miss or a mismatch leaves
-    // the hashes None, which is the correct "unknown, recompute" state.
-    if rec.hash_first.is_none() {
-        let key = format!(
-            "{}{}{}",
-            dir_path.join(&std::path::MAIN_SEPARATOR.to_string()),
-            std::path::MAIN_SEPARATOR,
-            rec.name
-        );
-        if let Some(&(mtime, size, hash_first, hash_full)) = rescan_hashes.get(&key) {
-            if mtime == rec.mtime && size == rec.size as i64 {
-                rec.hash_first = hash_first;
-                rec.hash_full = hash_full;
-            }
-        }
-    }
     // u64 columns (size, hashes) are stored as SQLite's signed 64-bit
     // integers via a bit-preserving cast.
     // Hash-cache rule in the conflict arm below (user requirement: mtime
     // unchanged means never recompute): an unchanged file (mtime AND size
     // match the row being replaced) keeps its persisted hashes across
-    // rescans; any change invalidates them to NULL. See the comment above
+    // rescans; any change invalidates them to NULL. With generation-based
+    // rescans the row is UPDATED in place (never deleted), so an unchanged
+    // file keeps its row — hashes included — by construction, and this
+    // CASE only has to handle the changed case. See the comment above
     // `update_file_hashes` for the same-second residual.
     let id: FileId = conn.query_row(
-        "INSERT INTO files(dir, name, size, mtime, ctime, atime, ext_id, is_dir, hash_first, hash_full, py_full, py_init)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "INSERT INTO files(dir, name, size, mtime, ctime, atime, ext_id, is_dir, hash_first, hash_full, py_full, py_init, scan_gen)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(dir, name) DO UPDATE SET
            size = excluded.size,
            mtime = excluded.mtime,
@@ -531,7 +463,8 @@ pub(crate) fn upsert_file_on(
              WHEN files.mtime = excluded.mtime AND files.size = excluded.size
              THEN files.hash_full ELSE NULL END,
            py_full = excluded.py_full,
-           py_init = excluded.py_init
+           py_init = excluded.py_init,
+           scan_gen = excluded.scan_gen
          RETURNING id",
         params![
             dir_id,
@@ -546,6 +479,7 @@ pub(crate) fn upsert_file_on(
             rec.hash_full.map(|h| h as i64),
             py_full,
             py_init,
+            scan_gen,
         ],
         |row| row.get(0),
     )?;
@@ -559,8 +493,9 @@ pub(crate) fn upsert_file_on(
 
 /// Resolves `segments` in `dirs`, creating missing levels (each segment's
 /// parent is the previous one; the first segment's parent is NULL), and
-/// returns the final dir id.
-fn resolve_dir(conn: &Connection, segments: &[&str]) -> Result<FileId> {
+/// returns the final dir id. Every level touched is re-stamped with the
+/// current generation so the post-scan sweep keeps live directories.
+fn resolve_dir(conn: &Connection, scan_gen: i64, segments: &[&str]) -> Result<FileId> {
     if segments.is_empty() {
         return Err(SynsoError::BadQuery(
             "dir_path must have at least one segment".into(),
@@ -582,11 +517,19 @@ fn resolve_dir(conn: &Connection, segments: &[&str]) -> Result<FileId> {
             )
             .optional()?;
         dir_id = match existing {
-            Some(id) => id,
+            Some(id) => {
+                // Re-stamp so the sweep keeps directories the walk still
+                // uses (one cheap UPDATE per resolved level).
+                conn.execute(
+                    "UPDATE dirs SET scan_gen = ?1 WHERE id = ?2",
+                    params![scan_gen, id],
+                )?;
+                id
+            }
             None => {
                 conn.execute(
-                    "INSERT INTO dirs(parent, name) VALUES (?1, ?2)",
-                    params![parent, segment],
+                    "INSERT INTO dirs(parent, name, scan_gen) VALUES (?1, ?2, ?3)",
+                    params![parent, segment, scan_gen],
                 )?;
                 conn.last_insert_rowid()
             }
@@ -658,7 +601,7 @@ fn intern_extension(conn: &Connection, name: &str) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HashUpdate, SCHEMA_V1_SQL};
+    use super::{HashUpdate, SCHEMA_V1_SQL, SCHEMA_VERSION};
     use crate::model::FileRecord;
     use crate::store::Store;
     use crate::SynsoError;
@@ -688,23 +631,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("index.db");
 
-        // First open: schema created, user_version bumped to 2.
+        // First open: schema created, user_version bumped to the current.
         {
             let store = Store::open(&db_path).unwrap();
             let version: i64 = store
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 2);
+            assert_eq!(version, SCHEMA_VERSION);
         }
 
-        // Second open on the same file: no error, still at 2 (idempotent).
+        // Second open on the same file: no error, unchanged (idempotent).
         let store = Store::open(&db_path).unwrap();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, SCHEMA_VERSION);
 
         // Every v1 table exists and starts empty.
         for table in [
@@ -915,13 +858,13 @@ mod tests {
             conn.pragma_update(None, "user_version", 1).unwrap();
         }
 
-        // Opening migrates to v2 and backfills the new columns in place.
+        // Opening migrates through v3 and backfills the v2 columns in place.
         let store = Store::open(&db_path).unwrap();
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, SCHEMA_VERSION);
         for (name, py_full, py_init) in [
             ("报告.docx", "baogao.docx", "bg.docx"),
             ("文件ABC", "wenjianabc", "wjabc"),
