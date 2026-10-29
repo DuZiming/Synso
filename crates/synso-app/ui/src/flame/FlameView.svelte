@@ -22,6 +22,7 @@
   import { onMount } from "svelte";
   import { t } from "../i18n";
   import { collAdd, fileIdOf, revealIndexPath, sizeTree } from "../lib/tauri";
+  import { listen } from "@tauri-apps/api/event";
   import type { Collection, SizeNode } from "../lib/types";
   import FlameChartSunburst from "./FlameChartSunburst.svelte";
   import CollectionPicker from "../collections/CollectionPicker.svelte";
@@ -216,9 +217,26 @@
     toastTimer = setTimeout(() => (toast = null), TOAST_MS);
   }
 
+  /// Index changes (fs-changed from the engine's watcher) refresh the
+  /// visible panes IN PLACE — same drill root, fresh data — so the cake
+  /// tower tracks disk edits without any manual reload. Debounced: bursts
+  /// (builds, copy jobs) collapse into one refetch.
+  let fsDebounce: ReturnType<typeof setTimeout> | undefined;
+  const unlisteners: (() => void)[] = [];
+
   onMount(() => {
     void load(panes[0]);
-    return () => clearTimeout(toastTimer);
+    void listen("fs-changed", () => {
+      clearTimeout(fsDebounce);
+      fsDebounce = setTimeout(() => {
+        for (const pane of visiblePanes) void load(pane);
+      }, 600);
+    }).then((un) => unlisteners.push(un));
+    return () => {
+      clearTimeout(toastTimer);
+      clearTimeout(fsDebounce);
+      for (const un of unlisteners) un();
+    };
   });
 </script>
 
