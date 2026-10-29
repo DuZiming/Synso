@@ -116,6 +116,9 @@ const zh: Dict = {
   flame: {
     compare: "对比模式",
     refresh: "刷新",
+    depth: "层数",
+    depthLess: "减少层数",
+    depthMore: "增加层数",
     loading: "加载中…",
     missing: "路径不存在",
     loadFailed: "加载失败",

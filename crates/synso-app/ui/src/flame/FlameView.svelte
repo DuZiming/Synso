@@ -4,8 +4,10 @@
   // breadcrumb chain back to the virtual "(all)" root; 对比模式 renders two
   // independent panes, each with its own root (drill / breadcrumb / a
   // root-picker input that accepts an index path). Every visible pane is
-  // (re)fetched via `size_tree(path, 2, 40)`; an unknown root renders
-  // 路径不存在 but keeps its breadcrumb so the user can climb back out.
+  // (re)fetched via `size_tree(path, depth, 40)` where `depth` is the
+  // user-tunable layer count (default 10, persisted per browser); an
+  // unknown root renders 路径不存在 but keeps its breadcrumb so the user
+  // can climb back out.
   //
   // The synthetic "(other)" aggregate node is not drillable (it names no
   // real directory — the engine would answer None): clicking it shows a
@@ -38,9 +40,28 @@
     picker: string;
   }
 
-  const DEPTH = 2;
   const MAX_CHILDREN = 40;
   const TOAST_MS = 10_000;
+  /// Depth range and default; persisted in localStorage (a view-local
+  /// display preference — not engine state).
+  const DEPTH_KEY = "synso.flame.depth";
+  const DEPTH_DEFAULT = 10;
+
+  function loadDepth(): number {
+    const raw = Number(localStorage.getItem(DEPTH_KEY));
+    if (!Number.isInteger(raw) || raw < 1 || raw > 30) return DEPTH_DEFAULT;
+    return raw;
+  }
+
+  let depth = $state(loadDepth());
+
+  function setDepth(next: number): void {
+    const clamped = Math.max(1, Math.min(30, next));
+    if (clamped === depth) return;
+    depth = clamped;
+    localStorage.setItem(DEPTH_KEY, String(clamped));
+    for (const pane of panes) void load(pane);
+  }
 
   let compare = $state(false);
   let panes = $state<Pane[]>([newPane("")]);
@@ -69,7 +90,7 @@
     pane.loading = true;
     pane.error = null;
     try {
-      const tree = await sizeTree(pane.root, DEPTH, MAX_CHILDREN);
+      const tree = await sizeTree(pane.root, depth, MAX_CHILDREN);
       if (seq !== pane.seq) return; // a newer request superseded this one
       if (tree) {
         pane.tree = tree;
@@ -197,6 +218,27 @@
       <input type="checkbox" checked={compare} onchange={toggleCompare} />
       {$t("flame.compare")}
     </label>
+    <div class="depth-stepper" role="group" aria-label={$t("flame.depth")}>
+      <button
+        class="ghost"
+        onclick={() => setDepth(depth - 1)}
+        disabled={depth <= 1}
+        aria-label={$t("flame.depthLess")}
+      >
+        −
+      </button>
+      <span class="depth-value" title={$t("flame.depth")}>
+        {$t("flame.depth")}: {depth}
+      </span>
+      <button
+        class="ghost"
+        onclick={() => setDepth(depth + 1)}
+        disabled={depth >= 30}
+        aria-label={$t("flame.depthMore")}
+      >
+        +
+      </button>
+    </div>
     <button class="ghost" onclick={refresh}>{$t("flame.refresh")}</button>
   </header>
 

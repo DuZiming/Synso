@@ -123,6 +123,9 @@ const en = {
   flame: {
     compare: "Compare mode",
     refresh: "Refresh",
+    depth: "Depth",
+    depthLess: "Fewer layers",
+    depthMore: "More layers",
     loading: "Loading…",
     missing: "Path not found",
     loadFailed: "Failed to load",
