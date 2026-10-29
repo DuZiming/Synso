@@ -57,7 +57,6 @@
     light: ["#bd7a30", "#2472a8", "#dfa262", "#4f9fd1", "#c98a45", "#3488bd"],
     dark: ["#96601a", "#1667a4", "#a06a25", "#24699c", "#9c6a20", "#1c72a8"],
   };
-  const isDarkNow = () => window.matchMedia("(prefers-color-scheme: dark)").matches;
 
   let el: HTMLDivElement | undefined = $state();
   let chart: echarts.ECharts | null = null;
@@ -80,12 +79,21 @@
   $effect(() => {
     if (!el) return;
     if (!chart) {
-      chart = echarts.init(el);
+      // Explicit dims at init: echarts on a zero-size container paints
+      // nothing (it logs "Can't get DOM width or height") — the layout
+      // may not have settled when this first runs, so fall back to the
+      // pane's box and let the ResizeObserver correct it right after.
+      chart = echarts.init(el, null, {
+        width: el.clientWidth || 600,
+        height: el.clientHeight || 400,
+      });
       chart.on("click", (params) => {
         const datum = params.data as SunDatum | undefined;
         if (datum && datum.path !== undefined) onDrill(datum.path);
       });
-      resizeObserver = new ResizeObserver(() => chart?.resize());
+      resizeObserver = new ResizeObserver(() => {
+        chart?.resize();
+      });
       resizeObserver.observe(el);
     }
     const data = toSun(root, root.size);
@@ -140,10 +148,15 @@
   });
 </script>
 
-<div class="sunburst-wrap" bind:this={el}></div>
+<!-- flame-wrap class: FlameView's pane layout keys on it (flex:1 +
+     min-height:0) — a differently-named root would collapse to zero
+     height in the flex column and echarts would paint nothing. -->
+<div class="flame-wrap sunburst-wrap" bind:this={el}></div>
 
 <style>
   .sunburst-wrap {
+    /* All shared chrome (background/border/radius/size) comes from
+       .flame-wrap's FlameView rule + this component's own copy below. */
     position: relative;
     width: 100%;
     height: 100%;
