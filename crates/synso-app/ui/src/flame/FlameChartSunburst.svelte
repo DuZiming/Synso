@@ -9,10 +9,7 @@
   // well-trodden path. Init errors surface ON the pane (we have no
   // devtools in the release webview) — see `fatal`.
   import { onDestroy } from "svelte";
-  import { get } from "svelte/store";
   import * as echarts from "echarts";
-  import { t } from "../i18n";
-  import { humanBytes } from "../lib/format";
   import type { SizeNode } from "../lib/types";
 
   let {
@@ -109,9 +106,16 @@
           const datum = params.data as SunDatum | undefined;
           if (datum && datum.path !== undefined) onDrill(datum.path);
         });
+        // Hover tap for the side panels. Guarded by path: ECharts fires
+        // mouseover per arc entry, and re-emitting the same arc on every
+        // wiggle re-rendered the panels for nothing (hover-lag culprit #3).
+        let lastHoverPath: string | null | undefined;
         chart.on("mouseover", (params) => {
           const datum = params.data as SunDatum | undefined;
-          if (!datum) {
+          const path = datum?.path;
+          if (path === lastHoverPath) return;
+          lastHoverPath = path ?? null;
+          if (!datum || path === undefined) {
             onHover?.(null);
             return;
           }
@@ -126,6 +130,8 @@
           });
         });
         chart.on("globalout", () => {
+          if (lastHoverPath === null) return;
+          lastHoverPath = null;
           onHover?.(null);
         });
         resizeObserver = new ResizeObserver(() => {
@@ -147,23 +153,16 @@
       chart.setOption(
         {
           backgroundColor: "transparent",
-          tooltip: {
-            formatter: (params: unknown) => {
-              const d = (params as { data: SunDatum }).data;
-              const files = get(t)("flame.filesLine").replace(
-                "{n}",
-                d.fileCount.toLocaleString(),
-              );
-              const share = get(t)("flame.ofParentLine").replace(
-                "{pct}",
-                d.pctOfParent.toFixed(1),
-              );
-              return `<b>${d.name}</b><br>${humanBytes(d.value)}<br>${files} · ${share}`;
-            },
-          },
           series: [
             {
               type: "sunburst",
+              // No tooltip (hover-lag culprit #2): the side panels carry
+              // richer info than the floating bubble did.
+              tooltip: { show: false },
+              // emphasis focus "ancestor" dims every non-ancestor arc — a
+              // full-canvas repaint per arc crossing (hover-lag culprit
+              // #1). "none" keeps hover a no-op on the canvas.
+              emphasis: { focus: "none" },
               // series.data is an ARRAY of roots — a bare object renders
               // as a single childless disc (the blank-cake bug).
               data: roots,
