@@ -25,12 +25,18 @@
   import {
     autostartSet,
     listVolumes,
+    pickFolder,
     setShortcut,
     settingsGet,
     settingsSet,
     startFullScan,
   } from "../lib/tauri";
-  import { parseExclusions, volumesChecked, volumesSaved } from "../lib/settings";
+  import {
+    parseExclusions,
+    customRootsOf,
+    volumesChecked,
+    volumesSavedWithCustoms,
+  } from "../lib/settings";
   import type { Settings, VolumeInfo } from "../lib/types";
 
   const langOptions = ["auto", "zh", "en"] as const;
@@ -47,6 +53,9 @@
   let volumes = $state<VolumeInfo[]>([]);
   /** Mount path -> checked (`[]` semantics: all fixed volumes). */
   let checked = $state<Record<string, boolean>>({});
+  /** Arbitrary folder scan roots (dev/testing scope control) — engine
+   * treats them exactly like volume roots. */
+  let customRoots = $state<string[]>([]);
   let exclusionsText = $state("");
 
   // Language: changeLang persists + the tray re-labels (settings_set hook).
@@ -68,6 +77,7 @@
   let rescanStarted = $state(false);
 
   const checkedCount = $derived(volumes.filter((v) => checked[v.path]).length);
+  const anyScope = $derived(checkedCount > 0 || customRoots.length > 0);
 
   function gb(bytes: number): string {
     return (bytes / 2 ** 30).toFixed(1);
@@ -106,7 +116,7 @@
 
   async function saveScope(): Promise<void> {
     const baseSettings = base;
-    if (saveBusy || !baseSettings || checkedCount === 0) return;
+    if (saveBusy || !baseSettings || !anyScope) return;
     saveBusy = true;
     saveError = null;
     try {
@@ -116,7 +126,7 @@
         autostart,
         shortcut: appliedShortcut,
         exclusions: parseExclusions(exclusionsText),
-        volumes: volumesSaved(volumes, checked),
+        volumes: volumesSavedWithCustoms(volumes, checked, customRoots),
       });
       base = await settingsGet();
       savedPending = true;
@@ -133,6 +143,16 @@
     void startFullScan();
   }
 
+  async function addCustomRoot(): Promise<void> {
+    const picked = await pickFolder();
+    if (picked === null) return;
+    if (!customRoots.includes(picked)) customRoots = [...customRoots, picked];
+  }
+
+  function removeCustomRoot(path: string): void {
+    customRoots = customRoots.filter((p) => p !== path);
+  }
+
   onMount(() => {
     void (async () => {
       const [settings, list] = await Promise.all([settingsGet(), listVolumes()]);
@@ -143,6 +163,7 @@
       exclusionsText = settings.exclusions.join("\n");
       volumes = list;
       checked = volumesChecked(list, settings.volumes);
+      customRoots = customRootsOf(settings.volumes, list);
       loaded = true;
     })();
   });
@@ -233,9 +254,29 @@
           </li>
         {/each}
       </ul>
-      {#if checkedCount === 0}
+      {#if checkedCount === 0 && customRoots.length === 0}
         <p class="error" role="alert">{$t("wizard.volumesEmpty")}</p>
       {/if}
+      <p class="hint">{$t("settings.customHint")}</p>
+      <ul class="volumes custom-roots" aria-label={$t("settings.customRoots")}>
+        {#each customRoots as path (path)}
+          <li>
+            <label class="vol">
+              <span class="vol-path">{path}</span>
+              <button
+                class="ghost"
+                onclick={() => removeCustomRoot(path)}
+                aria-label={$t("settings.removeRoot")}
+              >
+                {$t("settings.removeRoot")}
+              </button>
+            </label>
+          </li>
+        {/each}
+      </ul>
+      <button class="ghost" onclick={() => void addCustomRoot()}>
+        {$t("settings.addFolder")}
+      </button>
       <p class="hint">{$t("wizard.exclusionsHint")}</p>
       <p class="examples">
         <code>node_modules</code>
@@ -253,7 +294,7 @@
         <button
           class="primary"
           onclick={() => void saveScope()}
-          disabled={saveBusy || checkedCount === 0}
+          disabled={saveBusy || !anyScope}
         >
           {$t("settings.save")}
         </button>

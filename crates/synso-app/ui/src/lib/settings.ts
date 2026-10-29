@@ -37,3 +37,28 @@ export function volumesSaved(
   if (all) return [];
   return volumes.filter((v) => checked[v.path]).map((v) => v.path);
 }
+
+/** Saved scan roots that are not whole volumes — arbitrary folders the
+ * user added for controlled-scope indexing (dev/testing). */
+export function customRootsOf(
+  saved: string[],
+  volumes: { path: string }[],
+): string[] {
+  const volumePaths = new Set(volumes.map((v) => v.path));
+  return saved.filter((p) => !volumePaths.has(p));
+}
+
+/** The persisted scan-root list when custom folders are in play. With any
+ * custom root present the list is always EXPLICIT (the `[]` = all-volumes
+ * spelling would silently drop the custom roots). */
+export function volumesSavedWithCustoms(
+  volumes: { path: string }[],
+  checked: Record<string, boolean>,
+  customRoots: string[],
+): string[] {
+  if (customRoots.length === 0) return volumesSaved(volumes, checked);
+  return [
+    ...volumes.filter((v) => checked[v.path]).map((v) => v.path),
+    ...customRoots,
+  ];
+}

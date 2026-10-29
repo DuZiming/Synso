@@ -36,6 +36,12 @@ export function listVolumes(): Promise<VolumeInfo[]> {
   return invoke("list_volumes");
 }
 
+/** Native folder picker (main-thread modal on the Rust side); resolves
+ * null when the user cancels. */
+export function pickFolder(): Promise<string | null> {
+  return invoke("pick_folder");
+}
+
 // ------------------ Task 15: quick search window -------------------------
 
 /** Everything-style search: page `[offset, offset + limit)` of the ranked

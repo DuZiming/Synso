@@ -152,7 +152,8 @@ pub fn run() {
             commands::coll_add,
             commands::coll_remove,
             commands::coll_members,
-            commands::file_id_of
+            commands::file_id_of,
+            commands::pick_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

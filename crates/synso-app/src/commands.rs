@@ -425,3 +425,16 @@ pub async fn file_id_of(state: State<'_, AppState>, path: String) -> Result<i64,
         .file_id_of(&path)
         .ok_or_else(|| format!("not in the index: \"{path}\""))
 }
+
+/// Opens the native folder picker and returns the chosen path (None on
+/// cancel). Sync ON PURPOSE: sync commands run on the main thread, where a
+/// modal native dialog is the standard pattern (it pumps the message loop).
+/// No engine state, no locks — nothing to keep off the main thread.
+#[tauri::command]
+pub fn pick_folder(app: tauri::AppHandle) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    app.dialog()
+        .file()
+        .blocking_pick_folder()
+        .and_then(|f| f.as_path().map(|p| p.to_string_lossy().into_owned()))
+}

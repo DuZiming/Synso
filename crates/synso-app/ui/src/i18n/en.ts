@@ -178,6 +178,11 @@ const en = {
     applied: "Applied",
     shortcutFailed: "Shortcut unavailable",
     indexTitle: "Index scope",
+    customHint:
+      "Add any folder as a scan root to keep the test scope small during development — uncheck every disk and keep only custom paths for pinpoint indexing. Remove them and re-check disks to return to full-volume indexing once stable.",
+    customRoots: "Custom scan paths",
+    addFolder: "Add folder…",
+    removeRoot: "Remove",
     save: "Save",
     saved: "Saved — scope changes take effect after a rescan.",
     rescanStarted: "Rescan started — track it on the Overview tab.",

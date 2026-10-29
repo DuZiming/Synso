@@ -169,6 +169,11 @@ const zh: Dict = {
     applied: "已生效",
     shortcutFailed: "快捷键不可用",
     indexTitle: "索引范围",
+    customHint:
+      "开发/测试阶段可添加任意文件夹作为扫描根，把测试范围控制在小区块；取消勾选所有磁盘、只留自定义路径即为纯定点扫描。稳定后删掉自定义路径并重新勾选磁盘即回到全盘索引。",
+    customRoots: "自定义扫描路径",
+    addFolder: "添加文件夹…",
+    removeRoot: "移除",
     save: "保存",
     saved: "已保存——需要重新扫描后生效。",
     rescanStarted: "已开始重新扫描，可在「概览」页查看进度。",
