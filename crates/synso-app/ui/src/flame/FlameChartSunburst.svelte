@@ -1,15 +1,13 @@
 <script lang="ts">
-  // Sunburst mode: ECharts radial "cake tower" — the root at the center,
+  // The flame chart: ECharts radial "cake tower" — the root at the center,
   // directories ring by ring outward. The empty arc inside a parent IS
   // that dir's direct-file share (dir-only data). Click = drill.
   //
-  // Full-package import (not echarts/core + charts/...): the project
-  // bundles with rolldown-vite, whose deep-path interop with echarts'
-  // modular entry left a silently-blank canvas; the index entry is the
-  // well-trodden path. Init errors surface ON the pane (we have no
-  // devtools in the release webview) — see `fatal`.
+  // Hover feeds the RIGHT-SIDE PATH PANEL (user requirement): the full
+  // ancestor chain from the scan root down to the hovered directory,
+  // each level with name + size — the radial map answers "where", the
+  // panel answers "what exactly and how big".
   import { onDestroy } from "svelte";
-  import { get } from "svelte/store";
   import * as echarts from "echarts";
   import { t } from "../i18n";
   import { humanBytes } from "../lib/format";
@@ -25,32 +23,45 @@
     onAddToCollection: (path: string) => void;
   } = $props();
 
+  /// One level of the hover path panel.
+  interface ChainLevel {
+    name: string;
+    size: number;
+    fileCount: number;
+    pctOfParent: number;
+  }
+
   interface SunDatum {
     name: string;
     value: number;
     path: string;
-    fileCount: number;
-    pctOfParent: number;
+    // Root-first ancestor chain INCLUDING this node (the panel's data).
+    chain: ChainLevel[];
     itemStyle?: { color: string; borderColor: string; borderWidth: number };
     children?: SunDatum[];
   }
 
-  function toSun(node: SizeNode, parentSize: number): SunDatum {
+  function toSun(node: SizeNode, ancestors: ChainLevel[]): SunDatum {
+    const level: ChainLevel = {
+      name: node.name,
+      size: node.size,
+      fileCount: node.file_count,
+      pctOfParent:
+        ancestors.length > 0 && ancestors.at(-1)!.size > 0
+          ? (node.size / ancestors.at(-1)!.size) * 100
+          : 100,
+    };
+    const chain = [...ancestors, level];
     const datum: SunDatum = {
       name: node.name,
       value: node.size,
       path: node.path,
-      fileCount: node.file_count,
-      pctOfParent: parentSize > 0 ? (node.size / parentSize) * 100 : 100,
+      chain,
     };
     if (node.children.length > 0) {
-      datum.children = node.children.map((c) => toSun(c, node.size));
+      datum.children = node.children.map((c) => toSun(c, chain));
     }
     return datum;
-  }
-
-  function countNodes(node: SizeNode): number {
-    return 1 + node.children.reduce((s, c) => s + countNodes(c), 0);
   }
 
   const COLORS = {
@@ -60,6 +71,7 @@
 
   let el: HTMLDivElement | undefined = $state();
   let fatal = $state<string | null>(null);
+  let hoverChain = $state<ChainLevel[] | null>(null);
   let chart: echarts.ECharts | null = null;
   let resizeObserver: ResizeObserver | null = null;
   const darkQuery = window.matchMedia("(prefers-color-scheme: dark)");
@@ -91,42 +103,37 @@
           const datum = params.data as SunDatum | undefined;
           if (datum && datum.path !== undefined) onDrill(datum.path);
         });
+        chart.on("mouseover", (params) => {
+          const datum = params.data as SunDatum | undefined;
+          hoverChain = datum?.chain ?? null;
+        });
+        chart.on("globalout", () => {
+          hoverChain = null;
+        });
         resizeObserver = new ResizeObserver(() => {
           chart?.resize();
         });
         resizeObserver.observe(el);
       }
-      const data = toSun(root, root.size);
+      const data = toSun(root, []);
       decorate(data, 0);
       chart.setOption(
         {
           backgroundColor: "transparent",
-          tooltip: {
-            formatter: (params: unknown) => {
-              const d = (params as { data: SunDatum }).data;
-              const files = get(t)("flame.filesLine").replace(
-                "{n}",
-                d.fileCount.toLocaleString(),
-              );
-              const share = get(t)("flame.ofParentLine").replace(
-                "{pct}",
-                d.pctOfParent.toFixed(1),
-              );
-              return `<b>${d.name}</b><br>${humanBytes(d.value)}<br>${files} · ${share}`;
-            },
-          },
           series: [
             {
               type: "sunburst",
               // series.data is an ARRAY of roots — a bare object renders
-              // as a single childless disc (the blank-cake bug).
+              // as a single childless disc.
               data: [data],
-              radius: ["6%", "94%"],
+              radius: ["6%", "88%"],
+              // Right side of the pane is the path panel's space.
+              center: ["38%", "50%"],
               nodeClick: false, // we drill via our own click handler
               // No labels (user preference): on a radial map they rotate
-              // with the arcs and read badly; the tooltip carries names.
+              // with the arcs and read badly; the panel carries names.
               label: { show: false },
-              emphasis: { focus: "ancestor" },
+              emphasis: { focus: "none" },
             },
           ],
         },
@@ -152,13 +159,29 @@
 </script>
 
 <!-- flame-wrap class: FlameView's pane layout keys on it (flex:1 +
-     min-height:0). The fixed min pixel height is diagnosis belt: even if
-     every flex rule vanished, the chart still gets a drawable box. -->
+     min-height:0). -->
 <div class="flame-wrap sunburst-wrap" bind:this={el}>
   {#if fatal}
     <div class="fatal" role="alert">sunburst: {fatal}</div>
-  {:else if countNodes(root) <= 1}
-    <div class="hintline">sunburst: {countNodes(root)} node</div>
+  {/if}
+
+  {#if hoverChain && hoverChain.length > 0}
+    <aside class="path-panel" aria-label={$t("flame.pathPanel")}>
+      <h3>{$t("flame.pathPanel")}</h3>
+      <ol>
+        {#each hoverChain as level, i (i)}
+          <li class:current={i === hoverChain.length - 1}>
+            <span class="lvl-name" title={level.name}>{level.name}</span>
+            <span class="lvl-size">{humanBytes(level.size)}</span>
+            {#if i > 0}
+              <span class="lvl-pct">
+                {$t("flame.ofParentLine").replace("{pct}", level.pctOfParent.toFixed(1))}
+              </span>
+            {/if}
+          </li>
+        {/each}
+      </ol>
+    </aside>
   {/if}
 </div>
 
@@ -182,15 +205,75 @@
     word-break: break-all;
   }
 
-  .hintline {
+  .path-panel {
     position: absolute;
-    inset: 0;
-    z-index: 5;
-    display: grid;
-    place-items: center;
-    color: var(--text);
-    opacity: 0.6;
+    top: 10px;
+    right: 10px;
+    bottom: 10px;
+    width: 34%;
+    min-width: 180px;
+    max-width: 300px;
+    z-index: 6;
+    overflow-y: auto;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
     font-size: 12px;
-    pointer-events: none;
+    box-shadow: 0 4px 18px rgb(0 0 0 / 0.12);
+    pointer-events: none; /* hover must keep reaching the chart */
+  }
+
+  .path-panel h3 {
+    margin: 0 0 6px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+    opacity: 0.75;
+  }
+
+  .path-panel ol {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .path-panel li {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    flex-wrap: wrap;
+    color: var(--text);
+    padding: 2px 4px;
+    border-radius: 4px;
+  }
+
+  .path-panel li.current {
+    background: var(--bg);
+    font-weight: 600;
+  }
+
+  .lvl-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .lvl-size {
+    color: var(--text);
+    opacity: 0.85;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .lvl-pct {
+    flex-basis: 100%;
+    font-size: 10.5px;
+    opacity: 0.55;
+    margin-top: -1px;
   }
 </style>
