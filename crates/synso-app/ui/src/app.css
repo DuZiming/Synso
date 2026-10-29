@@ -29,6 +29,17 @@
   box-sizing: border-box;
 }
 
+/* Page scrollbars hidden (user preference): scrolling still works —
+   wheel/keyboard/trackpad — the bar itself just doesn't render. Applies
+   to the page; inner panels keep their own overflow handling. */
+html {
+  scrollbar-width: none; /* Firefox */
+}
+
+html::-webkit-scrollbar {
+  display: none; /* Chromium (WebView2) */
+}
+
 body {
   margin: 0;
   font-family:

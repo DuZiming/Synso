@@ -310,6 +310,29 @@
 
         {#if pane.tree}
           <div class="pane-body">
+            <aside class="side-panel" aria-label={$t("flame.pathPanel")}>
+              {#if pane.hover && pane.hover.chain.length > 0}
+                <h3>{$t("flame.pathPanel")}</h3>
+                <!-- Hovered first, then each parent up to the root. -->
+                <ol>
+                  {#each [...pane.hover.chain].reverse() as level, i (i)}
+                    <li class:current={i === 0}>
+                      <span class="lvl-name" title={level.name}>{level.name}</span>
+                      <span class="lvl-size">{humanBytes(level.size)}</span>
+                    </li>
+                  {/each}
+                </ol>
+              {:else}
+                <p class="path-hint">{$t("flame.pathHint")}</p>
+              {/if}
+            </aside>
+            <FlameChartSunburst
+              root={pane.tree}
+              onDrill={(path) => drill(pane, path)}
+              onReveal={(path) => void reveal(path)}
+              onAddToCollection={(path) => void addToCollection(path)}
+              onHover={(info) => (pane.hover = info)}
+            />
             <aside class="side-panel" aria-label={$t("flame.childrenPanel")}>
               {#if pane.hover && pane.hover.children.length > 0}
                 <h3>{$t("flame.childrenPanel")}</h3>
@@ -325,29 +348,6 @@
                 <p class="path-hint">{$t("flame.childrenEmpty")}</p>
               {:else}
                 <p class="path-hint">{$t("flame.childrenHint")}</p>
-              {/if}
-            </aside>
-            <FlameChartSunburst
-              root={pane.tree}
-              onDrill={(path) => drill(pane, path)}
-              onReveal={(path) => void reveal(path)}
-              onAddToCollection={(path) => void addToCollection(path)}
-              onHover={(info) => (pane.hover = info)}
-            />
-            <aside class="side-panel" aria-label={$t("flame.pathPanel")}>
-              {#if pane.hover && pane.hover.chain.length > 0}
-                <h3>{$t("flame.pathPanel")}</h3>
-                <!-- Hovered first, then each parent up to the root. -->
-                <ol>
-                  {#each [...pane.hover.chain].reverse() as level, i (i)}
-                    <li class:current={i === 0}>
-                      <span class="lvl-name" title={level.name}>{level.name}</span>
-                      <span class="lvl-size">{humanBytes(level.size)}</span>
-                    </li>
-                  {/each}
-                </ol>
-              {:else}
-                <p class="path-hint">{$t("flame.pathHint")}</p>
               {/if}
             </aside>
           </div>
