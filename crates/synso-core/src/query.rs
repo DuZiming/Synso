@@ -406,13 +406,25 @@ fn passes_filters(
         }
         PathFilter::Fast { needle, dir_hits } => {
             // The name check is the cheaper probe and short-circuits the
-            // dir-set lookup for name-bearing paths.
-            if !hot.name_lower(slot).contains(needle) && !dir_hits.contains(&hot.parent_dir(slot)) {
+            // dir-set lookup for name-bearing paths. The PREPARED needle
+            // (first-byte skip) beats `str::contains` on the reject-heavy
+            // path: the name misses dominate this filter's cost.
+            if !word_probe(needle, hot.name_lower(slot))
+                && !dir_hits.contains(&hot.parent_dir(slot))
+            {
                 return false;
             }
         }
     }
     true
+}
+
+/// First-byte-probe substring scan of a prepared needle into `hay` —
+/// `PreparedWord::find_from`'s containment check, standalone for the path
+/// filter (whose needle is built once per pass like a PreparedWord but
+/// lives in `PathFilter`, not the words list).
+fn word_probe(needle: &str, hay: &str) -> bool {
+    PreparedWord::new(needle).contained_in(hay)
 }
 
 /// Full lowercased path text of dir `id` — root segment, ..., name,
@@ -798,9 +810,19 @@ fn cmp_segment_with_sep(x: &[u8], y: &[u8], sep: u8) -> Ordering {
 /// either pinyin key is a [`MatchClass::Substring`] hit — position inside
 /// the key does not matter, so pinyin never outranks a literal match of
 /// the same file (or any other file's literal Prefix/WordStart hit).
+///
+/// Arena shortcut (the alias refactor's speed twin): for pure-ASCII names
+/// both pinyin keys ARE the lowercased name — the name scan already
+/// proved the word is NOT in it, so the two pinyin scans cannot hit and
+/// are skipped. At a 1M-entry corpus most names are ASCII, and the
+/// initials pass measured ~15% over budget without this.
 #[inline]
 fn pinyin_class(hot: &HotIndex, slot: usize, word: &PreparedWord) -> Option<MatchClass> {
-    if word.contained_in(hot.py_full(slot)) || word.contained_in(hot.py_init(slot)) {
+    if hot.py_full_aliases_name(slot) {
+        return None; // aliased ASCII name: the name scan already missed
+    }
+    let py_full = hot.py_full(slot);
+    if word.contained_in(py_full) || word.contained_in(hot.py_init(slot)) {
         Some(MatchClass::Substring)
     } else {
         None
