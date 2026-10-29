@@ -169,9 +169,8 @@
               radius: ["6%", "94%"],
               nodeClick: false, // we drill via our own click handler
               // No labels (user preference): on a radial map they rotate
-              // with the arcs and read badly; the tooltip carries names.
+              // with the arcs and read badly; the side panels carry names.
               label: { show: false },
-              emphasis: { focus: "ancestor" },
             },
           ],
         },
