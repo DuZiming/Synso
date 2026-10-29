@@ -159,10 +159,12 @@
               // No tooltip (hover-lag culprit #2): the side panels carry
               // richer info than the floating bubble did.
               tooltip: { show: false },
-              // emphasis focus "ancestor" dims every non-ancestor arc — a
-              // full-canvas repaint per arc crossing (hover-lag culprit
-              // #1). "none" keeps hover a no-op on the canvas.
-              emphasis: { focus: "none" },
+              // Ancestor highlight on hover (user-kept effect): the
+              // hovered dir's whole lineage lights up, everything else
+              // dims. Costs a canvas repaint per arc crossing — the other
+              // hover-path optimizations (no tooltip, guarded panel
+              // updates) keep the total feel smooth.
+              emphasis: { focus: "ancestor" },
               // series.data is an ARRAY of roots — a bare object renders
               // as a single childless disc (the blank-cake bug).
               data: roots,
