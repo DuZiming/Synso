@@ -28,7 +28,8 @@
 
 **修法**:
 
-- **设置快路径**:Engine 内缓存 `Settings`(独立小锁);`open` 时经 `load_persisted`(独立连接,已有)预热;`settings()` 返回缓存副本;`set_settings` 写穿 store 后更新缓存。设置读写从此不等索引加载/扫描;
+- **设置读快路径**:Engine 内缓存 `Settings`(独立小锁);`open` 时经 `load_persisted`(独立连接,已有)预热;`settings()` 返回缓存副本;`set_settings` 写穿 store 后更新缓存。设置**读取**从此不等索引加载/扫描;
+- **范围界定(评审后定)**:只做读路径。设置**写入**仍经 store 锁——加载/扫描期间点保存,保存按钮会等到它们结束(async 命令,不冻结 UI,只是等)。此为已接受行为,记录在案;若实际使用中咬人再立任务(那要拆扫描的整段持锁,是锁架构级改动,不在本轮);
 - `list_volumes` 命令改 async(线程池);
 - 复查其余同步命令(`engine_stats`、`dedup_*` 等)在锁下的最大持有时长,凡可能秒级的改 async 或在设计文档外记录保留理由。
 
@@ -38,21 +39,24 @@
 
 **现象**:运行中删除文件夹,仪表盘文件数变化,容量地图不动。
 
-**已排除**:引擎侧无缓存(`size_tree_dirs` 每次现算);事件在发(`FsChanged` → `fs-changed` emit)。
+**已排除**:引擎侧无缓存(`size_tree_dirs` 每次现算);事件在发(`FsChanged` → `fs-changed` emit)。静态读码另显示 sunburst 的 `$effect` 依赖 tree/root prop 并以 `notMerge` 重跑 `setOption`,"数据变了图不重画"这条嫌疑被削弱(评审注),但复现取证前不最终排除。
 
 **嫌疑(按序排查;先复现取证据再动手,系统化调试纪律)**:
 
-1. `FlameChartSunburst` 对 data prop 更新的响应(echarts setOption / 重绘路径)——`pane.tree` 已更新但图不重画;
-2. `listen("fs-changed")` 注册/解注册时序竞态(Task 16 记录过的 `listen().then(un)` 模式);
-3. 对比模式双窗格的刷新路径。
+1. `listen("fs-changed")` 注册/解注册时序竞态(Task 16 记录过的 `listen().then(un)` 模式);
+2. 事件到窗格的路径:对比模式双窗格、`visiblePanes` 取值时机;
+3. sunburst 重绘路径(静态读码已削弱,兜底保留)。
 
 **验收**:运行中删除/新建文件夹,600ms 去抖后地图刷新且保持钻取位置;对比模式两窗格都刷新。
 
 ### 任务 3:根层磁盘使用率 + 「火焰图」→「容量地图」改名
 
 - `VolumeInfo` 增加 `available_bytes`(sysinfo `available_space`),随 `list_volumes` 返回;
-- **根层**(根 = 卷/扫描根时)的环按物理容量构成:各已索引目录块 + 「未索引」块(= 物理已用 − 根层索引合计,≤0 则隐藏)+ 灰色「剩余空间」块(= `available_bytes`);中心/悬停显示「C: 已用 800.2 GB / 共 931 GB」式文案;
-- 下钻后物理对照消失(子目录层照旧);
+- **「根层」的精确定义(评审后定)**:
+  - 物理容量叠加(「未索引」块 = 物理已用 − 根层索引合计,≤0 隐藏;灰色「剩余空间」块 = `available_bytes`;中心/悬停「C: 已用 800.2 GB / 共 931 GB」文案)**仅当窗格根是单个卷挂载点**(与 `list_volumes` 结果按挂载点匹配);
+  - 子目录作为扫描根(如 `D:\data`)时不叠加——"物理已用"在子树上没有无歧义含义,索引合计即该子树的真实;
+  - `(all)` 总览视图不加块;各卷弧的悬停/标签补充「已用 / 共」文案;
+  - 卷数据随每次树刷新(含 fs-changed 去抖重取)一起重取,保证删除文件后"已用"立即跟上;根匹配不到已列出的固定卷(可移动/网络卷)时隐藏叠加,不报错。
 - i18n:zh「容量地图」/ en "Capacity Map";`tabs.flame` 与 `flame.*` 命名空间同步;代码符号(FlameView 等)不改名(用户可见文案优先,known-issues 已有此定夺)。
 
 **验收**:C 盘根层"已用"与资源管理器一致(允许小误差);两语言键完整(`check:i18n` 过)。
@@ -61,13 +65,13 @@
 
 用户决定,后续重新规划。删除范围:
 
-- **UI**:`CollectionsView`、`CollectionPicker`、快速窗多选「加入集合」、容量地图右键「加入集合」;
+- **UI**:`CollectionsView`、`CollectionPicker`、快速窗多选「加入集合」;容量地图的集合管线(`addToCollection`、`pickerIds` 及 sunburst 组件里**从未接线的** `onAddToCollection` 等 prop 声明一并删除——评审勘误:右键菜单本就未实现,验收不再检查"右键菜单无集合入口");
 - **commands**:`coll_*` 全部;
 - **engine**:`collections.rs`、engine 内 `reconcile` 调用点、`coll:` 查询修饰符(解析器不再识别,按未知 token 字面回退——与 `size:abc` 的既有行为一致);
 - **DB**:`collections`/成员表保留不迁移,代码不再触碰(用户已同意);
 - **文档**:使用手册 §6 删除;i18n 键删净(`check:i18n` 兜底)。
 
-**验收**:代码全文检索 coll/collection 无残留(除 store schema 声明与迁移历史);手测快速窗多选、右键菜单无集合入口;查重/搜索/容量地图不受影响。
+**验收**:代码全文检索 coll/collection 无残留(除 store schema 声明与迁移历史);手测快速窗多选、容量地图无任何集合入口;查重/搜索/容量地图不受影响。
 
 ### 任务 5:内存占用(先测量拆账,后定方案)
 
