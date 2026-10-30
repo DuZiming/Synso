@@ -15,9 +15,9 @@
   // `reveal_index_path`; failures surface in the same toast.
   import { onMount } from "svelte";
   import { t } from "../i18n";
-  import { revealIndexPath, sizeTree, volumeOverlay } from "../lib/tauri";
+  import { listVolumes, revealIndexPath, sizeTree, volumeOverlay } from "../lib/tauri";
   import { listen } from "@tauri-apps/api/event";
-  import type { SizeNode, VolumeOverlay } from "../lib/types";
+  import type { SizeNode, VolumeInfo, VolumeOverlay } from "../lib/types";
   import FlameChartSunburst from "./FlameChartSunburst.svelte";
   import { humanBytes } from "../lib/format";
 
@@ -49,6 +49,9 @@
     picker: string;
     hover: HoverInfo | null;
     overlay: VolumeOverlay | null;
+    /// Fixed volumes with their totals, fetched when this pane sits at the
+    /// (all) root — the promoted volume arcs hover with their usage line.
+    volumes: VolumeInfo[];
   }
 
   function newPane(root: string): Pane {
@@ -62,6 +65,7 @@
       picker: root,
       hover: null,
       overlay: null,
+      volumes: [],
     };
   }
 
@@ -101,13 +105,21 @@
     pane.error = null;
     // The overlay rides along on every load (including fs-changed
     // refreshes) so the used/free figures track deletions; a failure
-    // degrades to no overlay, never a failed pane.
+    // degrades to no overlay, never a failed pane. At the (all) root the
+    // overlay is null by design — instead the volume list feeds the
+    // promoted arcs' hover usage line (spec: (all) 不加块,悬停补文案).
     const overlayFetch = volumeOverlay(pane.root).catch(() => null);
+    const volumesFetch =
+      pane.root === ""
+        ? listVolumes().catch(() => [] as VolumeInfo[])
+        : Promise.resolve([] as VolumeInfo[]);
     try {
       const tree = await sizeTree(pane.root, depth, MAX_CHILDREN, false);
       const overlay = await overlayFetch;
+      const volumes = await volumesFetch;
       if (seq !== pane.seq) return; // a newer request superseded this one
       pane.overlay = overlay;
+      pane.volumes = volumes;
       if (tree) {
         pane.tree = tree;
         pane.missing = false;
@@ -122,6 +134,23 @@
     } finally {
       if (seq === pane.seq) pane.loading = false;
     }
+  }
+
+  /// At the (all) root with a hovered promoted arc: the volume that arc
+  /// names, if any (the arc's own name is the scan-root segment, e.g.
+  /// `C:` — matched against mounts trailing-separator-trimmed and
+  /// case-insensitively, mirroring the engine's `match_volume`).
+  function hoveredVolume(pane: Pane): VolumeInfo | null {
+    if (pane.root !== "" || !pane.hover) return null;
+    const name = pane.hover.chain[0]?.name;
+    if (!name) return null;
+    const key = name.trimEnd().toLowerCase();
+    const key2 = key.replace(/[/\\]+$/, "");
+    return (
+      pane.volumes.find(
+        (v) => v.path.trimEnd().toLowerCase().replace(/[/\\]+$/, "") === key2,
+      ) ?? null
+    );
   }
 
   /// Root change from any source (breadcrumb, picker, drill). The engine
@@ -300,6 +329,18 @@
                     </li>
                   {/each}
                 </ol>
+                {#if hoveredVolume(pane)}
+                  <p class="usage-line">
+                    {$t("flame.used")}
+                    {humanBytes(
+                      hoveredVolume(pane)!.total_bytes -
+                        hoveredVolume(pane)!.available_bytes,
+                    )}
+                    /
+                    {$t("flame.total")}
+                    {humanBytes(hoveredVolume(pane)!.total_bytes)}
+                  </p>
+                {/if}
               {:else}
                 <p class="path-hint">{$t("flame.pathHint")}</p>
               {/if}

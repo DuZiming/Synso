@@ -143,7 +143,7 @@ const en = {
     filesLine: "{n} files",
     ofParentLine: "{pct}% of parent",
     used: "Used",
-    total: "of",
+    total: "Total",
     unindexed: "Unindexed",
     freeSpace: "Free space",
   },

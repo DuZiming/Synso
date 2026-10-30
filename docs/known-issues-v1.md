@@ -39,7 +39,7 @@
   与死 prop）、commands（coll_* 与 file_id_of）、engine（collections.rs、7 个
   coll_* 方法、`coll:` 修饰符——现在按字面回退、三处 reconcile 调用点）
 - DB 的 `collections`/`collection_members` 表保留未迁移，代码不再触碰；使用手册
-  §6 删除、章节重排；i18n 键删净（128 键对齐）
+  §6 删除、章节重排；i18n 键删净（127 键对齐）
 - 重新规划时参考：引擎侧墓碑/重绑经验见 v1 提交历史（collections.rs 于
   6f033a3 删除）
 
