@@ -169,6 +169,12 @@ pub struct Engine {
     /// Dedup state machine + worker plumbing (Task 9). Threads and the
     /// auto-start timer own `Arc`s of this, never of the engine.
     dedup: Arc<DedupShared>,
+    /// In-memory copy of the persisted settings, preheated in [`open`]
+    /// and refreshed by [`Engine::set_settings`]. `settings()` serves
+    /// this — NEVER the store mutex, which the hot-index load and full
+    /// scans hold for their whole duration (a store-lock read froze the
+    /// app's main thread at startup: the v1 "not responding" bug).
+    settings_cache: Mutex<Settings>,
 }
 
 /// State shared between the engine, the dedup worker thread and the
@@ -204,6 +210,11 @@ impl Engine {
     /// flips to `true` when that load completes.
     pub fn open(db_path: &Path, opts: EngineOptions) -> Result<Engine> {
         let store = Arc::new(Mutex::new(Store::open(db_path)?));
+        // Preheat the settings cache BEFORE the hot-index load spawns:
+        // at this instant the store mutex is uncontended (the load and
+        // scans are what hold it for seconds later), so this read costs
+        // milliseconds — and every later `settings()` is lock-free.
+        let initial_settings = settings::load(&lock_unpoisoned(&store));
         let hot = Arc::new(RwLock::new(HotIndex::cold()));
         let scan_opts = ScanOptions {
             roots: opts.volumes,
@@ -229,6 +240,7 @@ impl Engine {
             db_path: db_path.to_path_buf(),
             watcher: Mutex::new(None),
             dedup,
+            settings_cache: Mutex::new(initial_settings),
         };
         if let Err(err) = thread::Builder::new()
             .name("synso-hot-load".into())
@@ -399,19 +411,25 @@ impl Engine {
 
     // ---------------- Task 13: user settings -----------------------------
 
-    /// The persisted user settings (see [`crate::settings`]). Missing
-    /// fields read as their documented defaults, and a store read error
-    /// degrades to the default for that field — settings are UI
-    /// convenience, never a startup failure.
+    /// The persisted user settings (see [`crate::settings`]), served from
+    /// the in-engine cache — this call NEVER touches the store mutex, so
+    /// it stays fast while a hot-index load or full scan holds it (the
+    /// app's main thread reads the shortcut at startup through
+    /// `quick::init`). The cache is preheated in [`Engine::open`] and
+    /// refreshed by [`Engine::set_settings`]; missing fields read as
+    /// their documented defaults.
     pub fn settings(&self) -> Settings {
-        settings::load(&lock_unpoisoned(&self.store))
+        lock_unpoisoned(&self.settings_cache).clone()
     }
 
-    /// Persists `settings` to the store's meta table; store errors surface
-    /// to the caller. The change applies to the field's consumers on their
-    /// next read (the engine holds no in-memory copy).
+    /// Persists `settings` to the store's meta table and refreshes the
+    /// in-memory cache in the same step (see [`Engine::settings`]), so
+    /// the two can never disagree. Store errors surface to the caller
+    /// and leave the cache untouched.
     pub fn set_settings(&self, settings: &Settings) -> Result<()> {
-        settings::save(&lock_unpoisoned(&self.store), settings)
+        settings::save(&lock_unpoisoned(&self.store), settings)?;
+        *lock_unpoisoned(&self.settings_cache) = settings.clone();
+        Ok(())
     }
 
     /// Case-insensitive substring search over the hot index's name arena
@@ -2258,5 +2276,63 @@ mod tests {
             .size_tree(&format!("fixture{sep}docs"), 1, 40)
             .unwrap();
         assert_eq!((dir_tree.size, dir_tree.file_count), (113, 4));
+    }
+
+    // ---------------- v1.1: cached settings reads ------------------------
+
+    /// `settings()` must be served from an in-engine cache, NOT the store
+    /// mutex: the startup hot-index load and full scans hold that mutex
+    /// for their whole duration, and the app's main thread reads the
+    /// shortcut through `quick::init` inside `.setup` — a store-lock read
+    /// there is the "window not responding for tens of seconds" bug. The
+    /// test holds the store lock exactly the way a load would; a cached
+    /// read returns instantly.
+    #[test]
+    fn settings_read_does_not_wait_on_store_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&tmp.path().join("index.db"), EngineOptions::default()).unwrap();
+
+        // Hold the store mutex the way the hot-index loader / a scan does.
+        // The guard borrows the local Arc clone, so `engine` itself can
+        // still move into the reader thread below.
+        let store = Arc::clone(&engine.store);
+        let _store_guard = lock_unpoisoned(&store);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let settings = engine.settings();
+            tx.send(settings.shortcut).unwrap();
+        });
+
+        let shortcut = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("settings() must not wait on the store mutex");
+        assert_eq!(shortcut, crate::settings::DEFAULT_SHORTCUT);
+        reader.join().unwrap();
+    }
+
+    /// `set_settings` writes through to the store AND refreshes the cache
+    /// in one step: the next `settings()` sees the new value without a
+    /// store round-trip, and a fresh `Engine::open` over the same database
+    /// reads it back from disk (cache and store never disagree).
+    #[test]
+    fn set_settings_roundtrip_cache_and_persist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("index.db");
+        let engine = Engine::open(&db, EngineOptions::default()).unwrap();
+
+        let mut next = engine.settings();
+        next.lang = "en".into();
+        next.shortcut = "Ctrl+Space".into();
+        engine.set_settings(&next).unwrap();
+
+        // The cache reflects the write immediately.
+        assert_eq!(engine.settings(), next);
+
+        // The store holds it too: a fresh open (whose cache is preheated
+        // from disk) reads the same values back.
+        drop(engine);
+        let reopened = Engine::open(&db, EngineOptions::default()).unwrap();
+        assert_eq!(reopened.settings(), next);
     }
 }

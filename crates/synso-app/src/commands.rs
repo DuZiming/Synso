@@ -15,6 +15,8 @@ use crate::state::AppState;
 
 /// Current index snapshot (files / dirs / warm / interned bytes) for the
 /// dashboard stats tile.
+// Sync is safe: a hot-index read lock held for microseconds (the loader
+// swaps in a fully built index, it never holds the lock while building).
 #[tauri::command]
 pub fn engine_stats(state: State<'_, AppState>) -> EngineStats {
     state.engine.stats()
@@ -24,6 +26,8 @@ pub fn engine_stats(state: State<'_, AppState>) -> EngineStats {
 /// time: a call while a scan runs is a no-op. Progress arrives as the
 /// `scan-progress` / `scan-finished` / `scan-failed` events (see
 /// `events.rs`).
+// Sync is safe: claims the scan slot via compare-exchange and spawns the
+// walk thread — no store lock is taken on the caller's thread.
 #[tauri::command]
 pub fn start_full_scan(state: State<'_, AppState>) {
     state.engine.start_full_scan();
@@ -141,8 +145,11 @@ pub async fn autostart_set(
 }
 
 /// The fixed local volumes, for the first-run wizard's volume picker.
+/// Async (thread-pool): sysinfo's disk refresh can take 1–3s, and a sync
+/// command runs on the MAIN thread — the settings page's volume list
+/// would freeze every window while it enumerates.
 #[tauri::command]
-pub fn list_volumes() -> Vec<VolumeInfo> {
+pub async fn list_volumes() -> Vec<VolumeInfo> {
     synso_core::list_volumes()
 }
 
@@ -173,6 +180,7 @@ pub async fn search(
 /// The engine's own parse of the query, for the quick window's modifier
 /// chips — the SAME parser the search path runs, so the chips can never
 /// disagree with what was actually searched.
+// Sync is safe: pure text parsing, no locks.
 #[tauri::command]
 pub fn parse_preview(q: String) -> ParsedQuery {
     synso_core::parse_query(&q)
@@ -252,6 +260,7 @@ pub fn quick_show_query(app: AppHandle, q: String) {
 /// The view's real "boost" semantic is calling this NOW instead of
 /// waiting for the engine's 30s post-scan auto-start; persisted hashes
 /// make every later run skip I/O on already-hashed files.
+// Sync is safe: an atomic claim plus a thread spawn, no locks held.
 #[tauri::command]
 pub fn dedup_start(state: State<'_, AppState>) {
     state.engine.dedup_start();
@@ -260,6 +269,7 @@ pub fn dedup_start(state: State<'_, AppState>) {
 /// Snapshot of the dedup state machine: phase, the current stage's
 /// `done`/`total`, the last completed run's group count and the skipped
 /// (unreadable / cloud-placeholder) file count.
+// Sync is safe: a copy out of the small bookkeeping mutex.
 #[tauri::command]
 pub fn dedup_state(state: State<'_, AppState>) -> DedupState {
     state.engine.dedup_state()
@@ -269,6 +279,8 @@ pub fn dedup_state(state: State<'_, AppState>) -> DedupState {
 /// groups, size-descending, members materialized as search-style hits.
 /// Files deleted since the run drop out; a group below two surviving
 /// members dissolves.
+// Sync is safe: an Arc snapshot of the stored groups plus a hot-index
+// read lock — the store mutex is never taken (v1.1 audit).
 #[tauri::command]
 pub fn dedup_groups(state: State<'_, AppState>, offset: u32, limit: u32) -> Vec<DupeGroup> {
     state.engine.dedup_groups(offset, limit)
