@@ -1,6 +1,6 @@
 //! synso-core: the Synso file-indexing engine as one embeddable facade —
 //! SQLite store, scanner, in-memory hot index, query execution, watcher,
-//! dedup, collections, trash and directory-size aggregation, glued behind
+//! dedup, trash and directory-size aggregation, glued behind
 //! a single entry point.
 //!
 //! The crate stays UI-free and dependency-light (never depend on tauri) so
@@ -17,14 +17,13 @@
 //!   fixture constructor) and [`search_index`], the standalone query
 //!   pipeline over it
 //! - Feature data: [`SizeNode`], [`DedupPhase`], [`DedupState`],
-//!   [`DupeGroup`], [`Collection`], [`MemberHit`], [`FileId`],
-//!   [`VolumeInfo`], [`pinyin_keys`]
+//!   [`DupeGroup`], [`FileId`], [`VolumeInfo`], [`pinyin_keys`]
 //! - Errors: [`SynsoError`], [`Result`]
 //!
 //! With the optional `serde` feature enabled, the facade DATA types
 //! (`Hit`, `SearchResult`, `ParsedQuery`, `SizeNode`, `DedupPhase`,
-//! `DedupState`, `DupeGroup`, `Collection`, `MemberHit`, `EngineStats`,
-//! `EngineEvent`, `VolumeInfo`, `Settings`) derive `Serialize` /
+//! `DedupState`, `DupeGroup`, `EngineStats`,
+//! `EngineEvent`, `VolumeInfo`, `VolumeOverlay`, `Settings`) derive `Serialize` /
 //! `Deserialize` — the app layer and JSON bridges turn that on; core
 //! itself stays dependency-lean without it.
 //!
@@ -118,8 +117,7 @@ pub enum SynsoError {
     /// Target row does not exist.
     #[error("not found")]
     NotFound,
-    /// Requested state conflicts with what already exists (e.g. a
-    /// collection name is already taken).
+    /// Requested state conflicts with what already exists.
     #[error("conflict: {0}")]
     Conflict(String),
     /// Malformed input from the caller (e.g. a path-segment resolution

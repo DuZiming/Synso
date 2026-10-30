@@ -12,9 +12,7 @@
 //! fresh reload can never be overwritten by a stale loader snapshot. One
 //! scan at a time: [`Engine::start_full_scan`] is a no-op while a scan is
 //! running; the slot is released by a drop guard, so even a panicked scan
-//! cannot wedge the engine. A successful scan also runs the collections
-//! reconcile (tombstone + rebind, see [`crate::collections`]) inside the
-//! same store critical section, before `ScanFinished` is emitted.
+//! cannot wedge the engine.
 //!
 //! Failure semantics: a scan that aborts with a store error emits
 //! [`EngineEvent::ScanFailed`] instead of `ScanFinished` and does NOT swap
@@ -454,7 +452,7 @@ impl Engine {
     /// Case-insensitive substring search over the hot index's name arena
     /// (see `crate::query` for the full contract). `text` is first
     /// parsed by [`crate::parse_query`]: Everything-style modifier
-    /// tokens (`ext:` / `size:` / `path:` / `coll:`) become dimension
+    /// tokens (`ext:` / `size:` / `path:`) become dimension
     /// filters applied before ranking, and the remaining words are free
     /// text that must ALL match. Ranking: prefix > word-start >
     /// substring, a within-class boost for mtimes within the last 30
@@ -470,12 +468,8 @@ impl Engine {
 
     /// [`Engine::search`] over an already-parsed query (see
     /// [`crate::parse_query`]). The parsed dimension filters
-    /// (`ext:` / `size:` / `path:` / `coll:`) apply as fast predicates
+    /// (`ext:` / `size:` / `path:`) apply as fast predicates
     /// BEFORE ranking and classification; ranking itself is unchanged.
-    /// `q.collections` resolves against the store: a file must be an ALIVE
-    /// member of every named collection, an unknown name filters the result
-    /// to empty (not an error), and a store error is logged and yields an
-    /// empty result (search is never fatal).
     pub fn search_parsed(&self, q: &ParsedQuery, offset: u32, limit: u32) -> SearchResult {
         let hot = read_unpoisoned(&self.hot);
         query::run_parsed(&hot, q, offset, limit, unix_now())
@@ -572,12 +566,10 @@ impl Engine {
     }
 
     /// The `files` row id the index-relative `path` names (the `Hit::path`
-    /// spelling; both separators accepted, directories included) — the
-    /// path → id bridge the app's `file_id_of` command (Task 18) needs,
-    /// because flame-chart nodes carry paths rather than row ids: adding a
-    /// flame node to a collection resolves it here first, then `coll_add`s
-    /// the id. `None` when the path matches nothing (unknown path, or the
-    /// virtual root `""` — it names no single entry).
+    /// spelling; both separators accepted, directories included) — a
+    /// generic path → id bridge (flame-chart nodes carry paths rather
+    /// than row ids). `None` when the path matches nothing (unknown path,
+    /// or the virtual root `""` — it names no single entry).
     pub fn file_id_of(&self, path: &str) -> Option<FileId> {
         let hot = read_unpoisoned(&self.hot);
         hot.id_of_path(path)
@@ -660,11 +652,9 @@ impl Engine {
     /// with the watcher's removal mechanics
     /// (`crate::watcher::remove_path`: the row located by (dir, name)
     /// plus a subtree purge on the store, the slot removal plus subtree
-    /// sweep on the hot index) under one store -> hot lock pair, and — when
-    /// at least one path landed — the collections reconcile (tombstone +
-    /// rebind) runs in the same store critical section. A path the trash
-    /// batch refused is logged and keeps its index rows; the next rescan
-    /// heals any drift. Returns the success count.
+    /// sweep on the hot index) under one store -> hot lock pair. A path
+    /// the trash batch refused is logged and keeps its index rows; the
+    /// next rescan heals any drift. Returns the success count.
     pub fn delete_to_trash(&self, ids: &[FileId]) -> Result<usize> {
         // Phase 1: one hot-index read snapshot -> one candidate per live
         // id. The (dir chain, name) key and the index-relative spelling are
@@ -1833,8 +1823,7 @@ mod tests {
     // ------------------ Task 10: recycle-bin deletion ---------------------
 
     /// The recycle-bin contract end to end: the file leaves the disk, leaves
-    /// search, leaves the store, and its collection membership is
-    /// tombstoned (alive=0) with the name snapshot kept for a later rebind.
+    /// search, and leaves the store.
     #[test]
     fn delete_to_trash_removes_and_updates_index() {
         let tmp = tempfile::tempdir().unwrap();

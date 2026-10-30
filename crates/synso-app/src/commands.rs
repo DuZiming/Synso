@@ -156,17 +156,15 @@ pub async fn list_volumes() -> Vec<VolumeInfo> {
 // ---------------------- Task 15: quick search window ----------------------
 
 /// Everything-style search: page `[offset, offset + limit)` of the ranked
-/// matches. Query modifiers (`ext:` / `size:` / `path:` / `coll:`) are
-/// parsed inside the engine, exactly as the dashboard path would. On a
-/// cold index the hot side is empty, so this returns an empty page — the
-/// quick window says "warming up" via `engine_stats`'s `warm` flag then.
+/// matches. Query modifiers (`ext:` / `size:` / `path:`) are parsed inside
+/// the engine, exactly as the dashboard path would. On a cold index the
+/// hot side is empty, so this returns an empty page — the quick window
+/// says "warming up" via `engine_stats`'s `warm` flag then.
 ///
-/// Async (thread-pool, not the main thread — see `size_tree`): a query
-/// with a `coll:` modifier resolves collection names under the store
-/// mutex, which a running scan holds for its whole walk — typing
-/// `coll:x` during a scan would otherwise freeze EVERY window. Returns a
-/// `Result` because Tauri requires that of async commands with reference
-/// inputs; `Ok` serializes to exactly the `SearchResult` JSON.
+/// Async (thread-pool, not the main thread — see `size_tree`): the call
+/// takes the hot index read lock, which watcher write batches can delay.
+/// Returns a `Result` because Tauri requires that of async commands with
+/// reference inputs; `Ok` serializes to exactly the `SearchResult` JSON.
 #[tauri::command]
 pub async fn search(
     state: State<'_, AppState>,
@@ -240,10 +238,10 @@ pub fn quick_info(state: State<'_, quick::QuickState>) -> quick::QuickInfo {
     state.info()
 }
 
-/// Shows + focuses the quick window with the query PRE-FILLED — the
-/// collections view's 「在快速搜索中查看」 button hands over `coll:<name>`.
-/// The same show logic the dashboard button (`quick_show`) uses, plus one
-/// `quick-query` event `emit_to` the quick webview (the pre-fill hook: the
+/// Shows + focuses the quick window with the query PRE-FILLED — a generic
+/// entry point for handing a query over (no in-app caller today; kept for
+/// tray/deep-link style entries). The same show logic the dashboard button
+/// (`quick_show`) uses, plus one `quick-query` event `emit_to` the quick webview (the pre-fill hook: the
 /// window's page is mounted from startup, its listener applies the text
 /// whenever it lands — see `quick::show_with_query`). snake_case payload
 /// key, kebab-case event name, per the events.rs conventions.
@@ -368,19 +366,6 @@ pub fn reveal_index_path(
     app.opener()
         .reveal_item_in_dir(&abs)
         .map_err(|err| err.to_string())
-}
-
-/// Resolves an INDEX path (the `Hit::path` spelling, directories included)
-/// to its `files` row id — the bridge that lets the flame chart (whose
-/// nodes carry paths, not ids) add its node — directory OR file, the node
-/// itself, not its children — to a collection. An unresolvable path is an
-/// error the view toasts verbatim.
-#[tauri::command]
-pub async fn file_id_of(state: State<'_, AppState>, path: String) -> Result<i64, String> {
-    state
-        .engine
-        .file_id_of(&path)
-        .ok_or_else(|| format!("not in the index: \"{path}\""))
 }
 
 /// Opens the native folder picker and returns the chosen path (None on

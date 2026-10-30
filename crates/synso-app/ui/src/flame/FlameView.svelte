@@ -13,25 +13,12 @@
   // real directory — the engine would answer None): clicking it shows a
   // toast instead of a missing-path pane. Reveal goes through
   // `reveal_index_path`; failures surface in the same toast.
-  //
-  // Task 18: the context menu's 加入集合 resolves the node's path → row
-  // id (`file_id_of`, directories included) and opens the shared
-  // CollectionPicker; the NODE itself — dir or file, not its children —
-  // becomes the member. An unresolvable path (synthetic or vanished)
-  // toasts instead of opening an empty picker.
   import { onMount } from "svelte";
   import { t } from "../i18n";
-  import {
-    collAdd,
-    fileIdOf,
-    revealIndexPath,
-    sizeTree,
-    volumeOverlay,
-  } from "../lib/tauri";
+  import { revealIndexPath, sizeTree, volumeOverlay } from "../lib/tauri";
   import { listen } from "@tauri-apps/api/event";
-  import type { Collection, SizeNode, VolumeOverlay } from "../lib/types";
+  import type { SizeNode, VolumeOverlay } from "../lib/types";
   import FlameChartSunburst from "./FlameChartSunburst.svelte";
-  import CollectionPicker from "../collections/CollectionPicker.svelte";
   import { humanBytes } from "../lib/format";
 
   /// One level of the hover path chain (name + size, root first).
@@ -105,9 +92,6 @@
   let panes = $state<Pane[]>([newPane("")]);
   let toast = $state<string | null>(null);
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
-  /// The pending add-to-collection: the resolved member ids awaiting a
-  /// collection choice (null = picker closed).
-  let pickerIds = $state<number[] | null>(null);
 
   const visiblePanes = $derived(compare ? panes : panes.slice(0, 1));
 
@@ -172,33 +156,6 @@
       await revealIndexPath(path);
     } catch (err) {
       showToast(String(err));
-    }
-  }
-
-  /// Task 18 context-menu path: resolve the node's path to its files-row
-  /// id (the node ITSELF joins — dir or file), then open the picker. The
-  /// resolution error toasts verbatim (synthetic or vanished paths).
-  async function addToCollection(path: string): Promise<void> {
-    try {
-      const id = await fileIdOf(path);
-      pickerIds = [id];
-    } catch (err) {
-      showToast(String(err));
-    }
-  }
-
-  async function onPickColl(coll: Collection): Promise<void> {
-    const ids = pickerIds;
-    if (!ids || ids.length === 0) return;
-    try {
-      await collAdd(coll.id, ids);
-      pickerIds = null;
-      showToast(
-        $t("collections.added").replace("{name}", coll.name),
-      );
-    } catch (err) {
-      showToast(String(err));
-      pickerIds = null;
     }
   }
 
@@ -368,7 +325,6 @@
                 : null}
               onDrill={(path) => drill(pane, path)}
               onReveal={(path) => void reveal(path)}
-              onAddToCollection={(path) => void addToCollection(path)}
               onHover={(info) => (pane.hover = info)}
             />
             <aside class="side-panel" aria-label={$t("flame.childrenPanel")}>
@@ -411,13 +367,6 @@
     </div>
   {/if}
 </section>
-
-{#if pickerIds}
-  <CollectionPicker
-    onpick={(coll) => void onPickColl(coll)}
-    onclose={() => (pickerIds = null)}
-  />
-{/if}
 
 <style>
   .flame {

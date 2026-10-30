@@ -1057,13 +1057,11 @@ impl HotIndex {
     /// segment but the last through the interned dir tree, then look the
     /// final name up as a slot under that dir. Directory entries ARE slots
     /// (`files` rows with `is_dir = 1`), so a dir path yields the same row
-    /// id a search hit for that dir would carry — the shape `coll_add`
-    /// validates against. `None` when nothing matches: an unknown segment,
-    /// a single-segment path naming no entry (the walk root itself is never
-    /// a `files` row), or the empty virtual-root path `""`, which names no
-    /// single entry. The inverse of [`HotIndex::path_of`] — the app's
-    /// `file_id_of` command (Task 18) turns flame-chart nodes, which carry
-    /// paths rather than ids, into collection members with it.
+    /// id a search hit for that dir would carry. `None` when nothing
+    /// matches: an unknown segment, a single-segment path naming no entry
+    /// (the walk root itself is never a `files` row), or the empty
+    /// virtual-root path `""`, which names no single entry. The inverse of
+    /// [`HotIndex::path_of`].
     pub fn id_of_path(&self, path: &str) -> Option<FileId> {
         let segments: Vec<&str> = path
             .split([MAIN_SEPARATOR, '/'])

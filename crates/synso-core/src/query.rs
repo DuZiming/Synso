@@ -11,7 +11,7 @@
 //! words must ALL match (AND); the slot's class is its best word's class.
 //!
 //! Modifiers (Task 7): [`parse_query`] splits the raw string into
-//! whitespace tokens; `ext:` / `size:` / `path:` / `coll:` tokens become
+//! whitespace tokens; `ext:` / `size:` / `path:` tokens become
 //! dimension filters on [`crate::model::ParsedQuery`], a bad value
 //! (`size:abc`) falls back verbatim into the free text. Filters run as
 //! fast predicates BEFORE ranking and classification (the private
@@ -42,7 +42,7 @@ const RECENCY_WINDOW_SECS: i64 = 30 * 86_400;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Hit {
-    /// The `files` row id (what reveal/trash/collections key on later).
+    /// The `files` row id (what reveal/trash key on later).
     pub id: FileId,
     /// Full path rebuilt from the interned dir tree — root segment, ...,
     /// parent dirs, name — in the ORIGINAL spelling, joined with
@@ -81,7 +81,7 @@ enum MatchClass {
 }
 
 /// Parses a raw query string into free text plus dimension filters (the
-/// Everything-style `ext:` / `size:` / `path:` / `coll:` modifiers — see
+/// Everything-style `ext:` / `size:` / `path:` modifiers — see
 /// [`ParsedQuery`]). Pure: no I/O, no engine. A modifier token with a BAD
 /// value (`size:abc`, a lone `ext:`) is not an error — the whole token
 /// falls back verbatim into the free text, so the query degrades to a
@@ -341,8 +341,8 @@ impl PathFilter {
 }
 
 /// The fast-reject chain both ranking modes run per slot BEFORE any
-/// ranking or classification: ext id and size are integer compares,
-/// collection membership one hash lookup. The `path:` filter is the one
+/// ranking or classification: ext id and size are integer compares.
+/// The `path:` filter is the one
 /// expensive predicate, so it runs LAST and only for slots that survived
 /// the cheap ones — and even then it materializes a slot path only when
 /// the needle itself contains a separator (the boundary-crossing shapes

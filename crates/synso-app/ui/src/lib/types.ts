@@ -101,7 +101,6 @@ export interface ParsedQuery {
   min_size: number | null;
   max_size: number | null;
   path_prefix: string | null;
-  collections: string[];
 }
 
 /// Payload of `quick_info`: the global shortcut's spelling and whether its
@@ -153,21 +152,4 @@ export interface SizeNode {
   size: number;
   file_count: number;
   children: SizeNode[];
-}
-
-/// Mirror of `synso_core::Collection` (`coll_create`'s and `coll_list`'s
-/// payload): one virtual collection row.
-export interface Collection {
-  id: number;
-  name: string;
-}
-
-/// Mirror of `synso_core::MemberHit` (`coll_members`' payload): one member
-/// row materialized for display. A tombstoned (`alive: false`) member
-/// carries a hit synthesized from the add-time snapshot: `path` is ""
-/// (unknown — the file is gone), `mtime` 0, and `id` the STALE file id,
-/// kept so the UI can still address the member (移出集合).
-export interface MemberHit {
-  hit: Hit;
-  alive: boolean;
 }

@@ -146,7 +146,6 @@ pub fn run() {
             commands::size_tree,
             commands::volume_overlay,
             commands::reveal_index_path,
-            commands::file_id_of,
             commands::pick_folder
         ])
         .run(tauri::generate_context!())

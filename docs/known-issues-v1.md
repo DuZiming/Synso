@@ -31,15 +31,15 @@
 - 相关记录:Task 16 的 minor "listen().then(push) 卸载竞态" 至今没修(卸载
   早于 listen resolve 时 unlisten 泄漏,实践中影响极小,留观)
 
-## 3. 集合功能整体移除（用户决定，后续重新规划）
+## 3. 集合功能整体移除（用户决定，后续重新规划）——已完成（v1.1 任务 4/5）
 
-- 移除范围建议：UI（CollectionsView、快速窗多选加入、火焰图右键加入、
-  CollectionPicker）→ commands（coll_*）→ engine（collections.rs、
-  reconcile 调用点、coll: 查询修饰符）→ schema 表保留（不迁移，代码不再
-  触碰）或一并删表
-- 注意删干净 i18n 键（check:i18n 会兜底）和使用手册 §6
-- 用户说"后面重新再规划"——留好引擎侧的墓碑/重绑经验，重新设计时可能
-  复用
+- 已删除：UI（CollectionsView、CollectionPicker、快速窗多选/勾选、容量地图集合管线
+  与死 prop）、commands（coll_* 与 file_id_of）、engine（collections.rs、7 个
+  coll_* 方法、`coll:` 修饰符——现在按字面回退、三处 reconcile 调用点）
+- DB 的 `collections`/`collection_members` 表保留未迁移，代码不再触碰；使用手册
+  §6 删除、章节重排；i18n 键删净（128 键对齐）
+- 重新规划时参考：引擎侧墓碑/重绑经验见 v1 提交历史（collections.rs 于
+  6f033a3 删除）
 
 ## 4. 「火焰图」改名「容量地图」（用户决定）——已完成（v1.1 任务 3）
 

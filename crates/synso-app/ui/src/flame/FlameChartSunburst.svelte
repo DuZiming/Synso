@@ -21,7 +21,6 @@
     root: SizeNode;
     onDrill: (path: string) => void;
     onReveal: (path: string) => void;
-    onAddToCollection: (path: string) => void;
     /// Physical-capacity overlay for a pane root that names exactly one
     /// volume (null at every other level): two synthetic gray arcs —
     /// 「未索引」 (used-but-unindexed bytes) and 「剩余空间」 — make the
