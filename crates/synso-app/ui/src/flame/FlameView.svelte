@@ -4,8 +4,10 @@
   // breadcrumb chain back to the virtual "(all)" root; 对比模式 renders two
   // independent panes, each with its own root (drill / breadcrumb / a
   // root-picker input that accepts an index path). Every visible pane is
-  // (re)fetched via `size_tree(path, 2, 40)`; an unknown root renders
-  // 路径不存在 but keeps its breadcrumb so the user can climb back out.
+  // (re)fetched via `size_tree(path, depth, 40)` where `depth` is the
+  // user-tunable layer count (default 10, persisted per browser); an
+  // unknown root renders 路径不存在 but keeps its breadcrumb so the user
+  // can climb back out.
   //
   // The synthetic "(other)" aggregate node is not drillable (it names no
   // real directory — the engine would answer None): clicking it shows a
@@ -20,14 +22,29 @@
   import { onMount } from "svelte";
   import { t } from "../i18n";
   import { collAdd, fileIdOf, revealIndexPath, sizeTree } from "../lib/tauri";
+  import { listen } from "@tauri-apps/api/event";
   import type { Collection, SizeNode } from "../lib/types";
-  import FlameChart from "./FlameChart.svelte";
+  import FlameChartSunburst from "./FlameChartSunburst.svelte";
   import CollectionPicker from "../collections/CollectionPicker.svelte";
+  import { humanBytes } from "../lib/format";
+
+  /// One level of the hover path chain (name + size, root first).
+  interface ChainLevel {
+    name: string;
+    size: number;
+  }
+
+  /// What the side panels show for the hovered block.
+  interface HoverInfo {
+    chain: ChainLevel[];
+    children: ChainLevel[];
+  }
 
   /// Per-pane view state: `root` is the requested index path ("" = the
   /// virtual root), `tree` the last successful fetch, `seq` a race guard
   /// so a slow response can never overwrite a newer request, `picker` the
-  /// text input's draft.
+  /// text input's draft, `hover` the hovered block's chain (right panel)
+  /// and subdirectories (left panel).
   interface Pane {
     root: string;
     tree: SizeNode | null;
@@ -36,11 +53,44 @@
     error: string | null;
     seq: number;
     picker: string;
+    hover: HoverInfo | null;
   }
 
-  const DEPTH = 2;
+  function newPane(root: string): Pane {
+    return {
+      root,
+      tree: null,
+      loading: false,
+      missing: false,
+      error: null,
+      seq: 0,
+      picker: root,
+      hover: null,
+    };
+  }
+
   const MAX_CHILDREN = 40;
   const TOAST_MS = 10_000;
+  /// Depth range and default; persisted in localStorage (a view-local
+  /// display preference — not engine state).
+  const DEPTH_KEY = "synso.flame.depth";
+  const DEPTH_DEFAULT = 10;
+
+  function loadDepth(): number {
+    const raw = Number(localStorage.getItem(DEPTH_KEY));
+    if (!Number.isInteger(raw) || raw < 1 || raw > 30) return DEPTH_DEFAULT;
+    return raw;
+  }
+
+  let depth = $state(loadDepth());
+
+  function setDepth(next: number): void {
+    const clamped = Math.max(1, Math.min(30, next));
+    if (clamped === depth) return;
+    depth = clamped;
+    localStorage.setItem(DEPTH_KEY, String(clamped));
+    for (const pane of panes) void load(pane);
+  }
 
   let compare = $state(false);
   let panes = $state<Pane[]>([newPane("")]);
@@ -52,24 +102,12 @@
 
   const visiblePanes = $derived(compare ? panes : panes.slice(0, 1));
 
-  function newPane(root: string): Pane {
-    return {
-      root,
-      tree: null,
-      loading: false,
-      missing: false,
-      error: null,
-      seq: 0,
-      picker: root,
-    };
-  }
-
   async function load(pane: Pane): Promise<void> {
     const seq = ++pane.seq;
     pane.loading = true;
     pane.error = null;
     try {
-      const tree = await sizeTree(pane.root, DEPTH, MAX_CHILDREN);
+      const tree = await sizeTree(pane.root, depth, MAX_CHILDREN, false);
       if (seq !== pane.seq) return; // a newer request superseded this one
       if (tree) {
         pane.tree = tree;
@@ -185,9 +223,26 @@
     toastTimer = setTimeout(() => (toast = null), TOAST_MS);
   }
 
+  /// Index changes (fs-changed from the engine's watcher) refresh the
+  /// visible panes IN PLACE — same drill root, fresh data — so the cake
+  /// tower tracks disk edits without any manual reload. Debounced: bursts
+  /// (builds, copy jobs) collapse into one refetch.
+  let fsDebounce: ReturnType<typeof setTimeout> | undefined;
+  const unlisteners: (() => void)[] = [];
+
   onMount(() => {
     void load(panes[0]);
-    return () => clearTimeout(toastTimer);
+    void listen("fs-changed", () => {
+      clearTimeout(fsDebounce);
+      fsDebounce = setTimeout(() => {
+        for (const pane of visiblePanes) void load(pane);
+      }, 600);
+    }).then((un) => unlisteners.push(un));
+    return () => {
+      clearTimeout(toastTimer);
+      clearTimeout(fsDebounce);
+      for (const un of unlisteners) un();
+    };
   });
 </script>
 
@@ -197,6 +252,27 @@
       <input type="checkbox" checked={compare} onchange={toggleCompare} />
       {$t("flame.compare")}
     </label>
+    <div class="depth-stepper" role="group" aria-label={$t("flame.depth")}>
+      <button
+        class="ghost"
+        onclick={() => setDepth(depth - 1)}
+        disabled={depth <= 1}
+        aria-label={$t("flame.depthLess")}
+      >
+        −
+      </button>
+      <span class="depth-value" title={$t("flame.depth")}>
+        {$t("flame.depth")}: {depth}
+      </span>
+      <button
+        class="ghost"
+        onclick={() => setDepth(depth + 1)}
+        disabled={depth >= 30}
+        aria-label={$t("flame.depthMore")}
+      >
+        +
+      </button>
+    </div>
     <button class="ghost" onclick={refresh}>{$t("flame.refresh")}</button>
   </header>
 
@@ -233,12 +309,48 @@
         />
 
         {#if pane.tree}
-          <FlameChart
-            root={pane.tree}
-            onDrill={(path) => drill(pane, path)}
-            onReveal={(path) => void reveal(path)}
-            onAddToCollection={(path) => void addToCollection(path)}
-          />
+          <div class="pane-body">
+            <aside class="side-panel" aria-label={$t("flame.pathPanel")}>
+              {#if pane.hover && pane.hover.chain.length > 0}
+                <h3>{$t("flame.pathPanel")}</h3>
+                <!-- Hovered first, then each parent up to the root. -->
+                <ol>
+                  {#each [...pane.hover.chain].reverse() as level, i (i)}
+                    <li class:current={i === 0}>
+                      <span class="lvl-name" title={level.name}>{level.name}</span>
+                      <span class="lvl-size">{humanBytes(level.size)}</span>
+                    </li>
+                  {/each}
+                </ol>
+              {:else}
+                <p class="path-hint">{$t("flame.pathHint")}</p>
+              {/if}
+            </aside>
+            <FlameChartSunburst
+              root={pane.tree}
+              onDrill={(path) => drill(pane, path)}
+              onReveal={(path) => void reveal(path)}
+              onAddToCollection={(path) => void addToCollection(path)}
+              onHover={(info) => (pane.hover = info)}
+            />
+            <aside class="side-panel" aria-label={$t("flame.childrenPanel")}>
+              {#if pane.hover && pane.hover.children.length > 0}
+                <h3>{$t("flame.childrenPanel")}</h3>
+                <ol>
+                  {#each pane.hover.children as child (child.name)}
+                    <li>
+                      <span class="lvl-name" title={child.name}>{child.name}</span>
+                      <span class="lvl-size">{humanBytes(child.size)}</span>
+                    </li>
+                  {/each}
+                </ol>
+              {:else if pane.hover}
+                <p class="path-hint">{$t("flame.childrenEmpty")}</p>
+              {:else}
+                <p class="path-hint">{$t("flame.childrenHint")}</p>
+              {/if}
+            </aside>
+          </div>
         {:else if pane.loading}
           <div class="pane-state muted">{$t("flame.loading")}</div>
         {:else if pane.missing}
@@ -282,6 +394,19 @@
     flex-wrap: wrap;
   }
 
+  .depth-stepper {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .depth-value {
+    font-size: 12.5px;
+    min-width: 64px;
+    text-align: center;
+    color: var(--text);
+  }
+
   .compare-toggle {
     display: flex;
     align-items: center;
@@ -301,7 +426,11 @@
     flex-wrap: wrap;
     gap: 14px;
     margin-top: 14px;
-    align-items: flex-start;
+    align-items: stretch;
+    /* User requirement: the chart uses the remaining window height —
+       anchor the panes to the viewport instead of content height. */
+    height: calc(100vh - 240px);
+    min-height: 320px;
   }
 
   .pane {
@@ -310,6 +439,79 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
+  }
+
+  .pane-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+  }
+
+  .pane-body > :global(.flame-wrap) {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .side-panel {
+    flex: 0 0 200px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--panel);
+    padding: 10px 12px;
+    font-size: 12px;
+    overflow-y: auto;
+  }
+
+  .side-panel h3 {
+    margin: 0 0 6px;
+    font-size: 12px;
+    font-weight: 600;
+    opacity: 0.7;
+  }
+
+  .side-panel ol {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .side-panel li {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 2px 4px;
+    border-radius: 4px;
+  }
+
+  .side-panel li.current {
+    background: var(--bg);
+    font-weight: 600;
+  }
+
+  .lvl-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .lvl-size {
+    color: var(--text);
+    opacity: 0.85;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  .path-hint {
+    margin: 6px 0 0;
+    opacity: 0.5;
+    line-height: 1.6;
   }
 
   .crumbs {

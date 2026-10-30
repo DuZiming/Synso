@@ -86,6 +86,12 @@ pub fn scan(store: &mut Store, opts: &ScanOptions, progress: &dyn Fn(u64)) -> Re
         }
 
         let walker = WalkDirGeneric::<((), Option<Metadata>)>::new(walk_root.clone())
+            // Serial walk (user requirement): jwalk's default rayon pool
+            // stats directories on EVERY core and maxed out the CPU on the
+            // target machine. The walk is IO-bound, so a single thread costs
+            // throughput but not correctness; revisit (or make configurable)
+            // if full-volume scan duration becomes the bottleneck.
+            .parallelism(jwalk::Parallelism::Serial)
             .follow_links(false)
             .min_depth(1)
             .process_read_dir({
@@ -246,6 +252,8 @@ pub(crate) fn scan_subtree(
     let mut batch: Vec<(Vec<String>, FileRecord)> = Vec::with_capacity(PROGRESS_BATCH);
 
     let walker = WalkDirGeneric::<((), Option<Metadata>)>::new(dir)
+        // Same serial-walk requirement as `scan` (see the comment there).
+        .parallelism(jwalk::Parallelism::Serial)
         .follow_links(false)
         .min_depth(1)
         .process_read_dir({
@@ -367,10 +375,11 @@ fn flush_batch(store: &mut Store, batch: &mut Vec<(Vec<String>, FileRecord)>) ->
     if batch.is_empty() {
         return Ok(());
     }
+    let scan_gen = store.current_scan_generation();
     let tx = store.conn_mut().transaction()?;
     for (segments, mut rec) in batch.drain(..) {
         let dir_path: Vec<&str> = segments.iter().map(String::as_str).collect();
-        crate::store::upsert_file_on(&tx, &dir_path, &mut rec)?;
+        crate::store::upsert_file_on(&tx, scan_gen, &dir_path, &mut rec)?;
     }
     tx.commit()?;
     Ok(())

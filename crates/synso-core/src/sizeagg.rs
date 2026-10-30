@@ -218,7 +218,44 @@ fn resolve_root(hot: &HotIndex, root: &str) -> Option<RootTarget> {
 /// Builds the tree behind `root` over a hot-index snapshot (the pure
 /// half of `Engine::size_tree`); `None` for an unknown root. Unknown
 /// roots return before any aggregation work happens.
+///
+/// Expansion stops at [`MAX_TREE_NODES`] created nodes: deeper/remaining
+/// siblings at the exhaustion point merge into "(other)" so every layer
+/// stays a complete partition of its parent (no bytes silently lost).
 pub fn build_tree(hot: &HotIndex, root: &str, depth: u8, max_children: u8) -> Option<SizeNode> {
+    let mut remaining = MAX_TREE_NODES;
+    build_tree_with_budget(hot, root, depth, max_children, true, &mut remaining)
+}
+
+/// Dir-only variant for the flame chart (user requirement: files are not
+/// drawn): file children are skipped entirely — their bytes still count
+/// in every dir's aggregate, so the gap between a dir's block and its
+/// children's combined width IS that dir's direct-file share (the source
+/// of the "mountain" taper).
+pub fn build_tree_dirs(
+    hot: &HotIndex,
+    root: &str,
+    depth: u8,
+    max_children: u8,
+) -> Option<SizeNode> {
+    let mut remaining = MAX_TREE_NODES;
+    build_tree_with_budget(hot, root, depth, max_children, false, &mut remaining)
+}
+
+/// Hard cap on nodes materialized per `size_tree` call. A real-disk root
+/// at a deep `depth` can reach hundreds of thousands of dirs — that much
+/// JSON/SVG would hang the webview. The cap turns the excess into
+/// "(other)" leaves; drilling into them refetches with a fresh budget.
+pub(crate) const MAX_TREE_NODES: usize = 20_000;
+
+fn build_tree_with_budget(
+    hot: &HotIndex,
+    root: &str,
+    depth: u8,
+    max_children: u8,
+    include_files: bool,
+    remaining: &mut usize,
+) -> Option<SizeNode> {
     match resolve_root(hot, root)? {
         RootTarget::VirtualRoot => {
             let aggregates = Aggregates::collect(hot);
@@ -234,7 +271,16 @@ pub fn build_tree(hot: &HotIndex, root: &str, depth: u8, max_children: u8) -> Op
                 name: "(all)".to_string(),
                 size,
                 file_count,
-                children: child_nodes(hot, &aggregates, None, "", depth, max_children),
+                children: child_nodes(
+                    hot,
+                    &aggregates,
+                    None,
+                    "",
+                    depth,
+                    max_children,
+                    include_files,
+                    remaining,
+                ),
             })
         }
         RootTarget::Dir(id) => {
@@ -251,6 +297,8 @@ pub fn build_tree(hot: &HotIndex, root: &str, depth: u8, max_children: u8) -> Op
                 path,
                 depth,
                 max_children,
+                include_files,
+                remaining,
             ))
         }
         RootTarget::File(slot) => {
@@ -274,9 +322,20 @@ fn dir_node(
     path: String,
     levels: u8,
     max_children: u8,
+    include_files: bool,
+    remaining: &mut usize,
 ) -> SizeNode {
     let agg = aggregates.per_dir.get(&id).copied().unwrap_or_default();
-    let children = child_nodes(hot, aggregates, Some(id), &path, levels, max_children);
+    let children = child_nodes(
+        hot,
+        aggregates,
+        Some(id),
+        &path,
+        levels,
+        max_children,
+        include_files,
+        remaining,
+    );
     SizeNode {
         path,
         name,
@@ -303,6 +362,12 @@ fn file_node(hot: &HotIndex, slot: usize, path: String) -> SizeNode {
 /// the overflow merged into one trailing "(other)" node, which counts
 /// against the budget. `levels` is how many levels may appear BELOW the
 /// children (each kept child recurses with `levels - 1`).
+///
+/// `remaining` is the GLOBAL node budget for the whole tree (see
+/// [`MAX_TREE_NODES`]): every materialized child consumes one. When it
+/// runs out mid-list, the rest of the level — and the width overflow —
+/// merge into the same "(other)" terminal, so the partition invariant
+/// ("children sum to parent") survives budget exhaustion.
 fn child_nodes(
     hot: &HotIndex,
     aggregates: &Aggregates,
@@ -310,6 +375,8 @@ fn child_nodes(
     parent_path: &str,
     levels: u8,
     max_children: u8,
+    include_files: bool,
+    remaining: &mut usize,
 ) -> Vec<SizeNode> {
     if levels == 0 || max_children == 0 {
         return Vec::new();
@@ -340,40 +407,49 @@ fn child_nodes(
             kind: ChildKind::Dir(child),
         });
     }
-    for &slot in file_slots {
-        entries.push(ChildEntry {
-            name: hot.name_original(slot).to_string(),
-            size: hot.size(slot),
-            file_count: 1,
-            kind: ChildKind::File(slot),
-        });
+    // Dir-only mode (flame chart) simply never materializes file leaves;
+    // their bytes remain inside every dir aggregate, which is what leaves
+    // the visible taper between a dir and its children.
+    if include_files {
+        for &slot in file_slots {
+            entries.push(ChildEntry {
+                name: hot.name_original(slot).to_string(),
+                size: hot.size(slot),
+                file_count: 1,
+                kind: ChildKind::File(slot),
+            });
+        }
     }
     // A total order — same-parent entries cannot share a name — so the
     // sort is deterministic despite being unstable.
     entries.sort_unstable_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
 
-    let budget = max_children as usize;
-    let overflow = entries.len() > budget;
-    let kept = if overflow {
-        &entries[..budget - 1] // budget >= 1 here; "(other)" takes the last slot
+    // Width cap first (existing semantics: "(other)" takes the last of the
+    // max_children slots), then the global node budget caps further.
+    let width = max_children as usize;
+    let width_kept = if entries.len() > width {
+        width - 1 // width >= 1 here; "(other)" takes the last slot
     } else {
-        &entries[..]
+        entries.len()
     };
-    let mut nodes: Vec<SizeNode> = kept
-        .iter()
-        .map(|entry| {
-            child_node(
-                hot,
-                aggregates,
-                entry,
-                parent_path,
-                levels - 1,
-                max_children,
-            )
-        })
-        .collect();
+    let kept_n = width_kept.min(*remaining);
+    let overflow = kept_n < entries.len();
+    *remaining = remaining.saturating_sub(kept_n);
+    let mut nodes: Vec<SizeNode> = Vec::with_capacity(kept_n + usize::from(overflow));
+    for entry in &entries[..kept_n] {
+        nodes.push(child_node(
+            hot,
+            aggregates,
+            entry,
+            parent_path,
+            levels - 1,
+            max_children,
+            include_files,
+            remaining,
+        ));
+    }
     if overflow {
-        let (size, file_count) = entries[budget - 1..]
+        let (size, file_count) = entries[kept_n..]
             .iter()
             .fold((0u64, 0u64), |(size, count), entry| {
                 (size.saturating_add(entry.size), count + entry.file_count)
@@ -398,12 +474,24 @@ fn child_node(
     parent_path: &str,
     levels: u8,
     max_children: u8,
+    include_files: bool,
+    remaining: &mut usize,
 ) -> SizeNode {
     let path = child_path(parent_path, &entry.name);
     match entry.kind {
         ChildKind::Dir(id) => {
             let name = entry.name.clone();
-            dir_node(hot, aggregates, id, name, path, levels, max_children)
+            dir_node(
+                hot,
+                aggregates,
+                id,
+                name,
+                path,
+                levels,
+                max_children,
+                include_files,
+                remaining,
+            )
         }
         ChildKind::File(slot) => file_node(hot, slot, path),
     }
@@ -416,6 +504,53 @@ fn child_path(parent_path: &str, name: &str) -> String {
         name.to_string()
     } else {
         format!("{parent_path}{MAIN_SEPARATOR}{name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (size, file_count) of the subtree a node describes — leaves carry
+    /// themselves, inner nodes carry their children (incl. "(other)").
+    fn subtree_sum(n: &SizeNode) -> (u64, u64) {
+        if n.children.is_empty() {
+            return (n.size, n.file_count);
+        }
+        n.children
+            .iter()
+            .map(subtree_sum)
+            .fold((0u64, 0u64), |(s, c), (cs, cc)| {
+                (s.saturating_add(cs), c + cc)
+            })
+    }
+
+    #[test]
+    fn node_budget_absorbs_rest_into_other() {
+        let hot = HotIndex::synthetic(60);
+        // Exhaust almost immediately — far fewer slots than the corpus.
+        let mut remaining = 5usize;
+        let tree =
+            build_tree_with_budget(&hot, "", 30, 40, true, &mut remaining).expect("virtual root");
+        assert_eq!(remaining, 0, "budget must be fully consumed");
+        // Partition invariant survives exhaustion: children (subtrees +
+        // "(other)") still sum exactly to the parent.
+        let (s, c) = subtree_sum(&tree);
+        assert_eq!((tree.size, tree.file_count), (s, c));
+        // A budget this tight must have produced at least one "(other)".
+        assert!(
+            tree.children.iter().any(|n| n.name == "(other)"),
+            "expected an (other) absorber under budget pressure"
+        );
+    }
+
+    #[test]
+    fn partition_invariant_holds_without_budget_pressure() {
+        let hot = HotIndex::synthetic(60);
+        let mut remaining = usize::MAX;
+        let tree = build_tree_with_budget(&hot, "", 30, 40, true, &mut remaining).expect("root");
+        let (s, c) = subtree_sum(&tree);
+        assert_eq!((tree.size, tree.file_count), (s, c));
     }
 }
 

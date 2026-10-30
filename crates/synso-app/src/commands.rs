@@ -313,8 +313,13 @@ pub async fn size_tree(
     root: String,
     depth: u8,
     max_children: u8,
+    include_files: bool,
 ) -> Result<Option<SizeNode>, String> {
-    Ok(state.engine.size_tree(&root, depth, max_children))
+    Ok(if include_files {
+        state.engine.size_tree(&root, depth, max_children)
+    } else {
+        state.engine.size_tree_dirs(&root, depth, max_children)
+    })
 }
 
 /// Reveals an INDEX path (the `Hit::path` spelling — flame-chart nodes
@@ -424,4 +429,17 @@ pub async fn file_id_of(state: State<'_, AppState>, path: String) -> Result<i64,
         .engine
         .file_id_of(&path)
         .ok_or_else(|| format!("not in the index: \"{path}\""))
+}
+
+/// Opens the native folder picker and returns the chosen path (None on
+/// cancel). Sync ON PURPOSE: sync commands run on the main thread, where a
+/// modal native dialog is the standard pattern (it pumps the message loop).
+/// No engine state, no locks — nothing to keep off the main thread.
+#[tauri::command]
+pub fn pick_folder(app: tauri::AppHandle) -> Option<String> {
+    use tauri_plugin_dialog::DialogExt;
+    app.dialog()
+        .file()
+        .blocking_pick_folder()
+        .and_then(|f| f.as_path().map(|p| p.to_string_lossy().into_owned()))
 }
