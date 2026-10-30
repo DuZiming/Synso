@@ -59,7 +59,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
-use crate::collections::{self, Collection, MemberHit};
 use crate::dedup::{self, DedupState, DupeGroup, StoredGroup};
 use crate::hotindex::HotIndex;
 use crate::model::{FileId, ParsedQuery};
@@ -478,60 +477,8 @@ impl Engine {
     /// to empty (not an error), and a store error is logged and yields an
     /// empty result (search is never fatal).
     pub fn search_parsed(&self, q: &ParsedQuery, offset: u32, limit: u32) -> SearchResult {
-        // Resolve the coll: filter against the store before touching the
-        // hot index (membership rows live only there). The store guard is
-        // released before the hot read; the engine's locks never nest.
-        let coll_members = if q.collections.is_empty() {
-            None
-        } else {
-            let store = lock_unpoisoned(&self.store);
-            match collections::alive_member_intersection(&store, &q.collections) {
-                // Ok(None) = an unknown collection name: no results, not
-                // an error — and NOT "no filter", hence the early return.
-                Ok(members) => match members {
-                    Some(members) => Some(members),
-                    None => return SearchResult::default(),
-                },
-                Err(err) => {
-                    log::error!(
-                        "synso: resolving collection filter {:?} failed: {err}",
-                        q.collections
-                    );
-                    return SearchResult::default();
-                }
-            }
-        };
         let hot = read_unpoisoned(&self.hot);
-        query::run_parsed(&hot, q, coll_members.as_ref(), offset, limit, unix_now())
-    }
-
-    /// Creates a virtual collection. A duplicate name is
-    /// `Err(SynsoError::Conflict)`. See `crate::collections`.
-    pub fn coll_create(&self, name: &str) -> Result<Collection> {
-        collections::create(&mut lock_unpoisoned(&self.store), name)
-    }
-
-    /// Renames a collection (`Err(NotFound)` for an unknown id,
-    /// `Err(Conflict)` when the name is taken).
-    pub fn coll_rename(&self, id: i64, name: &str) -> Result<()> {
-        collections::rename(&mut lock_unpoisoned(&self.store), id, name)
-    }
-
-    /// Deletes a collection and every member row it owns.
-    pub fn coll_delete(&self, id: i64) -> Result<()> {
-        collections::delete(&mut lock_unpoisoned(&self.store), id)
-    }
-
-    /// Every collection, id-ordered (creation order). Store errors surface
-    /// to the caller rather than degrading to an empty list.
-    pub fn coll_list(&self) -> Result<Vec<Collection>> {
-        collections::list(&lock_unpoisoned(&self.store))
-    }
-
-    /// Adds file OR folder row ids to a collection, snapshotting each
-    /// entry's current name and size (the later rebind key).
-    pub fn coll_add(&self, id: i64, members: &[FileId]) -> Result<()> {
-        collections::add(&mut lock_unpoisoned(&self.store), id, members)
+        query::run_parsed(&hot, q, offset, limit, unix_now())
     }
 
     // ---------------- Task 9: dedup state machine ------------------------
@@ -700,18 +647,6 @@ impl Engine {
         })
     }
 
-    /// Removes one member row (alive or tombstoned) from a collection.
-    pub fn coll_remove(&self, id: i64, member: FileId) -> Result<()> {
-        collections::remove(&mut lock_unpoisoned(&self.store), id, member)
-    }
-
-    /// The collection's members, tombstoned ones included (their `hit` is
-    /// synthesized from the snapshot — see [`MemberHit`]). Store errors
-    /// surface to the caller rather than degrading to an empty list.
-    pub fn coll_members(&self, id: i64) -> Result<Vec<MemberHit>> {
-        collections::members(&lock_unpoisoned(&self.store), id)
-    }
-
     // ---------------- Task 10: recycle-bin-only deletion -----------------
 
     /// Moves the entries behind `ids` to the OS trash — Synso's ONLY
@@ -802,14 +737,6 @@ impl Engine {
                 let segments: Vec<&str> = entry.segments.iter().map(String::as_str).collect();
                 watcher::remove_path(&mut store, &mut hot, &segments, &entry.name, &entry.abs);
                 deleted += 1;
-            }
-            if deleted > 0 {
-                // Tombstone + rebind the collections in the same store
-                // critical section a scan's and a watcher batch's reconcile
-                // use; best-effort, like those.
-                if let Err(err) = collections::reconcile(&mut store) {
-                    log::warn!("synso: collection reconcile after trash failed: {err}");
-                }
             }
         }
         Ok(deleted)
@@ -924,14 +851,6 @@ fn scan_cycle(
             // ScanFinished already see fresh stats. On failure the hot
             // index keeps serving the last known-good snapshot.
             reload_hot_index_locked(&guard, &hot);
-            // Collection reconcile (tombstone + rebind, see `collections`)
-            // runs in the same store critical section, after the hot
-            // reload and before ScanFinished, so subscribers see member
-            // state consistent with the fresh index. Best-effort: the scan
-            // itself succeeded, so a reconcile error is logged, not fatal.
-            if let Err(err) = collections::reconcile(&mut guard) {
-                log::warn!("synso: collection reconcile after scan failed: {err}");
-            }
             (stats.files, stats.dirs)
         })
     };
@@ -1054,7 +973,6 @@ fn reload_hot_index_locked(store: &Store, hot: &Arc<RwLock<HotIndex>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SynsoError;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -1526,45 +1444,6 @@ mod tests {
         assert_eq!(engine.stats().files, 3);
     }
 
-    /// Store errors behind the collection reads SURFACE: `coll_list` and
-    /// `coll_members` return `Err` instead of silently degrading to empty
-    /// lists. Dropping the underlying tables on the engine's own connection
-    /// is the cheapest way to force real store errors.
-    #[test]
-    fn coll_reads_surface_store_errors() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("index.db");
-        let root = write_fixture(tmp.path());
-
-        let engine = open_engine(&db_path, &root);
-        let coll = engine.coll_create("keep").unwrap();
-        assert_eq!(engine.coll_list().unwrap().len(), 1);
-        assert_eq!(engine.coll_members(coll.id).unwrap().len(), 0);
-
-        // Corrupt the schema out from under the engine's store connection:
-        // both reads must now report the store error to the caller.
-        {
-            let mut store = lock_unpoisoned(&engine.store);
-            store
-                .conn_mut()
-                .execute("DROP TABLE collection_members", [])
-                .unwrap();
-            store
-                .conn_mut()
-                .execute("DROP TABLE collections", [])
-                .unwrap();
-        }
-
-        assert!(
-            matches!(engine.coll_list(), Err(SynsoError::Db(_))),
-            "coll_list surfaces the store error, not an empty list"
-        );
-        assert!(
-            matches!(engine.coll_members(coll.id), Err(SynsoError::Db(_))),
-            "coll_members surfaces the store error, not an empty list"
-        );
-    }
-
     // ------------------- Task 9: dedup pipeline ---------------------------
 
     /// Receives events until `DedupFinished`, returning the finished run's
@@ -1979,11 +1858,6 @@ mod tests {
             .expect("the root segment resolves");
         assert!(abs.is_file());
 
-        // A collection tracks the doomed file so the tombstone is visible.
-        let coll = engine.coll_create("purge-test").unwrap();
-        engine.coll_add(coll.id, &[doomed_id]).unwrap();
-        assert!(engine.coll_members(coll.id).unwrap()[0].alive);
-
         assert_eq!(
             engine.delete_to_trash(&[doomed_id]).unwrap(),
             1,
@@ -2002,11 +1876,6 @@ mod tests {
             .unwrap()
             .iter()
             .all(|rec| rec.name != "doomed.txt"));
-        // ...and tombstoned in the collection (alive=0, snapshot kept).
-        let members = engine.coll_members(coll.id).unwrap();
-        assert_eq!(members.len(), 1);
-        assert!(!members[0].alive, "the deleted member must be tombstoned");
-        assert_eq!(members[0].hit.name, "doomed.txt");
         assert_eq!(engine.stats().files, 1);
     }
 

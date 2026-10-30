@@ -4,8 +4,8 @@
 use std::path::PathBuf;
 
 use synso_core::{
-    Collection, DedupState, DupeGroup, EngineStats, Hit, MemberHit, ParsedQuery, SearchResult,
-    Settings, SizeNode, VolumeInfo,
+    DedupState, DupeGroup, EngineStats, Hit, ParsedQuery, SearchResult, Settings, SizeNode,
+    VolumeInfo,
 };
 use tauri::{AppHandle, State};
 use tauri_plugin_opener::OpenerExt;
@@ -368,80 +368,6 @@ pub fn reveal_index_path(
     app.opener()
         .reveal_item_in_dir(&abs)
         .map_err(|err| err.to_string())
-}
-
-// ---------------------- Task 18: collections UI ----------------------
-
-// Thin forwarders over the engine's coll_* facade (see
-// `synso_core::collections` for the semantics: members are files OR folder
-// rows, multi-membership is core, rename/move tombstones then rebinds on
-// the next reconcile, and deleting a collection never touches files).
-// Every error surfaces to the webview verbatim as a string.
-//
-// ALL of these are async (thread-pool, not the main thread — see
-// `size_tree`): each takes the store mutex, which a running scan holds
-// for its whole walk, and Tauri runs sync commands on the main thread —
-// a sync call here would freeze EVERY window for the scan's duration.
-
-/// Creates a collection. A duplicate name is an error (engine Conflict).
-#[tauri::command]
-pub async fn coll_create(state: State<'_, AppState>, name: String) -> Result<Collection, String> {
-    state
-        .engine
-        .coll_create(&name)
-        .map_err(|err| err.to_string())
-}
-
-/// Renames a collection (unknown id / taken name → engine error verbatim).
-#[tauri::command]
-pub async fn coll_rename(state: State<'_, AppState>, id: i64, name: String) -> Result<(), String> {
-    state
-        .engine
-        .coll_rename(id, &name)
-        .map_err(|err| err.to_string())
-}
-
-/// Deletes a collection and its member rows — never the files themselves.
-#[tauri::command]
-pub async fn coll_delete(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    state.engine.coll_delete(id).map_err(|err| err.to_string())
-}
-
-/// Every collection, id-ordered (creation order).
-#[tauri::command]
-pub async fn coll_list(state: State<'_, AppState>) -> Result<Vec<Collection>, String> {
-    state.engine.coll_list().map_err(|err| err.to_string())
-}
-
-/// Adds file OR folder row ids to a collection, snapshotting each entry's
-/// current name + size (the later tombstone/rebind key).
-#[tauri::command]
-pub async fn coll_add(
-    state: State<'_, AppState>,
-    id: i64,
-    members: Vec<i64>,
-) -> Result<(), String> {
-    state
-        .engine
-        .coll_add(id, &members)
-        .map_err(|err| err.to_string())
-}
-
-/// Removes one member row (alive or tombstoned) from a collection.
-#[tauri::command]
-pub async fn coll_remove(state: State<'_, AppState>, id: i64, member: i64) -> Result<(), String> {
-    state
-        .engine
-        .coll_remove(id, member)
-        .map_err(|err| err.to_string())
-}
-
-/// The collection's members, tombstoned ones included (dead members carry
-/// a hit synthesized from the add-time snapshot: empty path, mtime 0, the
-/// stale file id kept so the UI can still address the row).
-#[tauri::command]
-pub async fn coll_members(state: State<'_, AppState>, id: i64) -> Result<Vec<MemberHit>, String> {
-    state.engine.coll_members(id).map_err(|err| err.to_string())
 }
 
 /// Resolves an INDEX path (the `Hit::path` spelling, directories included)

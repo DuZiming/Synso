@@ -66,7 +66,6 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-pub(crate) mod collections;
 pub(crate) mod dedup;
 pub(crate) mod engine;
 pub(crate) mod hotindex;
@@ -82,7 +81,6 @@ pub(crate) mod volumes;
 pub(crate) mod watcher;
 
 // The public facade: the ONLY surface embedders program against.
-pub use collections::{Collection, MemberHit};
 pub use dedup::{DedupState, DupeGroup};
 pub use engine::{DedupPhase, Engine, EngineEvent, EngineOptions, EngineStats, VolumeOverlay};
 pub use hotindex::HotIndex;
@@ -99,13 +97,13 @@ pub use volumes::VolumeInfo;
 
 /// Runs [`parse_query`] plus the full query pipeline over a STANDALONE hot
 /// index — the same path [`Engine::search`] executes (parse, dimension
-/// filters, rank, page), minus only the store-side `coll:` resolution and
-/// the engine's RwLock snapshot. Exposed for embedders that hold a hot
-/// index directly and for the Task 20 perf harness (`benches/search.rs`,
-/// `tests/perf.rs`), which times this over [`HotIndex::synthetic`].
+/// filters, rank, page), minus only the engine's RwLock snapshot. Exposed
+/// for embedders that hold a hot index directly and for the Task 20 perf
+/// harness (`benches/search.rs`, `tests/perf.rs`), which times this over
+/// [`HotIndex::synthetic`].
 pub fn search_index(hot: &HotIndex, text: &str, offset: u32, limit: u32) -> SearchResult {
     let parsed = parse_query(text);
-    query::run_parsed(hot, &parsed, None, offset, limit, engine::unix_now())
+    query::run_parsed(hot, &parsed, offset, limit, engine::unix_now())
 }
 
 /// Error type for all synso-core operations.

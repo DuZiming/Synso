@@ -32,10 +32,7 @@
 //!    store commits (Task 20 churn measurement: that span froze searches
 //!    for a whole batch, 8.8s at a 400-file burst); wholesale reload
 //!    stays the scan path;
-//! 3. if the batch contained deletions or renames,
-//!    [`crate::collections::reconcile`] runs in pass 1's store critical
-//!    section (tombstone + rebind);
-//! 4. [`EngineEvent::FsChanged`] broadcasts as a UI refresh hint.
+//! 3. [`EngineEvent::FsChanged`] broadcasts as a UI refresh hint.
 //!
 //! Directory arrivals walk: an upsert that resolves to a DIRECTORY gets
 //! its subtree indexed in-batch via [`scanner::scan_subtree`] — the OS
@@ -89,7 +86,6 @@ use notify::{
     RecursiveMode, Watcher as NotifyWatcher,
 };
 
-use crate::collections;
 use crate::engine::{broadcast, EngineEvent};
 use crate::hotindex::HotIndex;
 use crate::model::FileRecord;
@@ -475,11 +471,6 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
             }
         }
         // Renames already contribute removals through their from-side.
-        if !removals.is_empty() {
-            if let Err(err) = collections::reconcile(&mut store) {
-                log::warn!("synso: watcher collection reconcile failed: {err}");
-            }
-        }
     }
     {
         // Pass 2: hot replay under the canonical store -> hot order (the

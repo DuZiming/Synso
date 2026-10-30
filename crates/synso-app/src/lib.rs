@@ -146,13 +146,6 @@ pub fn run() {
             commands::size_tree,
             commands::volume_overlay,
             commands::reveal_index_path,
-            commands::coll_create,
-            commands::coll_rename,
-            commands::coll_delete,
-            commands::coll_list,
-            commands::coll_add,
-            commands::coll_remove,
-            commands::coll_members,
             commands::file_id_of,
             commands::pick_folder
         ])
