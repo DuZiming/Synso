@@ -17,6 +17,10 @@ pub struct VolumeInfo {
     pub label: String,
     /// Total capacity in bytes.
     pub total_bytes: u64,
+    /// Free space in bytes (OS-reported available). With `total_bytes`
+    /// this yields the physical used figure the capacity map overlays
+    /// at its volume ring (v1.1).
+    pub available_bytes: u64,
 }
 
 /// All fixed (non-removable) local volumes, sorted by mount path.
@@ -30,10 +34,33 @@ pub fn fixed_volumes() -> Vec<VolumeInfo> {
             path: disk.mount_point().to_string_lossy().into_owned(),
             label: volume_label(disk),
             total_bytes: disk.total_space(),
+            available_bytes: disk.available_space(),
         })
         .collect();
     volumes.sort_by(|a, b| a.path.cmp(&b.path));
     volumes
+}
+
+/// Whether `root` names exactly the volume behind one of `volumes` — the
+/// ONLY pane level that gets the physical-capacity overlay. The index
+/// spells a volume root as its last path segment (`C`), sysinfo as the
+/// mount point (`C:\`), users type either — so both sides are trimmed of
+/// trailing separators and compared ASCII case-insensitively. A
+/// subdirectory, a custom scan root, and the empty "(all)" root never
+/// name a whole volume.
+pub fn match_volume<'a>(root: &str, volumes: &'a [VolumeInfo]) -> Option<&'a VolumeInfo> {
+    let key = normalize_root(root);
+    if key.is_empty() {
+        return None;
+    }
+    volumes.iter().find(|v| normalize_root(&v.path) == key)
+}
+
+/// `root` with trailing `/` and `\` removed and folded to ASCII
+/// lowercase; empty input stays empty (the caller treats that as no
+/// match).
+fn normalize_root(root: &str) -> String {
+    root.trim_end_matches(['/', '\\']).to_ascii_lowercase()
 }
 
 /// Label preferring the volume/device name sysinfo reports (the volume
@@ -76,6 +103,22 @@ mod tests {
             assert!(!volumes.is_empty(), "host has at least one fixed volume");
             assert!(volumes.iter().all(|v| v.total_bytes > 0));
             assert!(volumes.iter().all(|v| !v.label.is_empty()));
+        }
+    }
+
+    #[test]
+    fn volume_reports_available_space() {
+        let volumes = fixed_volumes();
+
+        #[cfg(windows)]
+        {
+            assert!(!volumes.is_empty(), "host has at least one fixed volume");
+            for v in &volumes {
+                assert!(
+                    v.available_bytes > 0 && v.available_bytes <= v.total_bytes,
+                    "0 < available <= total must hold: {v:?}"
+                );
+            }
         }
     }
 }

@@ -84,7 +84,7 @@ pub(crate) mod watcher;
 // The public facade: the ONLY surface embedders program against.
 pub use collections::{Collection, MemberHit};
 pub use dedup::{DedupState, DupeGroup};
-pub use engine::{DedupPhase, Engine, EngineEvent, EngineOptions, EngineStats};
+pub use engine::{DedupPhase, Engine, EngineEvent, EngineOptions, EngineStats, VolumeOverlay};
 pub use hotindex::HotIndex;
 pub use model::{FileId, ParsedQuery};
 pub use pinyin::pinyin_keys;

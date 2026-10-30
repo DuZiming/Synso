@@ -69,6 +69,7 @@ use crate::settings::{self, Settings};
 use crate::sizeagg::{self, SizeNode};
 use crate::store::Store;
 use crate::trash;
+use crate::volumes::{match_volume, VolumeInfo};
 use crate::watcher::{self, Watcher};
 use crate::Result;
 
@@ -146,6 +147,25 @@ pub struct EngineStats {
     pub dirs: u64,
     pub warm: bool,
     pub interned_bytes: u64,
+}
+
+/// Physical-capacity figures for a pane root that names exactly one
+/// volume (see [`Engine::volume_overlay`]); the capacity map draws its
+/// root ring against these so the proportions are the drive's real ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct VolumeOverlay {
+    /// `total - available` as the OS reports it — what Explorer would
+    /// call the drive's used space.
+    pub used_bytes: u64,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    /// The subtree total the hot index holds for this root.
+    pub indexed_bytes: u64,
+    /// `used - indexed`, clamped at zero: bytes on the drive the index
+    /// does not account for (excluded paths, recycle bin, accounting
+    /// skew).
+    pub unindexed_bytes: u64,
 }
 
 /// Facade owning the store and the hot index (see module docs). `Engine`
@@ -646,6 +666,38 @@ impl Engine {
     pub fn size_tree_dirs(&self, root: &str, depth: u8, max_children: u8) -> Option<SizeNode> {
         let hot = read_unpoisoned(&self.hot);
         sizeagg::build_tree_dirs(&hot, root, depth, max_children)
+    }
+
+    /// Physical-capacity overlay for a pane root that names exactly one
+    /// volume (see [`crate::volumes::match_volume`]); `None` for every
+    /// other level. `used = total - available` straight from the OS, so
+    /// the capacity map's ring can be honest about what Explorer reports,
+    /// with the indexed-vs-physical gap as the「未索引」block.
+    pub fn volume_overlay(&self, root: &str) -> Option<VolumeOverlay> {
+        let volumes = crate::volumes::fixed_volumes();
+        self.volume_overlay_in(root, &volumes)
+    }
+
+    /// [`Engine::volume_overlay`] over a caller-supplied volume list —
+    /// the seam that keeps the arithmetic unit-testable without touching
+    /// the host's real disks.
+    fn volume_overlay_in(&self, root: &str, volumes: &[VolumeInfo]) -> Option<VolumeOverlay> {
+        let volume = match_volume(root, volumes)?;
+        let used = volume.total_bytes.saturating_sub(volume.available_bytes);
+        // depth 0 = the root node alone, carrying the subtree total.
+        let indexed = self
+            .size_tree_dirs(root, 0, 0)
+            .map_or(0u64, |node| node.size);
+        Some(VolumeOverlay {
+            used_bytes: used,
+            total_bytes: volume.total_bytes,
+            available_bytes: volume.available_bytes,
+            indexed_bytes: indexed,
+            // Sparse files / accounting skew can push the indexed sum
+            // past physical usage — the chart must never draw a negative
+            // block.
+            unindexed_bytes: used.saturating_sub(indexed),
+        })
     }
 
     /// Removes one member row (alive or tombstoned) from a collection.
@@ -2334,5 +2386,96 @@ mod tests {
         drop(engine);
         let reopened = Engine::open(&db, EngineOptions::default()).unwrap();
         assert_eq!(reopened.settings(), next);
+    }
+
+    // ---------------- v1.1: volume usage overlay -------------------------
+
+    /// `match_volume` decides whether a pane root names a whole volume
+    /// (the only view level that gets the physical-capacity overlay).
+    /// Index paths and mount points spell the same volume differently
+    /// (`C` from the index root segment vs `C:\` from sysinfo) — trailing
+    /// separators are trimmed and comparison is ASCII case-insensitive.
+    #[test]
+    fn match_volume_normalizes_windows_paths() {
+        let volumes = vec![
+            crate::volumes::VolumeInfo {
+                path: "C:\\".into(),
+                label: "System".into(),
+                total_bytes: 500,
+                available_bytes: 100,
+            },
+            crate::volumes::VolumeInfo {
+                path: "D:\\".into(),
+                label: "Data".into(),
+                total_bytes: 900,
+                available_bytes: 300,
+            },
+        ];
+
+        let c = |root: &str| match_volume(root, &volumes).map(|v| v.path.clone());
+        assert_eq!(c("C:\\"), Some("C:\\".into()), "exact mount matches");
+        assert_eq!(c("c:\\"), Some("C:\\".into()), "case-insensitive");
+        assert_eq!(
+            c("C:"),
+            Some("C:\\".into()),
+            "the index root segment (root_segment keeps the colon) matches"
+        );
+        assert_eq!(c("D:\\"), Some("D:\\".into()));
+        assert_eq!(c("D:\\data"), None, "a subdirectory is not a volume");
+        assert_eq!(c(""), None, "the (all) root never matches");
+        assert_eq!(c("fixture"), None, "a custom scan root never matches");
+        assert_eq!(c("C"), None, "a bare folder name is not a volume");
+    }
+
+    /// `volume_overlay` arithmetic on a synthetic volume list: `used =
+    /// total - available`, `indexed` = the subtree total the hot index
+    /// reports for the root, and `unindexed` clamps at zero when the
+    /// indexed sum exceeds physical usage (sparse files / accounting
+    /// skew) — a negative block must never reach the chart.
+    #[test]
+    fn volume_overlay_clamps_unindexed() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_size_fixture(tmp.path());
+        let engine = size_fixture_engine(&tmp);
+        let indexed = engine
+            .size_tree_dirs("fixture", 0, 0)
+            .expect("fixture root resolves")
+            .size;
+        assert!(indexed > 0);
+
+        // A "volume" whose used space (total - available) is smaller than
+        // what the index adds up: unindexed must clamp to 0, not underflow.
+        let tiny = vec![crate::volumes::VolumeInfo {
+            path: "fixture".into(),
+            label: "Fake".into(),
+            total_bytes: 1000,
+            available_bytes: 1000,
+        }];
+        let o = engine
+            .volume_overlay_in("fixture", &tiny)
+            .expect("matching volume yields an overlay");
+        assert_eq!(o.used_bytes, 0);
+        assert_eq!(o.indexed_bytes, indexed);
+        assert_eq!(o.unindexed_bytes, 0, "saturating clamp at zero");
+
+        // A healthy margin: used > indexed leaves the unindexed remainder.
+        let big = vec![crate::volumes::VolumeInfo {
+            path: "fixture".into(),
+            label: "Fake".into(),
+            total_bytes: indexed + 20_000,
+            available_bytes: 5_000,
+        }];
+        let o = engine.volume_overlay_in("fixture", &big).unwrap();
+        assert_eq!(o.used_bytes, indexed + 15_000);
+        assert_eq!(o.unindexed_bytes, 15_000);
+
+        // No matching volume (a custom root): no overlay at all.
+        let volumes = vec![crate::volumes::VolumeInfo {
+            path: "C:\\".into(),
+            label: "System".into(),
+            total_bytes: 1,
+            available_bytes: 1,
+        }];
+        assert!(engine.volume_overlay_in("fixture", &volumes).is_none());
     }
 }
