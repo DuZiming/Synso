@@ -21,9 +21,15 @@
   // toasts instead of opening an empty picker.
   import { onMount } from "svelte";
   import { t } from "../i18n";
-  import { collAdd, fileIdOf, revealIndexPath, sizeTree } from "../lib/tauri";
+  import {
+    collAdd,
+    fileIdOf,
+    revealIndexPath,
+    sizeTree,
+    volumeOverlay,
+  } from "../lib/tauri";
   import { listen } from "@tauri-apps/api/event";
-  import type { Collection, SizeNode } from "../lib/types";
+  import type { Collection, SizeNode, VolumeOverlay } from "../lib/types";
   import FlameChartSunburst from "./FlameChartSunburst.svelte";
   import CollectionPicker from "../collections/CollectionPicker.svelte";
   import { humanBytes } from "../lib/format";
@@ -44,7 +50,8 @@
   /// virtual root), `tree` the last successful fetch, `seq` a race guard
   /// so a slow response can never overwrite a newer request, `picker` the
   /// text input's draft, `hover` the hovered block's chain (right panel)
-  /// and subdirectories (left panel).
+  /// and subdirectories (left panel), `overlay` the physical-capacity
+  /// figures when this pane's root names a whole volume (null elsewhere).
   interface Pane {
     root: string;
     tree: SizeNode | null;
@@ -54,6 +61,7 @@
     seq: number;
     picker: string;
     hover: HoverInfo | null;
+    overlay: VolumeOverlay | null;
   }
 
   function newPane(root: string): Pane {
@@ -66,6 +74,7 @@
       seq: 0,
       picker: root,
       hover: null,
+      overlay: null,
     };
   }
 
@@ -106,9 +115,15 @@
     const seq = ++pane.seq;
     pane.loading = true;
     pane.error = null;
+    // The overlay rides along on every load (including fs-changed
+    // refreshes) so the used/free figures track deletions; a failure
+    // degrades to no overlay, never a failed pane.
+    const overlayFetch = volumeOverlay(pane.root).catch(() => null);
     try {
       const tree = await sizeTree(pane.root, depth, MAX_CHILDREN, false);
+      const overlay = await overlayFetch;
       if (seq !== pane.seq) return; // a newer request superseded this one
+      pane.overlay = overlay;
       if (tree) {
         pane.tree = tree;
         pane.missing = false;
@@ -307,6 +322,12 @@
             if (event.key === "Enter") jump(pane, pane.picker);
           }}
         />
+        {#if pane.overlay}
+          <span class="usage-line">
+            {$t("flame.used")} {humanBytes(pane.overlay.used_bytes)} /
+            {$t("flame.total")} {humanBytes(pane.overlay.total_bytes)}
+          </span>
+        {/if}
 
         {#if pane.tree}
           <div class="pane-body">
@@ -328,6 +349,23 @@
             </aside>
             <FlameChartSunburst
               root={pane.tree}
+              overlay={pane.overlay
+                ? {
+                    unindexedBytes: pane.overlay.unindexed_bytes,
+                    freeBytes: pane.overlay.available_bytes,
+                    freeLabel: $t("flame.freeSpace"),
+                    unindexedLabel: $t("flame.unindexed"),
+                    centerTitle: list.length
+                      ? list[list.length - 1].name
+                      : pane.root,
+                    // Center copy stays bare numbers (the 已用/共 words
+                    // live in the header usage line) — the widened hole
+                    // is still too narrow for the full sentence.
+                    centerLine: `${humanBytes(pane.overlay.used_bytes)} / ${humanBytes(
+                      pane.overlay.total_bytes,
+                    )}`,
+                  }
+                : null}
               onDrill={(path) => drill(pane, path)}
               onReveal={(path) => void reveal(path)}
               onAddToCollection={(path) => void addToCollection(path)}
@@ -566,6 +604,13 @@
     border-radius: 8px;
     padding: 7px 12px;
     width: 100%;
+  }
+
+  .usage-line {
+    font-size: 12px;
+    color: var(--text-muted, var(--text));
+    opacity: 0.75;
+    white-space: nowrap;
   }
 
   .pane-state {

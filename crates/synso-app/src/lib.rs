@@ -144,6 +144,7 @@ pub fn run() {
             commands::dedup_groups,
             commands::delete_to_trash,
             commands::size_tree,
+            commands::volume_overlay,
             commands::reveal_index_path,
             commands::coll_create,
             commands::coll_rename,

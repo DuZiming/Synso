@@ -41,11 +41,10 @@
 - 用户说"后面重新再规划"——留好引擎侧的墓碑/重绑经验，重新设计时可能
   复用
 
-## 4. 「火焰图」改名「容量地图」（用户决定）
+## 4. 「火焰图」改名「容量地图」（用户决定）——已完成（v1.1 任务 3）
 
-- i18n：zh 的 tabs.flame 及 flame.* 命名空间、en 同步；快捷键无涉
-- 代码符号（FlameView/FlameChartSunburst）可顺手改名也可不动（用户可见
-  文案优先）
+- i18n：zh `tabs.flame` → 「容量地图」、`flame.chartLabel` 同步；en → "Capacity Map"；
+  代码符号（FlameView/FlameChartSunburst）未改名（用户可见文案优先）
 
 ## 5. 小问题备忘
 

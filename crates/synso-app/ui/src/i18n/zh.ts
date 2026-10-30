@@ -47,7 +47,7 @@ const zh: Dict = {
   tabs: {
     overview: "概览",
     dedup: "查重",
-    flame: "火焰图",
+    flame: "容量地图",
     collections: "集合",
     settings: "设置",
   },
@@ -132,7 +132,7 @@ const zh: Dict = {
     rootPickerPlaceholder: "输入索引路径，回车跳转",
     rootPickerLabel: "根路径输入框",
     crumbsLabel: "根目录面包屑",
-    chartLabel: "目录大小火焰图",
+    chartLabel: "目录大小容量地图",
     menuLabel: "节点菜单",
     reveal: "在资源管理器中显示",
     revealUnavailable: "聚合节点没有对应的磁盘位置",
@@ -140,6 +140,10 @@ const zh: Dict = {
     aggregateNoDrill: "聚合节点不可下钻（(other) 是多个目录的合并项）。",
     filesLine: "{n} 个文件",
     ofParentLine: "占上级 {pct}%",
+    used: "已用",
+    total: "共",
+    unindexed: "未索引",
+    freeSpace: "剩余空间",
   },
   collections: {
     create: "新建",

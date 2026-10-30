@@ -25,6 +25,17 @@ export interface VolumeInfo {
   path: string;
   label: string;
   total_bytes: number;
+  available_bytes: number;
+}
+
+/// Mirror of `synso_core::VolumeOverlay` — the physical-capacity figures
+/// the capacity map overlays at a pane root that names a whole volume.
+export interface VolumeOverlay {
+  used_bytes: number;
+  total_bytes: number;
+  available_bytes: number;
+  indexed_bytes: number;
+  unindexed_bytes: number;
 }
 
 /// Payload of the `scan-progress` event.

@@ -46,7 +46,7 @@ const en = {
   tabs: {
     overview: "Overview",
     dedup: "Duplicates",
-    flame: "Flame chart",
+    flame: "Capacity map",
     collections: "Collections",
     settings: "Settings",
   },
@@ -139,7 +139,7 @@ const en = {
     rootPickerPlaceholder: "Index path — Enter to jump",
     rootPickerLabel: "Root path picker",
     crumbsLabel: "Root breadcrumb",
-    chartLabel: "Directory size flame chart",
+    chartLabel: "Directory size capacity map",
     menuLabel: "Node menu",
     reveal: "Show in File Explorer",
     revealUnavailable: "Aggregated nodes have no disk location",
@@ -148,6 +148,10 @@ const en = {
       "Aggregated node — the (other) bucket has no single path to drill into.",
     filesLine: "{n} files",
     ofParentLine: "{pct}% of parent",
+    used: "Used",
+    total: "of",
+    unindexed: "Unindexed",
+    freeSpace: "Free space",
   },
   collections: {
     create: "New",

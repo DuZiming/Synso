@@ -14,6 +14,7 @@ import type {
   Settings,
   SizeNode,
   VolumeInfo,
+  VolumeOverlay,
 } from "./types";
 
 export function engineStats(): Promise<EngineStats> {
@@ -161,6 +162,13 @@ export function sizeTree(
     maxChildren,
     includeFiles,
   });
+}
+
+/** Physical-capacity overlay for a pane root naming exactly one volume
+ * (null at every other level) — see `Engine::volume_overlay`. Fetched
+ * alongside every tree load so the used/free figures track deletions. */
+export function volumeOverlay(root: string): Promise<VolumeOverlay | null> {
+  return invoke("volume_overlay", { root });
 }
 
 /** Reveals an INDEX path in the OS file manager (Explorer with the item

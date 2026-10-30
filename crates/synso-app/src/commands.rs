@@ -334,6 +334,20 @@ pub async fn size_tree(
     })
 }
 
+/// Physical-capacity overlay for a pane root that names exactly one
+/// volume (`None` at every other level — see `Engine::volume_overlay`).
+/// Async like `size_tree`: it walks the hot index for the indexed sum
+/// and queries sysinfo for the volume's totals. The `Result` wrapper is
+/// Tauri's requirement for async commands with reference-carrying
+/// returns; `Ok` serializes to exactly the `Option<VolumeOverlay>` JSON.
+#[tauri::command]
+pub async fn volume_overlay(
+    state: State<'_, AppState>,
+    root: String,
+) -> Result<Option<synso_core::VolumeOverlay>, String> {
+    Ok(state.engine.volume_overlay(&root))
+}
+
 /// Reveals an INDEX path (the `Hit::path` spelling — flame-chart nodes
 /// carry paths, not row ids, so this is the path-based sibling of
 /// `reveal_path`) in the OS file manager: resolve to the absolute disk
