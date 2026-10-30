@@ -21,6 +21,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 synso-core = { path = "../synso-core", features = ["serde"] }
+# Process-memory sampling for the memlog thread (v1.1 Task 6); same
+# version as the workspace's, but with the `system` feature (processes +
+# memory) — core only needs `disk`.
+sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 # tray-icon: the built-in v2 tray (Task 19). image-png/image-ico: decode the
 # bundled placeholder icon for the tray (and window icons come from the
 # bundle section of tauri.conf.json).

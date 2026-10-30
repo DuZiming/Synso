@@ -20,6 +20,7 @@
 mod commands;
 mod events;
 mod logging;
+mod memlog;
 mod quick;
 mod state;
 mod tray;
@@ -74,6 +75,11 @@ pub fn run() {
             }
             app.manage(app_state);
             events::spawn_forwarder(app.handle().clone(), engine_events);
+            // Memory sampler (v1.1 Task 6): one log line per minute,
+            // working set + commit next to engine stats.
+            memlog::spawn(std::sync::Arc::clone(
+                &app.state::<state::AppState>().engine,
+            ));
 
             // Quick window: placement, focus-loss hide, global shortcut
             // (reads settings, so after `app.manage`).
