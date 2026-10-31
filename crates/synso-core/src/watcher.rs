@@ -96,6 +96,7 @@ use crate::{Result, SynsoError};
 /// Events collect for this long after the LAST event before the batch is
 /// applied (the debounce quiet window from the design).
 const QUIET_WINDOW: Duration = Duration::from_millis(500);
+pub(crate) const MAX_DEFER: Duration = Duration::from_secs(2);
 
 /// Wake-up granularity while no window is open (no pending ops): only a
 /// safety net — events and the stop signal wake the thread immediately.
@@ -291,12 +292,19 @@ fn run_loop(
     pending: &mut BTreeMap<PathBuf, PendingOp>,
 ) {
     let mut deadline: Option<Instant> = None;
+    // When the CURRENT batch's first op queued; None while no batch is
+    // pending. Caps the sliding window at MAX_DEFER (see its doc).
+    let mut batch_started: Option<Instant> = None;
     loop {
-        if let Some(at) = deadline {
-            if Instant::now() >= at {
-                apply_batch(ctx, pending);
-                deadline = None;
-                continue;
+        if let Some(started) = batch_started {
+            let capped = (Instant::now() - started) >= MAX_DEFER;
+            if let Some(at) = deadline {
+                if Instant::now() >= at || capped {
+                    apply_batch(ctx, pending);
+                    deadline = None;
+                    batch_started = None;
+                    continue;
+                }
             }
         }
         let wait = deadline.map_or(SLOW_POLL, |at| at.saturating_duration_since(Instant::now()));
@@ -309,6 +317,9 @@ fn run_loop(
                     // a flood of filtered noise would otherwise keep
                     // sliding the window and starve the pending batch.
                     if absorb(ctx, event, pending) {
+                        if batch_started.is_none() {
+                            batch_started = Some(Instant::now());
+                        }
                         deadline = Some(Instant::now() + QUIET_WINDOW);
                     }
                 }
@@ -554,6 +565,7 @@ fn write_unpoisoned<T>(rwlock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T>
 
 #[cfg(test)]
 mod tests {
+    use super::MAX_DEFER;
     use crate::engine::{Engine, EngineEvent, EngineOptions};
     use crate::store::Store;
     use std::fs;
@@ -978,5 +990,55 @@ mod tests {
         // Noise stays excluded (ample time after the flood ended).
         std::thread::sleep(Duration::from_millis(1200));
         assert_eq!(search_total(&engine, "noise"), 0, "noise never indexed");
+    }
+
+    /// Liveness under a CONTINUOUS stream of REAL (in-scope) events: the
+    /// sliding 500ms quiet window would otherwise never hold on a busy
+    /// machine (builds, browser caches — a user-observed freeze of the
+    /// capacity map's refresh), so the first pending op must force an
+    /// apply within [`MAX_DEFER`] even while the storm keeps raging.
+    #[test]
+    fn watcher_applies_batch_under_continuous_real_event_storm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = write_fixture(tmp.path());
+        let engine = open_engine(&db_path, &root, Vec::new());
+        scan_once(&engine);
+        engine.start_watcher().unwrap();
+
+        // A storm of real in-scope writes: one file every 100ms, forever
+        // (no quiet gap >= QUIET_WINDOW ever occurs while it runs).
+        let storm_dir = root.join("storm");
+        fs::create_dir_all(&storm_dir).unwrap();
+        let storming = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let storm_flag = std::sync::Arc::clone(&storming);
+        let storm_root = storm_dir.to_path_buf();
+        let storm_thread = std::thread::spawn(move || {
+            let mut i = 0u32;
+            while storm_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                fs::write(storm_root.join(format!("churn{i}.txt")), b"x").unwrap();
+                i += 1;
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        // One deliberate file mid-storm: it must become searchable WHILE
+        // the storm is still running (cap forces a batch through). Budget
+        // MAX_DEFER + quiet-window + generous slack; without the cap this
+        // only resolves after the storm ends.
+        let marker = root.join("storm_marker.txt");
+        fs::write(&marker, b"marker").unwrap();
+        // poll_until panics on timeout: the marker MUST appear within the
+        // budget while the storm is still running.
+        poll_until(Duration::from_secs(MAX_DEFER.as_secs() + 5), || {
+            (search_total(&engine, "storm_marker") == 1).then_some(())
+        });
+        assert!(
+            storming.load(std::sync::atomic::Ordering::SeqCst),
+            "the storm must still be running (no quiet window to exploit)"
+        );
+
+        storming.store(false, std::sync::atomic::Ordering::SeqCst);
+        storm_thread.join().unwrap();
     }
 }

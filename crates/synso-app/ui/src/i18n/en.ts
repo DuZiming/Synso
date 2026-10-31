@@ -152,6 +152,8 @@ const en = {
     pinned: "Pinned",
     pinnedHint:
       "This block is click-pinned; click it again to unpin and let hover take over.",
+    copyPath: "Copy full path",
+    copied: "Path copied",
   },
   settings: {
     langTitle: "Language",

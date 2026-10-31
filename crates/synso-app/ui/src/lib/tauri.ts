@@ -2,6 +2,7 @@
 // crates/synso-app/src/commands.rs).
 
 import { invoke } from "@tauri-apps/api/core";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import type {
   DedupState,
   DupeGroup,
@@ -166,6 +167,13 @@ export function sizeTree(
  * alongside every tree load so the used/free figures track deletions. */
 export function volumeOverlay(root: string): Promise<VolumeOverlay | null> {
   return invoke("volume_overlay", { root });
+}
+
+/** Writes `text` to the OS clipboard (the capacity map's copy-path
+ * button; the webview origin is not a secure context, so the raw
+ * navigator.clipboard is unavailable). */
+export function copyToClipboard(text: string): Promise<void> {
+  return writeText(text);
 }
 
 /** Reveals an INDEX path in the OS file manager (Explorer with the item

@@ -49,6 +49,8 @@ pub fn run() {
         ))
         // Native dialogs (Task 19): the mid-scan quit confirmation.
         .plugin(tauri_plugin_dialog::init())
+        // Clipboard writes (capacity map's copy-path button).
+        .plugin(tauri_plugin_clipboard_manager::init())
         // Global shortcut for the quick window; registration itself
         // happens in `quick::init` from the user's settings spelling,
         // and live re-registration in `quick::set_shortcut`.

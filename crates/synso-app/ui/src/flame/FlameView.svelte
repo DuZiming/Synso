@@ -14,7 +14,12 @@
   // click PINS the arc's side lists instead.
   import { onMount } from "svelte";
   import { t } from "../i18n";
-  import { listVolumes, sizeTree, volumeOverlay } from "../lib/tauri";
+  import {
+    copyToClipboard,
+    listVolumes,
+    sizeTree,
+    volumeOverlay,
+  } from "../lib/tauri";
   import { listen } from "@tauri-apps/api/event";
   import type { SizeNode, VolumeInfo, VolumeOverlay } from "../lib/types";
   import FlameChartSunburst from "./FlameChartSunburst.svelte";
@@ -189,6 +194,27 @@
     pane.pinned = pane.pinned?.key === key ? null : { key, info };
   }
 
+  /// The pinned arc's full index path — the chain's names root-first,
+  /// joined with the separator (for volume scan roots this IS the disk
+  /// path, e.g. `C:\Users\admin`).
+  function pinnedPath(pane: Pane): string | null {
+    const info = pane.pinned?.info;
+    if (!info || info.chain.length === 0) return null;
+    return info.chain.map((l) => l.name).join("\\");
+  }
+
+  /// Copies the pinned path; feedback through the toast.
+  async function copyPinnedPath(pane: Pane): Promise<void> {
+    const path = pinnedPath(pane);
+    if (!path) return;
+    try {
+      await copyToClipboard(path);
+      showToast($t("flame.copied"));
+    } catch (err) {
+      showToast(String(err));
+    }
+  }
+
   /// What the side lists show: the pinned arc when one is pinned, the
   /// live hover otherwise.
   function listInfo(pane: Pane): HoverInfo | null {
@@ -337,6 +363,27 @@
                     </span>
                   {/if}
                 </h3>
+                {#if pane.pinned && pinnedPath(pane)}
+                  <!-- The pinned arc's full path with a one-click copy. -->
+                  <div class="fullpath-row">
+                    <code class="fullpath" title={pinnedPath(pane)!}>
+                      {pinnedPath(pane)}
+                    </code>
+                    <button
+                      class="ghost copy-btn"
+                      aria-label={$t("flame.copyPath")}
+                      title={$t("flame.copyPath")}
+                      onclick={() => void copyPinnedPath(pane)}
+                    >
+                      <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+                        <rect x="5" y="1" width="9" height="11" rx="1.5"
+                          fill="none" stroke="currentColor" stroke-width="1.4" />
+                        <path d="M11 13.5v1a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h1"
+                          fill="none" stroke="currentColor" stroke-width="1.4" />
+                      </svg>
+                    </button>
+                  </div>
+                {/if}
                 <!-- Pinned/hovered first, then each parent up to the root. -->
                 <ol>
                   {#each [...listInfo(pane)!.chain].reverse() as level, i (i)}
@@ -617,6 +664,45 @@
     color: var(--text-muted, var(--text));
     opacity: 0.75;
     white-space: nowrap;
+  }
+
+  .pin-chip {
+    font-size: 11px;
+    font-weight: 500;
+    margin-left: 8px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--text-muted, var(--text));
+  }
+
+  .fullpath-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 4px 0 8px;
+  }
+
+  .fullpath {
+    flex: 1;
+    min-width: 0;
+    font-size: 11px;
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg, transparent);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl; /* long paths show their TAIL (the leaf) */
+    text-align: left;
+  }
+
+  .copy-btn {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 7px;
   }
 
   .pane-state {

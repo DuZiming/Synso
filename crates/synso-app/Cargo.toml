@@ -35,6 +35,9 @@ tauri-plugin-global-shortcut = "2"
 # OS autostart registration, and single-instance (second launch focuses
 # the running app). All driven from Rust; no webview permissions needed.
 tauri-plugin-dialog = "2"
+# Clipboard write for the capacity map's pinned-path copy button (the
+# webview origin is not a secure context, so navigator.clipboard is out).
+tauri-plugin-clipboard-manager = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
 # OS UI language for the tray menu's "auto" resolution (see tray.rs);
