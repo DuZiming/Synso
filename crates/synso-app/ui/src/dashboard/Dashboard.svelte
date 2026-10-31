@@ -1,9 +1,9 @@
 <script lang="ts">
   // Dashboard shell (Task 16): client-side tabs over the main window —
-  // 概览 (index tiles + scan), 查重 (DedupView), 火焰图 (FlameView,
-  // Task 17), 集合 (CollectionsView, Task 18) and 设置 (SettingsView,
-  // Task 19). No router lib: tab state is one $state string, and tab
-  // content mounts on demand, so a re-opened tab re-reads its own state.
+  // 概览 (index tiles + scan), 查重 (DedupView), 容量地图 (FlameView,
+  // Task 17) and 设置 (SettingsView, Task 19). No router lib: tab state
+  // is one $state string, and tab content mounts on demand, so a
+  // re-opened tab re-reads its own state.
   //
   // Task 19: the tray's 设置 item emits `nav-tab` to this window (see
   // tray.rs); the listener switches tabs, so the tray reaches the panel
@@ -16,24 +16,17 @@
   import type { EngineStats, NavTabPayload } from "../lib/types";
   import DedupView from "../dedup/DedupView.svelte";
   import FlameView from "../flame/FlameView.svelte";
-  import CollectionsView from "../collections/CollectionsView.svelte";
   import SettingsView from "../settings/SettingsView.svelte";
 
-  type TabId = "overview" | "dedup" | "flame" | "collections" | "settings";
+  type TabId = "overview" | "dedup" | "flame" | "settings";
 
   const tabs: {
     id: TabId;
-    label:
-      | "tabs.overview"
-      | "tabs.dedup"
-      | "tabs.flame"
-      | "tabs.collections"
-      | "tabs.settings";
+    label: "tabs.overview" | "tabs.dedup" | "tabs.flame" | "tabs.settings";
   }[] = [
     { id: "overview", label: "tabs.overview" },
     { id: "dedup", label: "tabs.dedup" },
     { id: "flame", label: "tabs.flame" },
-    { id: "collections", label: "tabs.collections" },
     { id: "settings", label: "tabs.settings" },
   ];
 
@@ -152,8 +145,6 @@
   </section>
 {:else if tab === "flame"}
   <FlameView />
-{:else if tab === "collections"}
-  <CollectionsView />
 {:else if tab === "settings"}
   <SettingsView />
 {:else}

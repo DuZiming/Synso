@@ -63,7 +63,4 @@ pub struct ParsedQuery {
     /// reconstructed path (the field name keeps the brief's spelling;
     /// the semantics are substring, not prefix). Last occurrence wins.
     pub path_prefix: Option<String>,
-    /// `coll:工作` — repeatable. The file must be an ALIVE member of EVERY
-    /// named collection; an unknown name filters to no results.
-    pub collections: Vec<String>,
 }

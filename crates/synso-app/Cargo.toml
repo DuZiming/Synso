@@ -21,6 +21,10 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 synso-core = { path = "../synso-core", features = ["serde"] }
+# Process-memory sampling for the memlog thread (v1.1 Task 6); same
+# version as the workspace's, but with the `system` feature (processes +
+# memory) — core only needs `disk`.
+sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 # tray-icon: the built-in v2 tray (Task 19). image-png/image-ico: decode the
 # bundled placeholder icon for the tray (and window icons come from the
 # bundle section of tauri.conf.json).
@@ -31,6 +35,9 @@ tauri-plugin-global-shortcut = "2"
 # OS autostart registration, and single-instance (second launch focuses
 # the running app). All driven from Rust; no webview permissions needed.
 tauri-plugin-dialog = "2"
+# Clipboard write for the capacity map's pinned-path copy button (the
+# webview origin is not a secure context, so navigator.clipboard is out).
+tauri-plugin-clipboard-manager = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
 # OS UI language for the tray menu's "auto" resolution (see tray.rs);

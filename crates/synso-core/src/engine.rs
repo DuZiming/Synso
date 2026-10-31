@@ -12,9 +12,7 @@
 //! fresh reload can never be overwritten by a stale loader snapshot. One
 //! scan at a time: [`Engine::start_full_scan`] is a no-op while a scan is
 //! running; the slot is released by a drop guard, so even a panicked scan
-//! cannot wedge the engine. A successful scan also runs the collections
-//! reconcile (tombstone + rebind, see [`crate::collections`]) inside the
-//! same store critical section, before `ScanFinished` is emitted.
+//! cannot wedge the engine.
 //!
 //! Failure semantics: a scan that aborts with a store error emits
 //! [`EngineEvent::ScanFailed`] instead of `ScanFinished` and does NOT swap
@@ -59,7 +57,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
-use crate::collections::{self, Collection, MemberHit};
 use crate::dedup::{self, DedupState, DupeGroup, StoredGroup};
 use crate::hotindex::HotIndex;
 use crate::model::{FileId, ParsedQuery};
@@ -69,6 +66,7 @@ use crate::settings::{self, Settings};
 use crate::sizeagg::{self, SizeNode};
 use crate::store::Store;
 use crate::trash;
+use crate::volumes::{match_volume, VolumeInfo};
 use crate::watcher::{self, Watcher};
 use crate::Result;
 
@@ -148,6 +146,25 @@ pub struct EngineStats {
     pub interned_bytes: u64,
 }
 
+/// Physical-capacity figures for a pane root that names exactly one
+/// volume (see [`Engine::volume_overlay`]); the capacity map draws its
+/// root ring against these so the proportions are the drive's real ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct VolumeOverlay {
+    /// `total - available` as the OS reports it — what Explorer would
+    /// call the drive's used space.
+    pub used_bytes: u64,
+    pub total_bytes: u64,
+    pub available_bytes: u64,
+    /// The subtree total the hot index holds for this root.
+    pub indexed_bytes: u64,
+    /// `used - indexed`, clamped at zero: bytes on the drive the index
+    /// does not account for (excluded paths, recycle bin, accounting
+    /// skew).
+    pub unindexed_bytes: u64,
+}
+
 /// Facade owning the store and the hot index (see module docs). `Engine`
 /// is `Send + Sync`, so the app layer can hold it in an `Arc`.
 pub struct Engine {
@@ -169,6 +186,12 @@ pub struct Engine {
     /// Dedup state machine + worker plumbing (Task 9). Threads and the
     /// auto-start timer own `Arc`s of this, never of the engine.
     dedup: Arc<DedupShared>,
+    /// In-memory copy of the persisted settings, preheated in [`open`]
+    /// and refreshed by [`Engine::set_settings`]. `settings()` serves
+    /// this — NEVER the store mutex, which the hot-index load and full
+    /// scans hold for their whole duration (a store-lock read froze the
+    /// app's main thread at startup: the v1 "not responding" bug).
+    settings_cache: Mutex<Settings>,
 }
 
 /// State shared between the engine, the dedup worker thread and the
@@ -204,6 +227,11 @@ impl Engine {
     /// flips to `true` when that load completes.
     pub fn open(db_path: &Path, opts: EngineOptions) -> Result<Engine> {
         let store = Arc::new(Mutex::new(Store::open(db_path)?));
+        // Preheat the settings cache BEFORE the hot-index load spawns:
+        // at this instant the store mutex is uncontended (the load and
+        // scans are what hold it for seconds later), so this read costs
+        // milliseconds — and every later `settings()` is lock-free.
+        let initial_settings = settings::load(&lock_unpoisoned(&store));
         let hot = Arc::new(RwLock::new(HotIndex::cold()));
         let scan_opts = ScanOptions {
             roots: opts.volumes,
@@ -229,6 +257,7 @@ impl Engine {
             db_path: db_path.to_path_buf(),
             watcher: Mutex::new(None),
             dedup,
+            settings_cache: Mutex::new(initial_settings),
         };
         if let Err(err) = thread::Builder::new()
             .name("synso-hot-load".into())
@@ -397,27 +426,39 @@ impl Engine {
         }
     }
 
-    // ---------------- Task 13: user settings -----------------------------
-
-    /// The persisted user settings (see [`crate::settings`]). Missing
-    /// fields read as their documented defaults, and a store read error
-    /// degrades to the default for that field — settings are UI
-    /// convenience, never a startup failure.
-    pub fn settings(&self) -> Settings {
-        settings::load(&lock_unpoisoned(&self.store))
+    /// Per-structure memory breakdown of the hot index (v1.1 Task 6
+    /// diagnostics — see [`crate::hotindex::HotIndex::mem_breakdown`]).
+    pub fn mem_breakdown(&self) -> crate::hotindex::MemBreakdown {
+        read_unpoisoned(&self.hot).mem_breakdown()
     }
 
-    /// Persists `settings` to the store's meta table; store errors surface
-    /// to the caller. The change applies to the field's consumers on their
-    /// next read (the engine holds no in-memory copy).
+    // ---------------- Task 13: user settings -----------------------------
+
+    /// The persisted user settings (see [`crate::settings`]), served from
+    /// the in-engine cache — this call NEVER touches the store mutex, so
+    /// it stays fast while a hot-index load or full scan holds it (the
+    /// app's main thread reads the shortcut at startup through
+    /// `quick::init`). The cache is preheated in [`Engine::open`] and
+    /// refreshed by [`Engine::set_settings`]; missing fields read as
+    /// their documented defaults.
+    pub fn settings(&self) -> Settings {
+        lock_unpoisoned(&self.settings_cache).clone()
+    }
+
+    /// Persists `settings` to the store's meta table and refreshes the
+    /// in-memory cache in the same step (see [`Engine::settings`]), so
+    /// the two can never disagree. Store errors surface to the caller
+    /// and leave the cache untouched.
     pub fn set_settings(&self, settings: &Settings) -> Result<()> {
-        settings::save(&lock_unpoisoned(&self.store), settings)
+        settings::save(&lock_unpoisoned(&self.store), settings)?;
+        *lock_unpoisoned(&self.settings_cache) = settings.clone();
+        Ok(())
     }
 
     /// Case-insensitive substring search over the hot index's name arena
     /// (see `crate::query` for the full contract). `text` is first
     /// parsed by [`crate::parse_query`]: Everything-style modifier
-    /// tokens (`ext:` / `size:` / `path:` / `coll:`) become dimension
+    /// tokens (`ext:` / `size:` / `path:`) become dimension
     /// filters applied before ranking, and the remaining words are free
     /// text that must ALL match. Ranking: prefix > word-start >
     /// substring, a within-class boost for mtimes within the last 30
@@ -433,67 +474,11 @@ impl Engine {
 
     /// [`Engine::search`] over an already-parsed query (see
     /// [`crate::parse_query`]). The parsed dimension filters
-    /// (`ext:` / `size:` / `path:` / `coll:`) apply as fast predicates
+    /// (`ext:` / `size:` / `path:`) apply as fast predicates
     /// BEFORE ranking and classification; ranking itself is unchanged.
-    /// `q.collections` resolves against the store: a file must be an ALIVE
-    /// member of every named collection, an unknown name filters the result
-    /// to empty (not an error), and a store error is logged and yields an
-    /// empty result (search is never fatal).
     pub fn search_parsed(&self, q: &ParsedQuery, offset: u32, limit: u32) -> SearchResult {
-        // Resolve the coll: filter against the store before touching the
-        // hot index (membership rows live only there). The store guard is
-        // released before the hot read; the engine's locks never nest.
-        let coll_members = if q.collections.is_empty() {
-            None
-        } else {
-            let store = lock_unpoisoned(&self.store);
-            match collections::alive_member_intersection(&store, &q.collections) {
-                // Ok(None) = an unknown collection name: no results, not
-                // an error — and NOT "no filter", hence the early return.
-                Ok(members) => match members {
-                    Some(members) => Some(members),
-                    None => return SearchResult::default(),
-                },
-                Err(err) => {
-                    log::error!(
-                        "synso: resolving collection filter {:?} failed: {err}",
-                        q.collections
-                    );
-                    return SearchResult::default();
-                }
-            }
-        };
         let hot = read_unpoisoned(&self.hot);
-        query::run_parsed(&hot, q, coll_members.as_ref(), offset, limit, unix_now())
-    }
-
-    /// Creates a virtual collection. A duplicate name is
-    /// `Err(SynsoError::Conflict)`. See `crate::collections`.
-    pub fn coll_create(&self, name: &str) -> Result<Collection> {
-        collections::create(&mut lock_unpoisoned(&self.store), name)
-    }
-
-    /// Renames a collection (`Err(NotFound)` for an unknown id,
-    /// `Err(Conflict)` when the name is taken).
-    pub fn coll_rename(&self, id: i64, name: &str) -> Result<()> {
-        collections::rename(&mut lock_unpoisoned(&self.store), id, name)
-    }
-
-    /// Deletes a collection and every member row it owns.
-    pub fn coll_delete(&self, id: i64) -> Result<()> {
-        collections::delete(&mut lock_unpoisoned(&self.store), id)
-    }
-
-    /// Every collection, id-ordered (creation order). Store errors surface
-    /// to the caller rather than degrading to an empty list.
-    pub fn coll_list(&self) -> Result<Vec<Collection>> {
-        collections::list(&lock_unpoisoned(&self.store))
-    }
-
-    /// Adds file OR folder row ids to a collection, snapshotting each
-    /// entry's current name and size (the later rebind key).
-    pub fn coll_add(&self, id: i64, members: &[FileId]) -> Result<()> {
-        collections::add(&mut lock_unpoisoned(&self.store), id, members)
+        query::run_parsed(&hot, q, offset, limit, unix_now())
     }
 
     // ---------------- Task 9: dedup state machine ------------------------
@@ -587,12 +572,10 @@ impl Engine {
     }
 
     /// The `files` row id the index-relative `path` names (the `Hit::path`
-    /// spelling; both separators accepted, directories included) — the
-    /// path → id bridge the app's `file_id_of` command (Task 18) needs,
-    /// because flame-chart nodes carry paths rather than row ids: adding a
-    /// flame node to a collection resolves it here first, then `coll_add`s
-    /// the id. `None` when the path matches nothing (unknown path, or the
-    /// virtual root `""` — it names no single entry).
+    /// spelling; both separators accepted, directories included) — a
+    /// generic path → id bridge (flame-chart nodes carry paths rather
+    /// than row ids). `None` when the path matches nothing (unknown path,
+    /// or the virtual root `""` — it names no single entry).
     pub fn file_id_of(&self, path: &str) -> Option<FileId> {
         let hot = read_unpoisoned(&self.hot);
         hot.id_of_path(path)
@@ -630,16 +613,36 @@ impl Engine {
         sizeagg::build_tree_dirs(&hot, root, depth, max_children)
     }
 
-    /// Removes one member row (alive or tombstoned) from a collection.
-    pub fn coll_remove(&self, id: i64, member: FileId) -> Result<()> {
-        collections::remove(&mut lock_unpoisoned(&self.store), id, member)
+    /// Physical-capacity overlay for a pane root that names exactly one
+    /// volume (see [`crate::volumes::match_volume`]); `None` for every
+    /// other level. `used = total - available` straight from the OS, so
+    /// the capacity map's ring can be honest about what Explorer reports,
+    /// with the indexed-vs-physical gap as the「未索引」block.
+    pub fn volume_overlay(&self, root: &str) -> Option<VolumeOverlay> {
+        let volumes = crate::volumes::fixed_volumes();
+        self.volume_overlay_in(root, &volumes)
     }
 
-    /// The collection's members, tombstoned ones included (their `hit` is
-    /// synthesized from the snapshot — see [`MemberHit`]). Store errors
-    /// surface to the caller rather than degrading to an empty list.
-    pub fn coll_members(&self, id: i64) -> Result<Vec<MemberHit>> {
-        collections::members(&lock_unpoisoned(&self.store), id)
+    /// [`Engine::volume_overlay`] over a caller-supplied volume list —
+    /// the seam that keeps the arithmetic unit-testable without touching
+    /// the host's real disks.
+    fn volume_overlay_in(&self, root: &str, volumes: &[VolumeInfo]) -> Option<VolumeOverlay> {
+        let volume = match_volume(root, volumes)?;
+        let used = volume.total_bytes.saturating_sub(volume.available_bytes);
+        // depth 0 = the root node alone, carrying the subtree total.
+        let indexed = self
+            .size_tree_dirs(root, 0, 0)
+            .map_or(0u64, |node| node.size);
+        Some(VolumeOverlay {
+            used_bytes: used,
+            total_bytes: volume.total_bytes,
+            available_bytes: volume.available_bytes,
+            indexed_bytes: indexed,
+            // Sparse files / accounting skew can push the indexed sum
+            // past physical usage — the chart must never draw a negative
+            // block.
+            unindexed_bytes: used.saturating_sub(indexed),
+        })
     }
 
     // ---------------- Task 10: recycle-bin-only deletion -----------------
@@ -655,11 +658,9 @@ impl Engine {
     /// with the watcher's removal mechanics
     /// (`crate::watcher::remove_path`: the row located by (dir, name)
     /// plus a subtree purge on the store, the slot removal plus subtree
-    /// sweep on the hot index) under one store -> hot lock pair, and — when
-    /// at least one path landed — the collections reconcile (tombstone +
-    /// rebind) runs in the same store critical section. A path the trash
-    /// batch refused is logged and keeps its index rows; the next rescan
-    /// heals any drift. Returns the success count.
+    /// sweep on the hot index) under one store -> hot lock pair. A path
+    /// the trash batch refused is logged and keeps its index rows; the
+    /// next rescan heals any drift. Returns the success count.
     pub fn delete_to_trash(&self, ids: &[FileId]) -> Result<usize> {
         // Phase 1: one hot-index read snapshot -> one candidate per live
         // id. The (dir chain, name) key and the index-relative spelling are
@@ -732,14 +733,6 @@ impl Engine {
                 let segments: Vec<&str> = entry.segments.iter().map(String::as_str).collect();
                 watcher::remove_path(&mut store, &mut hot, &segments, &entry.name, &entry.abs);
                 deleted += 1;
-            }
-            if deleted > 0 {
-                // Tombstone + rebind the collections in the same store
-                // critical section a scan's and a watcher batch's reconcile
-                // use; best-effort, like those.
-                if let Err(err) = collections::reconcile(&mut store) {
-                    log::warn!("synso: collection reconcile after trash failed: {err}");
-                }
             }
         }
         Ok(deleted)
@@ -854,14 +847,6 @@ fn scan_cycle(
             // ScanFinished already see fresh stats. On failure the hot
             // index keeps serving the last known-good snapshot.
             reload_hot_index_locked(&guard, &hot);
-            // Collection reconcile (tombstone + rebind, see `collections`)
-            // runs in the same store critical section, after the hot
-            // reload and before ScanFinished, so subscribers see member
-            // state consistent with the fresh index. Best-effort: the scan
-            // itself succeeded, so a reconcile error is logged, not fatal.
-            if let Err(err) = collections::reconcile(&mut guard) {
-                log::warn!("synso: collection reconcile after scan failed: {err}");
-            }
             (stats.files, stats.dirs)
         })
     };
@@ -984,7 +969,6 @@ fn reload_hot_index_locked(store: &Store, hot: &Arc<RwLock<HotIndex>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SynsoError;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
@@ -1456,45 +1440,6 @@ mod tests {
         assert_eq!(engine.stats().files, 3);
     }
 
-    /// Store errors behind the collection reads SURFACE: `coll_list` and
-    /// `coll_members` return `Err` instead of silently degrading to empty
-    /// lists. Dropping the underlying tables on the engine's own connection
-    /// is the cheapest way to force real store errors.
-    #[test]
-    fn coll_reads_surface_store_errors() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("index.db");
-        let root = write_fixture(tmp.path());
-
-        let engine = open_engine(&db_path, &root);
-        let coll = engine.coll_create("keep").unwrap();
-        assert_eq!(engine.coll_list().unwrap().len(), 1);
-        assert_eq!(engine.coll_members(coll.id).unwrap().len(), 0);
-
-        // Corrupt the schema out from under the engine's store connection:
-        // both reads must now report the store error to the caller.
-        {
-            let mut store = lock_unpoisoned(&engine.store);
-            store
-                .conn_mut()
-                .execute("DROP TABLE collection_members", [])
-                .unwrap();
-            store
-                .conn_mut()
-                .execute("DROP TABLE collections", [])
-                .unwrap();
-        }
-
-        assert!(
-            matches!(engine.coll_list(), Err(SynsoError::Db(_))),
-            "coll_list surfaces the store error, not an empty list"
-        );
-        assert!(
-            matches!(engine.coll_members(coll.id), Err(SynsoError::Db(_))),
-            "coll_members surfaces the store error, not an empty list"
-        );
-    }
-
     // ------------------- Task 9: dedup pipeline ---------------------------
 
     /// Receives events until `DedupFinished`, returning the finished run's
@@ -1884,8 +1829,7 @@ mod tests {
     // ------------------ Task 10: recycle-bin deletion ---------------------
 
     /// The recycle-bin contract end to end: the file leaves the disk, leaves
-    /// search, leaves the store, and its collection membership is
-    /// tombstoned (alive=0) with the name snapshot kept for a later rebind.
+    /// search, and leaves the store.
     #[test]
     fn delete_to_trash_removes_and_updates_index() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1909,11 +1853,6 @@ mod tests {
             .expect("the root segment resolves");
         assert!(abs.is_file());
 
-        // A collection tracks the doomed file so the tombstone is visible.
-        let coll = engine.coll_create("purge-test").unwrap();
-        engine.coll_add(coll.id, &[doomed_id]).unwrap();
-        assert!(engine.coll_members(coll.id).unwrap()[0].alive);
-
         assert_eq!(
             engine.delete_to_trash(&[doomed_id]).unwrap(),
             1,
@@ -1932,11 +1871,6 @@ mod tests {
             .unwrap()
             .iter()
             .all(|rec| rec.name != "doomed.txt"));
-        // ...and tombstoned in the collection (alive=0, snapshot kept).
-        let members = engine.coll_members(coll.id).unwrap();
-        assert_eq!(members.len(), 1);
-        assert!(!members[0].alive, "the deleted member must be tombstoned");
-        assert_eq!(members[0].hit.name, "doomed.txt");
         assert_eq!(engine.stats().files, 1);
     }
 
@@ -2258,5 +2192,154 @@ mod tests {
             .size_tree(&format!("fixture{sep}docs"), 1, 40)
             .unwrap();
         assert_eq!((dir_tree.size, dir_tree.file_count), (113, 4));
+    }
+
+    // ---------------- v1.1: cached settings reads ------------------------
+
+    /// `settings()` must be served from an in-engine cache, NOT the store
+    /// mutex: the startup hot-index load and full scans hold that mutex
+    /// for their whole duration, and the app's main thread reads the
+    /// shortcut through `quick::init` inside `.setup` — a store-lock read
+    /// there is the "window not responding for tens of seconds" bug. The
+    /// test holds the store lock exactly the way a load would; a cached
+    /// read returns instantly.
+    #[test]
+    fn settings_read_does_not_wait_on_store_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&tmp.path().join("index.db"), EngineOptions::default()).unwrap();
+
+        // Hold the store mutex the way the hot-index loader / a scan does.
+        // The guard borrows the local Arc clone, so `engine` itself can
+        // still move into the reader thread below.
+        let store = Arc::clone(&engine.store);
+        let _store_guard = lock_unpoisoned(&store);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let settings = engine.settings();
+            tx.send(settings.shortcut).unwrap();
+        });
+
+        let shortcut = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("settings() must not wait on the store mutex");
+        assert_eq!(shortcut, crate::settings::DEFAULT_SHORTCUT);
+        reader.join().unwrap();
+    }
+
+    /// `set_settings` writes through to the store AND refreshes the cache
+    /// in one step: the next `settings()` sees the new value without a
+    /// store round-trip, and a fresh `Engine::open` over the same database
+    /// reads it back from disk (cache and store never disagree).
+    #[test]
+    fn set_settings_roundtrip_cache_and_persist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("index.db");
+        let engine = Engine::open(&db, EngineOptions::default()).unwrap();
+
+        let mut next = engine.settings();
+        next.lang = "en".into();
+        next.shortcut = "Ctrl+Space".into();
+        engine.set_settings(&next).unwrap();
+
+        // The cache reflects the write immediately.
+        assert_eq!(engine.settings(), next);
+
+        // The store holds it too: a fresh open (whose cache is preheated
+        // from disk) reads the same values back.
+        drop(engine);
+        let reopened = Engine::open(&db, EngineOptions::default()).unwrap();
+        assert_eq!(reopened.settings(), next);
+    }
+
+    // ---------------- v1.1: volume usage overlay -------------------------
+
+    /// `match_volume` decides whether a pane root names a whole volume
+    /// (the only view level that gets the physical-capacity overlay).
+    /// Index paths and mount points spell the same volume differently
+    /// (`C` from the index root segment vs `C:\` from sysinfo) — trailing
+    /// separators are trimmed and comparison is ASCII case-insensitive.
+    #[test]
+    fn match_volume_normalizes_windows_paths() {
+        let volumes = vec![
+            crate::volumes::VolumeInfo {
+                path: "C:\\".into(),
+                label: "System".into(),
+                total_bytes: 500,
+                available_bytes: 100,
+            },
+            crate::volumes::VolumeInfo {
+                path: "D:\\".into(),
+                label: "Data".into(),
+                total_bytes: 900,
+                available_bytes: 300,
+            },
+        ];
+
+        let c = |root: &str| match_volume(root, &volumes).map(|v| v.path.clone());
+        assert_eq!(c("C:\\"), Some("C:\\".into()), "exact mount matches");
+        assert_eq!(c("c:\\"), Some("C:\\".into()), "case-insensitive");
+        assert_eq!(
+            c("C:"),
+            Some("C:\\".into()),
+            "the index root segment (root_segment keeps the colon) matches"
+        );
+        assert_eq!(c("D:\\"), Some("D:\\".into()));
+        assert_eq!(c("D:\\data"), None, "a subdirectory is not a volume");
+        assert_eq!(c(""), None, "the (all) root never matches");
+        assert_eq!(c("fixture"), None, "a custom scan root never matches");
+        assert_eq!(c("C"), None, "a bare folder name is not a volume");
+    }
+
+    /// `volume_overlay` arithmetic on a synthetic volume list: `used =
+    /// total - available`, `indexed` = the subtree total the hot index
+    /// reports for the root, and `unindexed` clamps at zero when the
+    /// indexed sum exceeds physical usage (sparse files / accounting
+    /// skew) — a negative block must never reach the chart.
+    #[test]
+    fn volume_overlay_clamps_unindexed() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_size_fixture(tmp.path());
+        let engine = size_fixture_engine(&tmp);
+        let indexed = engine
+            .size_tree_dirs("fixture", 0, 0)
+            .expect("fixture root resolves")
+            .size;
+        assert!(indexed > 0);
+
+        // A "volume" whose used space (total - available) is smaller than
+        // what the index adds up: unindexed must clamp to 0, not underflow.
+        let tiny = vec![crate::volumes::VolumeInfo {
+            path: "fixture".into(),
+            label: "Fake".into(),
+            total_bytes: 1000,
+            available_bytes: 1000,
+        }];
+        let o = engine
+            .volume_overlay_in("fixture", &tiny)
+            .expect("matching volume yields an overlay");
+        assert_eq!(o.used_bytes, 0);
+        assert_eq!(o.indexed_bytes, indexed);
+        assert_eq!(o.unindexed_bytes, 0, "saturating clamp at zero");
+
+        // A healthy margin: used > indexed leaves the unindexed remainder.
+        let big = vec![crate::volumes::VolumeInfo {
+            path: "fixture".into(),
+            label: "Fake".into(),
+            total_bytes: indexed + 20_000,
+            available_bytes: 5_000,
+        }];
+        let o = engine.volume_overlay_in("fixture", &big).unwrap();
+        assert_eq!(o.used_bytes, indexed + 15_000);
+        assert_eq!(o.unindexed_bytes, 15_000);
+
+        // No matching volume (a custom root): no overlay at all.
+        let volumes = vec![crate::volumes::VolumeInfo {
+            path: "C:\\".into(),
+            label: "System".into(),
+            total_bytes: 1,
+            available_bytes: 1,
+        }];
+        assert!(engine.volume_overlay_in("fixture", &volumes).is_none());
     }
 }

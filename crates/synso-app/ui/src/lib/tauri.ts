@@ -2,18 +2,18 @@
 // crates/synso-app/src/commands.rs).
 
 import { invoke } from "@tauri-apps/api/core";
+import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import type {
-  Collection,
   DedupState,
   DupeGroup,
   EngineStats,
-  MemberHit,
   ParsedQuery,
   QuickInfo,
   SearchResult,
   Settings,
   SizeNode,
   VolumeInfo,
+  VolumeOverlay,
 } from "./types";
 
 export function engineStats(): Promise<EngineStats> {
@@ -85,8 +85,7 @@ export function quickInfo(): Promise<QuickInfo> {
   return invoke("quick_info");
 }
 
-/** Shows + focuses the quick window with the query pre-filled (the
- * collections view's 「在快速搜索中查看」 hands over `coll:<name>`). The
+/** Shows + focuses the quick window with the query pre-filled. The
  * window receives the text via the `quick-query` event the Rust side
  * emits after showing — the same show path the dashboard button uses. */
 export function quickShowQuery(q: string): Promise<void> {
@@ -163,56 +162,24 @@ export function sizeTree(
   });
 }
 
+/** Physical-capacity overlay for a pane root naming exactly one volume
+ * (null at every other level) — see `Engine::volume_overlay`. Fetched
+ * alongside every tree load so the used/free figures track deletions. */
+export function volumeOverlay(root: string): Promise<VolumeOverlay | null> {
+  return invoke("volume_overlay", { root });
+}
+
+/** Writes `text` to the OS clipboard (the capacity map's copy-path
+ * button; the webview origin is not a secure context, so the raw
+ * navigator.clipboard is unavailable). */
+export function copyToClipboard(text: string): Promise<void> {
+  return writeText(text);
+}
+
 /** Reveals an INDEX path in the OS file manager (Explorer with the item
  * selected) — the path-based sibling of `revealPath`, since flame-chart
  * nodes carry paths rather than row ids. Errors (synthetic or unknown
  * paths) surface verbatim for the view to toast. */
 export function revealIndexPath(path: string): Promise<void> {
   return invoke("reveal_index_path", { path });
-}
-
-// ------------------ Task 18: collections ----------------------------------
-
-/** Creates a collection; a duplicate name rejects with the engine error. */
-export function collCreate(name: string): Promise<Collection> {
-  return invoke("coll_create", { name });
-}
-
-/** Renames a collection (unknown id / taken name reject verbatim). */
-export function collRename(id: number, name: string): Promise<void> {
-  return invoke("coll_rename", { id, name });
-}
-
-/** Deletes a collection and its member rows — never the files themselves. */
-export function collDelete(id: number): Promise<void> {
-  return invoke("coll_delete", { id });
-}
-
-/** Every collection, id-ordered (creation order). */
-export function collList(): Promise<Collection[]> {
-  return invoke("coll_list");
-}
-
-/** Adds file OR folder row ids to a collection (snapshotting name + size
- * as the later tombstone/rebind key). */
-export function collAdd(id: number, members: number[]): Promise<void> {
-  return invoke("coll_add", { id, members });
-}
-
-/** Removes one member row (alive or tombstoned) from a collection. */
-export function collRemove(id: number, member: number): Promise<void> {
-  return invoke("coll_remove", { id, member });
-}
-
-/** The collection's members, tombstoned ones included (dead members carry
- * a hit synthesized from the add-time snapshot: empty path, mtime 0). */
-export function collMembers(id: number): Promise<MemberHit[]> {
-  return invoke("coll_members", { id });
-}
-
-/** Resolves an INDEX path (Hit::path spelling, directories included) to
- * its files-row id — the bridge that lets the flame chart (whose nodes
- * carry paths, not ids) add its node to a collection. */
-export function fileIdOf(path: string): Promise<number> {
-  return invoke("file_id_of", { path });
 }

@@ -4,6 +4,7 @@
   "description": "Capability for the main dashboard window and the quick search window (core APIs only — opener and global-shortcut are driven from Rust, not the webview)",
   "windows": ["main", "quick"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "clipboard-manager:allow-write-text"
   ]
 }

@@ -14,13 +14,33 @@
 
   let {
     root,
-    onDrill,
+    onPin,
     onHover,
+    overlay = null,
   }: {
     root: SizeNode;
-    onDrill: (path: string) => void;
-    onReveal: (path: string) => void;
-    onAddToCollection: (path: string) => void;
+    /// Click PINS an arc (v1.1 user decision: no drill, no hover
+    /// dimming): the parent freezes the side lists on the clicked arc
+    /// (`key` is the index path, or the arc name for the synthetic
+    /// overlay arcs). Clicking is a toggle from the parent's side.
+    onPin: (key: string, info: {
+      chain: { name: string; size: number }[];
+      children: { name: string; size: number }[];
+    }) => void;
+    /// Physical-capacity overlay for a pane root that names exactly one
+    /// volume (null at every other level): two synthetic gray arcs —
+    /// 「未索引」 (used-but-unindexed bytes) and 「剩余空间」 — make the
+    /// root ring's proportions the drive's real ones, with the usage
+    /// figures in the center. All copy is pre-localized by FlameView;
+    /// this component stays i18n-free.
+    overlay?: {
+      unindexedBytes: number;
+      freeBytes: number;
+      freeLabel: string;
+      unindexedLabel: string;
+      centerTitle: string;
+      centerLine: string;
+    } | null;
     /// Hover reporting for the parent's side panels: the hovered block's
     /// root-first chain (right panel) and its subdirectories sorted by
     /// size desc (left panel). Null on leave. The chart's rendering
@@ -34,7 +54,9 @@
   interface SunDatum {
     name: string;
     value: number;
-    path: string;
+    /// Absent on the synthetic overlay arcs (未索引 / 剩余空间): they name
+    /// no directory, never drill, and hover as a chain of just themselves.
+    path?: string;
     fileCount: number;
     pctOfParent: number;
     // Root-first ancestor chain INCLUDING this node (extra field —
@@ -102,9 +124,19 @@
           width: el.clientWidth || 600,
           height: el.clientHeight || 400,
         });
+        // Click PINS the arc (v1.1: no drill) — same shape the hover tap
+        // emits, plus the stable key the parent toggles on. The
+        // synthetic overlay arcs pin by name (they carry no path).
         chart.on("click", (params) => {
           const datum = params.data as SunDatum | undefined;
-          if (datum && datum.path !== undefined) onDrill(datum.path);
+          if (!datum) return;
+          const children = [...(datum.children ?? [])].sort(
+            (a, b) => b.value - a.value,
+          );
+          onPin(datum.path ?? datum.name, {
+            chain: datum.chain,
+            children: children.map((c) => ({ name: c.name, size: c.value })),
+          });
         });
         // Hover tap for the side panels. Guarded by path: ECharts fires
         // mouseover per arc entry, and re-emitting the same arc on every
@@ -115,8 +147,14 @@
           const path = datum?.path;
           if (path === lastHoverPath) return;
           lastHoverPath = path ?? null;
-          if (!datum || path === undefined) {
+          if (!datum) {
             onHover?.(null);
+            return;
+          }
+          // The synthetic overlay arcs (未索引 / 剩余空间) carry no path:
+          // they hover as a chain of just themselves, no children.
+          if (path === undefined) {
+            onHover?.({ chain: datum.chain, children: [] });
             return;
           }
           // Children arrive engine-sorted (size desc); sort again so the
@@ -150,26 +188,83 @@
       for (const r of roots) {
         decorate(r, 0);
       }
+      // Volume overlay (never at the promoted (all) level): two gray
+      // sibling arcs make the root ring a partition of the DRIVE's real
+      // capacity — indexed content + 未索引 + 剩余空间 — and the center
+      // hole (widened for this) carries the usage figures.
+      const gray = isDark ? "#5f6368" : "#9aa0a6";
+      const grayStyle = {
+        color: gray,
+        borderColor: isDark ? "#1d2129" : "#ffffff",
+        borderWidth: 1,
+      };
+      const synth = (name: string, bytes: number): SunDatum => ({
+        name,
+        value: bytes,
+        fileCount: 0,
+        pctOfParent:
+          root.size + (overlay?.unindexedBytes ?? 0) +
+            (overlay?.freeBytes ?? 0) >
+          0
+            ? (bytes /
+                (root.size +
+                  (overlay?.unindexedBytes ?? 0) +
+                  (overlay?.freeBytes ?? 0))) *
+              100
+            : 0,
+        chain: [{ name, size: bytes }],
+        itemStyle: grayStyle,
+      });
+      let data: SunDatum[] = roots;
+      let radius: [string, string] = ["6%", "94%"];
+      let title: object | undefined;
+      if (overlay && !promote) {
+        const extra: SunDatum[] = [];
+        if (overlay.unindexedBytes > 0) {
+          extra.push(synth(overlay.unindexedLabel, overlay.unindexedBytes));
+        }
+        if (overlay.freeBytes > 0) {
+          extra.push(synth(overlay.freeLabel, overlay.freeBytes));
+        }
+        if (extra.length > 0) {
+          data = [...roots, ...extra];
+          radius = ["26%", "94%"];
+          title = {
+            text: overlay.centerTitle,
+            subtext: overlay.centerLine,
+            left: "center",
+            top: "center",
+            itemGap: 2,
+            textStyle: {
+              fontSize: 13,
+              fontWeight: 600,
+              color: isDark ? "#e8eaed" : "#333",
+            },
+            subtextStyle: {
+              fontSize: 11,
+              color: isDark ? "#9aa0a6" : "#5f6368",
+            },
+          };
+        }
+      }
       chart.setOption(
         {
           backgroundColor: "transparent",
+          ...(title ? { title } : {}),
           series: [
             {
               type: "sunburst",
               // No tooltip (hover-lag culprit #2): the side panels carry
               // richer info than the floating bubble did.
               tooltip: { show: false },
-              // Ancestor highlight on hover (user-kept effect): the
-              // hovered dir's whole lineage lights up, everything else
-              // dims. Costs a canvas repaint per arc crossing — the other
-              // hover-path optimizations (no tooltip, guarded panel
-              // updates) keep the total feel smooth.
-              emphasis: { focus: "ancestor" },
+              // No emphasis focus (v1.1 user decision): hovering must NOT
+              // dim everything else — the side panels are the feedback.
+              emphasis: { focus: "none" },
               // series.data is an ARRAY of roots — a bare object renders
               // as a single childless disc (the blank-cake bug).
-              data: roots,
-              radius: ["6%", "94%"],
-              nodeClick: false, // we drill via our own click handler
+              data,
+              radius,
+              nodeClick: false, // clicks are our own pin handler
               // No labels (user preference): on a radial map they rotate
               // with the arcs and read badly; the side panels carry names.
               label: { show: false },

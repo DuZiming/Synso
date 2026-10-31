@@ -20,6 +20,7 @@
 mod commands;
 mod events;
 mod logging;
+mod memlog;
 mod quick;
 mod state;
 mod tray;
@@ -48,6 +49,8 @@ pub fn run() {
         ))
         // Native dialogs (Task 19): the mid-scan quit confirmation.
         .plugin(tauri_plugin_dialog::init())
+        // Clipboard writes (capacity map's copy-path button).
+        .plugin(tauri_plugin_clipboard_manager::init())
         // Global shortcut for the quick window; registration itself
         // happens in `quick::init` from the user's settings spelling,
         // and live re-registration in `quick::set_shortcut`.
@@ -74,6 +77,11 @@ pub fn run() {
             }
             app.manage(app_state);
             events::spawn_forwarder(app.handle().clone(), engine_events);
+            // Memory sampler (v1.1 Task 6): one log line per minute,
+            // working set + commit next to engine stats.
+            memlog::spawn(std::sync::Arc::clone(
+                &app.state::<state::AppState>().engine,
+            ));
 
             // Quick window: placement, focus-loss hide, global shortcut
             // (reads settings, so after `app.manage`).
@@ -144,15 +152,8 @@ pub fn run() {
             commands::dedup_groups,
             commands::delete_to_trash,
             commands::size_tree,
+            commands::volume_overlay,
             commands::reveal_index_path,
-            commands::coll_create,
-            commands::coll_rename,
-            commands::coll_delete,
-            commands::coll_list,
-            commands::coll_add,
-            commands::coll_remove,
-            commands::coll_members,
-            commands::file_id_of,
             commands::pick_folder
         ])
         .run(tauri::generate_context!())

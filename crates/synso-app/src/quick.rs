@@ -226,8 +226,7 @@ pub fn hide(app: &AppHandle) {
 /// path), then one [`QUERY_EVENT`] `emit_to` the quick webview. The page
 /// is mounted from startup, so the listener applies the text whenever it
 /// lands; a failed emit (window gone) is logged, not fatal — the window
-/// still showed with its previous query. The collections view's 「在快速
-/// 搜索中查看」 button hands over `coll:<name>` through here.
+/// still showed with its previous query.
 pub fn show_with_query(app: &AppHandle, q: &str) {
     show(app);
     if let Err(err) = app.emit_to(LABEL, QUERY_EVENT, QuickQueryPayload { q: q.to_owned() }) {

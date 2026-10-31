@@ -314,6 +314,9 @@ fn build_tree_with_budget(
 /// remain, its materialized children. `name` comes from the caller — the
 /// resolver or the child entry — so it is read from `dir_row` exactly
 /// once per node.
+// Hot-path tree builders threading explicit per-level state; a params
+// struct would churn v1-accepted code for a lint threshold.
+#[allow(clippy::too_many_arguments)]
 fn dir_node(
     hot: &HotIndex,
     aggregates: &Aggregates,
@@ -368,6 +371,9 @@ fn file_node(hot: &HotIndex, slot: usize, path: String) -> SizeNode {
 /// runs out mid-list, the rest of the level — and the width overflow —
 /// merge into the same "(other)" terminal, so the partition invariant
 /// ("children sum to parent") survives budget exhaustion.
+// Hot-path tree builders threading explicit per-level state; a params
+// struct would churn v1-accepted code for a lint threshold.
+#[allow(clippy::too_many_arguments)]
 fn child_nodes(
     hot: &HotIndex,
     aggregates: &Aggregates,
@@ -467,6 +473,9 @@ fn child_nodes(
 
 /// Builds one kept child: a dir node recursing with `levels - 1`, or a
 /// file leaf.
+// Hot-path tree builders threading explicit per-level state; a params
+// struct would churn v1-accepted code for a lint threshold.
+#[allow(clippy::too_many_arguments)]
 fn child_node(
     hot: &HotIndex,
     aggregates: &Aggregates,
@@ -505,6 +514,33 @@ fn child_path(parent_path: &str, name: &str) -> String {
     } else {
         format!("{parent_path}{MAIN_SEPARATOR}{name}")
     }
+}
+
+/// Root-first dir names from the root segment down to `id`'s own name.
+/// Budget-guarded like the hot index's own walks so even a corrupt
+/// parent cycle terminates.
+fn dir_chain(hot: &HotIndex, id: FileId) -> Vec<&str> {
+    let mut chain: Vec<&str> = Vec::new();
+    let mut budget = hot.dir_tree_len() + 1;
+    let mut current = Some(id);
+    while let Some(cid) = current {
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        let Some((parent, name)) = hot.dir_row(cid) else {
+            break;
+        };
+        chain.push(name);
+        current = parent;
+    }
+    chain.reverse();
+    chain
+}
+
+/// Full index-relative path of an interned dir.
+fn dir_path(hot: &HotIndex, id: FileId) -> String {
+    dir_chain(hot, id).join(MAIN_SEPARATOR_STR)
 }
 
 #[cfg(test)]
@@ -552,31 +588,4 @@ mod tests {
         let (s, c) = subtree_sum(&tree);
         assert_eq!((tree.size, tree.file_count), (s, c));
     }
-}
-
-/// Root-first dir names from the root segment down to `id`'s own name.
-/// Budget-guarded like the hot index's own walks so even a corrupt
-/// parent cycle terminates.
-fn dir_chain(hot: &HotIndex, id: FileId) -> Vec<&str> {
-    let mut chain: Vec<&str> = Vec::new();
-    let mut budget = hot.dir_tree_len() + 1;
-    let mut current = Some(id);
-    while let Some(cid) = current {
-        if budget == 0 {
-            break;
-        }
-        budget -= 1;
-        let Some((parent, name)) = hot.dir_row(cid) else {
-            break;
-        };
-        chain.push(name);
-        current = parent;
-    }
-    chain.reverse();
-    chain
-}
-
-/// Full index-relative path of an interned dir.
-fn dir_path(hot: &HotIndex, id: FileId) -> String {
-    dir_chain(hot, id).join(MAIN_SEPARATOR_STR)
 }

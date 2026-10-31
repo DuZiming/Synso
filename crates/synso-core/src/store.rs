@@ -97,7 +97,7 @@ impl Store {
     /// `rec.py_init` hold the pinyin keys computed here from the name —
     /// the single choke point, so callers never pass pinyin in.
     pub fn upsert_file(&mut self, dir_path: &[&str], rec: &mut FileRecord) -> Result<()> {
-        upsert_file_on(&mut self.conn, self.scan_gen, dir_path, rec)
+        upsert_file_on(&self.conn, self.scan_gen, dir_path, rec)
     }
 
     /// Advances and returns the scan generation. The engine calls this
@@ -125,7 +125,7 @@ impl Store {
     pub fn sweep_stale(&mut self, generation: i64) -> Result<u64> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM files WHERE scan_gen < ?1", params![generation])?;
-        let files_deleted = tx.changes() as u64;
+        let files_deleted = tx.changes();
         tx.execute("DELETE FROM dirs WHERE scan_gen < ?1", params![generation])?;
         tx.commit()?;
         Ok(files_deleted)
@@ -357,14 +357,8 @@ impl Store {
         Ok(())
     }
 
-    /// Raw read access for sibling modules in this crate (the collections
-    /// layer runs its SQL through this). Keeps every statement in the crate
-    /// on the one connection `Store` owns.
-    pub(crate) fn conn(&self) -> &Connection {
-        &self.conn
-    }
-
-    /// `conn`, for statements that mutate (and `BEGIN`).
+    /// Raw mutable access for sibling modules in this crate. Keeps every
+    /// statement in the crate on the one connection `Store` owns.
     pub(crate) fn conn_mut(&mut self) -> &mut Connection {
         &mut self.conn
     }

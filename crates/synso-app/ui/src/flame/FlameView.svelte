@@ -9,23 +9,20 @@
   // unknown root renders 路径不存在 but keeps its breadcrumb so the user
   // can climb back out.
   //
-  // The synthetic "(other)" aggregate node is not drillable (it names no
-  // real directory — the engine would answer None): clicking it shows a
-  // toast instead of a missing-path pane. Reveal goes through
-  // `reveal_index_path`; failures surface in the same toast.
-  //
-  // Task 18: the context menu's 加入集合 resolves the node's path → row
-  // id (`file_id_of`, directories included) and opens the shared
-  // CollectionPicker; the NODE itself — dir or file, not its children —
-  // becomes the member. An unresolvable path (synthetic or vanished)
-  // toasts instead of opening an empty picker.
+  // Per-pane state machine: root changes come from the breadcrumb or the
+  // root-picker input; arcs no longer drill (v1.1 user decision) — a
+  // click PINS the arc's side lists instead.
   import { onMount } from "svelte";
   import { t } from "../i18n";
-  import { collAdd, fileIdOf, revealIndexPath, sizeTree } from "../lib/tauri";
+  import {
+    copyToClipboard,
+    listVolumes,
+    sizeTree,
+    volumeOverlay,
+  } from "../lib/tauri";
   import { listen } from "@tauri-apps/api/event";
-  import type { Collection, SizeNode } from "../lib/types";
+  import type { SizeNode, VolumeInfo, VolumeOverlay } from "../lib/types";
   import FlameChartSunburst from "./FlameChartSunburst.svelte";
-  import CollectionPicker from "../collections/CollectionPicker.svelte";
   import { humanBytes } from "../lib/format";
 
   /// One level of the hover path chain (name + size, root first).
@@ -44,7 +41,8 @@
   /// virtual root), `tree` the last successful fetch, `seq` a race guard
   /// so a slow response can never overwrite a newer request, `picker` the
   /// text input's draft, `hover` the hovered block's chain (right panel)
-  /// and subdirectories (left panel).
+  /// and subdirectories (left panel), `overlay` the physical-capacity
+  /// figures when this pane's root names a whole volume (null elsewhere).
   interface Pane {
     root: string;
     tree: SizeNode | null;
@@ -54,6 +52,18 @@
     seq: number;
     picker: string;
     hover: HoverInfo | null;
+    overlay: VolumeOverlay | null;
+    /// Fixed volumes with their totals, fetched when this pane sits at the
+    /// (all) root — the promoted volume arcs hover with their usage line.
+    volumes: VolumeInfo[];
+    /// Wall-clock of the last load that COMPLETED (success or error —
+    /// either way the refresh FIRED; a stuck timestamp means no trigger).
+    /// Displayed beside the breadcrumb so a stale map is diagnosable at
+    /// a glance: time moved + map identical = refreshed-but-unchanged
+    /// data; time frozen = the fs-changed trigger never landed.
+    updatedAt: number | null;
+    /// The click-pinned arc (see [`togglePin`]); null = follow the hover.
+    pinned: { key: string; info: HoverInfo } | null;
   }
 
   function newPane(root: string): Pane {
@@ -66,7 +76,17 @@
       seq: 0,
       picker: root,
       hover: null,
+      overlay: null,
+      volumes: [],
+      updatedAt: null,
+      pinned: null,
     };
+  }
+
+  /// HH:MM:SS for the refresh-time chip.
+  function clockOf(ts: number | null): string {
+    if (ts === null) return "--:--:--";
+    return new Date(ts).toLocaleTimeString([], { hour12: false });
   }
 
   const MAX_CHILDREN = 40;
@@ -96,9 +116,6 @@
   let panes = $state<Pane[]>([newPane("")]);
   let toast = $state<string | null>(null);
   let toastTimer: ReturnType<typeof setTimeout> | undefined;
-  /// The pending add-to-collection: the resolved member ids awaiting a
-  /// collection choice (null = picker closed).
-  let pickerIds = $state<number[] | null>(null);
 
   const visiblePanes = $derived(compare ? panes : panes.slice(0, 1));
 
@@ -106,9 +123,23 @@
     const seq = ++pane.seq;
     pane.loading = true;
     pane.error = null;
+    // The overlay rides along on every load (including fs-changed
+    // refreshes) so the used/free figures track deletions; a failure
+    // degrades to no overlay, never a failed pane. At the (all) root the
+    // overlay is null by design — instead the volume list feeds the
+    // promoted arcs' hover usage line (spec: (all) 不加块,悬停补文案).
+    const overlayFetch = volumeOverlay(pane.root).catch(() => null);
+    const volumesFetch =
+      pane.root === ""
+        ? listVolumes().catch(() => [] as VolumeInfo[])
+        : Promise.resolve([] as VolumeInfo[]);
     try {
       const tree = await sizeTree(pane.root, depth, MAX_CHILDREN, false);
+      const overlay = await overlayFetch;
+      const volumes = await volumesFetch;
       if (seq !== pane.seq) return; // a newer request superseded this one
+      pane.overlay = overlay;
+      pane.volumes = volumes;
       if (tree) {
         pane.tree = tree;
         pane.missing = false;
@@ -116,13 +147,34 @@
         pane.tree = null;
         pane.missing = true;
       }
+      pane.updatedAt = Date.now();
     } catch (err) {
       if (seq !== pane.seq) return;
       pane.tree = null;
       pane.error = String(err);
+      pane.updatedAt = Date.now();
     } finally {
       if (seq === pane.seq) pane.loading = false;
     }
+  }
+
+  /// At the (all) root with a hovered/pinned promoted arc: the volume
+  /// that arc names, if any (the arc's own name is the scan-root segment,
+  /// e.g. `C:` — matched against mounts trailing-separator-trimmed and
+  /// case-insensitively, mirroring the engine's `match_volume`).
+  function hoveredVolume(pane: Pane): VolumeInfo | null {
+    if (pane.root !== "") return null;
+    const info = listInfo(pane);
+    if (!info) return null;
+    const name = info.chain[0]?.name;
+    if (!name) return null;
+    const key = name.trimEnd().toLowerCase();
+    const key2 = key.replace(/[/\\]+$/, "");
+    return (
+      pane.volumes.find(
+        (v) => v.path.trimEnd().toLowerCase().replace(/[/\\]+$/, "") === key2,
+      ) ?? null
+    );
   }
 
   /// Root change from any source (breadcrumb, picker, drill). The engine
@@ -130,61 +182,43 @@
   function jump(pane: Pane, path: string): void {
     pane.root = path.trim();
     pane.picker = pane.root;
+    pane.pinned = null; // the pinned arc belonged to the old view
     void load(pane);
   }
 
-  function findNode(tree: SizeNode, path: string): SizeNode | null {
-    if (tree.path === path) return tree;
-    for (const child of tree.children) {
-      const found = findNode(child, path);
-      if (found) return found;
-    }
-    return null;
+  /// Click PINS an arc (v1.1 user request: no drill, no hover dimming —
+  /// click freezes the side lists on that arc). Clicking the pinned arc
+  /// again unpins; clicking any other arc re-pins. Hover still drives
+  /// the lists while nothing is pinned.
+  function togglePin(pane: Pane, key: string, info: HoverInfo): void {
+    pane.pinned = pane.pinned?.key === key ? null : { key, info };
   }
 
-  function drill(pane: Pane, path: string): void {
-    // The engine's own tree tells us whether this path is the synthetic
-    // aggregate (a real dir could legitimately carry the name).
-    if (pane.tree && findNode(pane.tree, path)?.name === "(other)") {
-      showToast($t("flame.aggregateNoDrill"));
-      return;
-    }
-    jump(pane, path);
+  /// The pinned arc's full index path — the chain's names root-first,
+  /// joined with the separator (for volume scan roots this IS the disk
+  /// path, e.g. `C:\Users\admin`).
+  function pinnedPath(pane: Pane): string | null {
+    const info = pane.pinned?.info;
+    if (!info || info.chain.length === 0) return null;
+    return info.chain.map((l) => l.name).join("\\");
   }
 
-  async function reveal(path: string): Promise<void> {
+  /// Copies the pinned path; feedback through the toast.
+  async function copyPinnedPath(pane: Pane): Promise<void> {
+    const path = pinnedPath(pane);
+    if (!path) return;
     try {
-      await revealIndexPath(path);
+      await copyToClipboard(path);
+      showToast($t("flame.copied"));
     } catch (err) {
       showToast(String(err));
     }
   }
 
-  /// Task 18 context-menu path: resolve the node's path to its files-row
-  /// id (the node ITSELF joins — dir or file), then open the picker. The
-  /// resolution error toasts verbatim (synthetic or vanished paths).
-  async function addToCollection(path: string): Promise<void> {
-    try {
-      const id = await fileIdOf(path);
-      pickerIds = [id];
-    } catch (err) {
-      showToast(String(err));
-    }
-  }
-
-  async function onPickColl(coll: Collection): Promise<void> {
-    const ids = pickerIds;
-    if (!ids || ids.length === 0) return;
-    try {
-      await collAdd(coll.id, ids);
-      pickerIds = null;
-      showToast(
-        $t("collections.added").replace("{name}", coll.name),
-      );
-    } catch (err) {
-      showToast(String(err));
-      pickerIds = null;
-    }
+  /// What the side lists show: the pinned arc when one is pinned, the
+  /// live hover otherwise.
+  function listInfo(pane: Pane): HoverInfo | null {
+    return pane.pinned?.info ?? pane.hover;
   }
 
   function refresh(): void {
@@ -307,44 +341,108 @@
             if (event.key === "Enter") jump(pane, pane.picker);
           }}
         />
+        {#if pane.overlay}
+          <span class="usage-line">
+            {$t("flame.used")} {humanBytes(pane.overlay.used_bytes)} /
+            {$t("flame.total")} {humanBytes(pane.overlay.total_bytes)}
+          </span>
+        {/if}
+        <span class="usage-line" title={$t("flame.updatedAtHint")}>
+          {$t("flame.updatedAt")} {clockOf(pane.updatedAt)}
+        </span>
 
         {#if pane.tree}
           <div class="pane-body">
             <aside class="side-panel" aria-label={$t("flame.pathPanel")}>
-              {#if pane.hover && pane.hover.chain.length > 0}
-                <h3>{$t("flame.pathPanel")}</h3>
-                <!-- Hovered first, then each parent up to the root. -->
+              {#if listInfo(pane) && listInfo(pane)!.chain.length > 0}
+                <h3>
+                  {$t("flame.pathPanel")}
+                  {#if pane.pinned}
+                    <span class="pin-chip" title={$t("flame.pinnedHint")}>
+                      📌 {$t("flame.pinned")}
+                    </span>
+                  {/if}
+                </h3>
+                {#if pane.pinned && pinnedPath(pane)}
+                  <!-- The pinned arc's full path with a one-click copy. -->
+                  <div class="fullpath-row">
+                    <code class="fullpath" title={pinnedPath(pane)!}>
+                      {pinnedPath(pane)}
+                    </code>
+                    <button
+                      class="ghost copy-btn"
+                      aria-label={$t("flame.copyPath")}
+                      title={$t("flame.copyPath")}
+                      onclick={() => void copyPinnedPath(pane)}
+                    >
+                      <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+                        <rect x="5" y="1" width="9" height="11" rx="1.5"
+                          fill="none" stroke="currentColor" stroke-width="1.4" />
+                        <path d="M11 13.5v1a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1h1"
+                          fill="none" stroke="currentColor" stroke-width="1.4" />
+                      </svg>
+                    </button>
+                  </div>
+                {/if}
+                <!-- Pinned/hovered first, then each parent up to the root. -->
                 <ol>
-                  {#each [...pane.hover.chain].reverse() as level, i (i)}
+                  {#each [...listInfo(pane)!.chain].reverse() as level, i (i)}
                     <li class:current={i === 0}>
                       <span class="lvl-name" title={level.name}>{level.name}</span>
                       <span class="lvl-size">{humanBytes(level.size)}</span>
                     </li>
                   {/each}
                 </ol>
+                {#if hoveredVolume(pane)}
+                  <p class="usage-line">
+                    {$t("flame.used")}
+                    {humanBytes(
+                      hoveredVolume(pane)!.total_bytes -
+                        hoveredVolume(pane)!.available_bytes,
+                    )}
+                    /
+                    {$t("flame.total")}
+                    {humanBytes(hoveredVolume(pane)!.total_bytes)}
+                  </p>
+                {/if}
               {:else}
                 <p class="path-hint">{$t("flame.pathHint")}</p>
               {/if}
             </aside>
             <FlameChartSunburst
               root={pane.tree}
-              onDrill={(path) => drill(pane, path)}
-              onReveal={(path) => void reveal(path)}
-              onAddToCollection={(path) => void addToCollection(path)}
+              overlay={pane.overlay
+                ? {
+                    unindexedBytes: pane.overlay.unindexed_bytes,
+                    freeBytes: pane.overlay.available_bytes,
+                    freeLabel: $t("flame.freeSpace"),
+                    unindexedLabel: $t("flame.unindexed"),
+                    centerTitle: list.length
+                      ? list[list.length - 1].name
+                      : pane.root,
+                    // Center copy stays bare numbers (the 已用/共 words
+                    // live in the header usage line) — the widened hole
+                    // is still too narrow for the full sentence.
+                    centerLine: `${humanBytes(pane.overlay.used_bytes)} / ${humanBytes(
+                      pane.overlay.total_bytes,
+                    )}`,
+                  }
+                : null}
+              onPin={(key, info) => togglePin(pane, key, info)}
               onHover={(info) => (pane.hover = info)}
             />
             <aside class="side-panel" aria-label={$t("flame.childrenPanel")}>
-              {#if pane.hover && pane.hover.children.length > 0}
+              {#if listInfo(pane) && listInfo(pane)!.children.length > 0}
                 <h3>{$t("flame.childrenPanel")}</h3>
                 <ol>
-                  {#each pane.hover.children as child (child.name)}
+                  {#each listInfo(pane)!.children as child (child.name)}
                     <li>
                       <span class="lvl-name" title={child.name}>{child.name}</span>
                       <span class="lvl-size">{humanBytes(child.size)}</span>
                     </li>
                   {/each}
                 </ol>
-              {:else if pane.hover}
+              {:else if listInfo(pane)}
                 <p class="path-hint">{$t("flame.childrenEmpty")}</p>
               {:else}
                 <p class="path-hint">{$t("flame.childrenHint")}</p>
@@ -373,13 +471,6 @@
     </div>
   {/if}
 </section>
-
-{#if pickerIds}
-  <CollectionPicker
-    onpick={(coll) => void onPickColl(coll)}
-    onclose={() => (pickerIds = null)}
-  />
-{/if}
 
 <style>
   .flame {
@@ -566,6 +657,52 @@
     border-radius: 8px;
     padding: 7px 12px;
     width: 100%;
+  }
+
+  .usage-line {
+    font-size: 12px;
+    color: var(--text-muted, var(--text));
+    opacity: 0.75;
+    white-space: nowrap;
+  }
+
+  .pin-chip {
+    font-size: 11px;
+    font-weight: 500;
+    margin-left: 8px;
+    padding: 1px 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    color: var(--text-muted, var(--text));
+  }
+
+  .fullpath-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 4px 0 8px;
+  }
+
+  .fullpath {
+    flex: 1;
+    min-width: 0;
+    font-size: 11px;
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg, transparent);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl; /* long paths show their TAIL (the leaf) */
+    text-align: left;
+  }
+
+  .copy-btn {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    padding: 4px 7px;
   }
 
   .pane-state {

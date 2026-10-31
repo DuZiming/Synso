@@ -33,9 +33,8 @@
 //!   (`synso-perf-fixture-100k`, marker file next to it) and is reused
 //!   across runs; delete both to force regeneration.
 //! - The scan itself is timed engine-side, from `start_full_scan` to
-//!   `ScanFinished` — purge, walk, store writes, hot-index reload and the
-//!   collections reconcile included, exactly the work a real first scan
-//!   does.
+//!   `ScanFinished` — purge, walk, store writes and the hot-index reload
+//!   included, exactly the work a real first scan does.
 
 use std::fs;
 use std::hint::black_box;

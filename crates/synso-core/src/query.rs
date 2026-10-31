@@ -11,7 +11,7 @@
 //! words must ALL match (AND); the slot's class is its best word's class.
 //!
 //! Modifiers (Task 7): [`parse_query`] splits the raw string into
-//! whitespace tokens; `ext:` / `size:` / `path:` / `coll:` tokens become
+//! whitespace tokens; `ext:` / `size:` / `path:` tokens become
 //! dimension filters on [`crate::model::ParsedQuery`], a bad value
 //! (`size:abc`) falls back verbatim into the free text. Filters run as
 //! fast predicates BEFORE ranking and classification (the private
@@ -42,7 +42,7 @@ const RECENCY_WINDOW_SECS: i64 = 30 * 86_400;
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Hit {
-    /// The `files` row id (what reveal/trash/collections key on later).
+    /// The `files` row id (what reveal/trash key on later).
     pub id: FileId,
     /// Full path rebuilt from the interned dir tree — root segment, ...,
     /// parent dirs, name — in the ORIGINAL spelling, joined with
@@ -81,7 +81,7 @@ enum MatchClass {
 }
 
 /// Parses a raw query string into free text plus dimension filters (the
-/// Everything-style `ext:` / `size:` / `path:` / `coll:` modifiers — see
+/// Everything-style `ext:` / `size:` / `path:` modifiers — see
 /// [`ParsedQuery`]). Pure: no I/O, no engine. A modifier token with a BAD
 /// value (`size:abc`, a lone `ext:`) is not an error — the whole token
 /// falls back verbatim into the free text, so the query degrades to a
@@ -94,7 +94,6 @@ pub fn parse_query(s: &str) -> ParsedQuery {
             // Repeated ext:/path: tokens win with their last occurrence.
             Some(Modifier::Ext(ext)) => parsed.ext = Some(ext),
             Some(Modifier::Path(path)) => parsed.path_prefix = Some(path),
-            Some(Modifier::Coll(name)) => parsed.collections.push(name),
             // Repeated size: tokens combine into the tightest bounds.
             Some(Modifier::Size(min, max)) => {
                 parsed.min_size = tighten_bound(parsed.min_size, min, u64::max);
@@ -116,7 +115,6 @@ enum Modifier {
     Ext(String),
     Size(Option<u64>, Option<u64>),
     Path(String),
-    Coll(String),
 }
 
 /// Parses one whitespace-free token into a modifier. `None` when the token
@@ -127,11 +125,11 @@ fn parse_modifier(token: &str) -> Option<Modifier> {
     match keyword.to_ascii_lowercase().as_str() {
         "ext" => valid_ext(value).map(Modifier::Ext),
         "size" => parse_size(value).map(|(min, max)| Modifier::Size(min, max)),
-        // Any non-empty string is a usable path substring / collection
-        // name; the value is kept as typed (matching lowercases / the
-        // store compares exactly).
+        // Any non-empty string is a usable path substring; the value is
+        // kept as typed (matching lowercases). `coll:` is no longer a
+        // keyword (v1.1 removed collections) — such tokens fall through
+        // to free text via `_ => None`.
         "path" => (!value.is_empty()).then(|| Modifier::Path(value.to_string())),
-        "coll" => (!value.is_empty()).then(|| Modifier::Coll(value.to_string())),
         _ => None,
     }
 }
@@ -253,18 +251,16 @@ fn tighten_bound(
 /// while loading, and a cold index holds no data anyway.
 #[cfg(test)]
 pub(crate) fn run(hot: &HotIndex, text: &str, offset: u32, limit: u32, now: i64) -> SearchResult {
-    run_parsed(hot, &parse_query(text), None, offset, limit, now)
+    run_parsed(hot, &parse_query(text), offset, limit, now)
 }
 
-/// [`run`], over an already-parsed query plus the resolved `coll:` filter
-/// (`None` = no collection constraint; the engine resolves names to this
-/// membership set). [`crate::engine::Engine::search_parsed`] is the public
-/// wrapper. The parsed dimension filters run as fast predicates BEFORE
-/// ranking and classification; ranking itself is unchanged.
+/// [`run`], over an already-parsed query. [`crate::engine::Engine::search_parsed`]
+/// is the public wrapper. The parsed dimension filters run as fast
+/// predicates BEFORE ranking and classification; ranking itself is
+/// unchanged.
 pub(crate) fn run_parsed(
     hot: &HotIndex,
     q: &ParsedQuery,
-    coll_members: Option<&HashSet<FileId>>,
     offset: u32,
     limit: u32,
     now: i64,
@@ -290,19 +286,9 @@ pub(crate) fn run_parsed(
     // EVERY free-text word to hit the name or a pinyin key (AND).
     let words: Vec<String> = q.text.split_whitespace().map(str::to_lowercase).collect();
     let (total, ranked) = if words.is_empty() {
-        recent_slots(hot, q, ext_id, coll_members, &path_filter, offset, limit)
+        recent_slots(hot, q, ext_id, &path_filter, offset, limit)
     } else {
-        match_slots(
-            hot,
-            q,
-            ext_id,
-            coll_members,
-            &path_filter,
-            &words,
-            now,
-            offset,
-            limit,
-        )
+        match_slots(hot, q, ext_id, &path_filter, &words, now, offset, limit)
     };
     SearchResult {
         total,
@@ -355,8 +341,8 @@ impl PathFilter {
 }
 
 /// The fast-reject chain both ranking modes run per slot BEFORE any
-/// ranking or classification: ext id and size are integer compares,
-/// collection membership one hash lookup. The `path:` filter is the one
+/// ranking or classification: ext id and size are integer compares.
+/// The `path:` filter is the one
 /// expensive predicate, so it runs LAST and only for slots that survived
 /// the cheap ones — and even then it materializes a slot path only when
 /// the needle itself contains a separator (the boundary-crossing shapes
@@ -373,7 +359,6 @@ fn passes_filters(
     hot: &HotIndex,
     q: &ParsedQuery,
     ext_id: Option<i64>,
-    coll_members: Option<&HashSet<FileId>>,
     path_filter: &PathFilter,
     slot: usize,
 ) -> bool {
@@ -389,11 +374,6 @@ fn passes_filters(
     }
     if let Some(max) = q.max_size {
         if hot.size(slot) > max {
-            return false;
-        }
-    }
-    if let Some(members) = coll_members {
-        if !members.contains(&hot.file_id(slot)) {
             return false;
         }
     }
@@ -581,7 +561,6 @@ fn match_slots(
     hot: &HotIndex,
     q: &ParsedQuery,
     ext_id: Option<i64>,
-    coll_members: Option<&HashSet<FileId>>,
     path_filter: &PathFilter,
     words: &[String],
     now: i64,
@@ -599,7 +578,7 @@ fn match_slots(
     // ancestor walk once.
     let mut path_lens: HashMap<FileId, u64> = HashMap::new();
     for slot in 0..hot.slot_count() {
-        if !passes_filters(hot, q, ext_id, coll_members, path_filter, slot) {
+        if !passes_filters(hot, q, ext_id, path_filter, slot) {
             continue;
         }
         let Some(class) = classify_words(hot, slot, &prepared) else {
@@ -701,7 +680,6 @@ fn recent_slots(
     hot: &HotIndex,
     q: &ParsedQuery,
     ext_id: Option<i64>,
-    coll_members: Option<&HashSet<FileId>>,
     path_filter: &PathFilter,
     offset: u32,
     limit: u32,
@@ -711,7 +689,7 @@ fn recent_slots(
     let mut top: Vec<Recent> = Vec::new();
     let mut path_lens: HashMap<FileId, u64> = HashMap::new();
     for slot in 0..hot.slot_count() {
-        if !passes_filters(hot, q, ext_id, coll_members, path_filter, slot) {
+        if !passes_filters(hot, q, ext_id, path_filter, slot) {
             continue;
         }
         total += 1;
@@ -1168,23 +1146,15 @@ mod tests {
         (q.min_size, q.max_size)
     }
 
-    /// The files row id of the unique hit named `name`.
-    fn hit_id(engine: &Engine, name: &str) -> FileId {
-        let res = engine.search(name, 0, 50);
-        assert_eq!(res.total, 1, "exactly one hit named {name}");
-        res.hits[0].id
-    }
-
     #[test]
     fn parse_modifiers_basic() {
-        let q = parse_query("报告 ext:docx size:>1mb path:docs coll:工作");
+        let q = parse_query("报告 ext:docx size:>1mb path:docs");
         assert_eq!(q.text, "报告", "only the free-text token remains");
         assert_eq!(q.ext.as_deref(), Some("docx"));
         // `>` is strict: the stored INCLUSIVE lower bound is 1 MiB + 1.
         assert_eq!(q.min_size, Some(1024 * 1024 + 1));
         assert_eq!(q.max_size, None);
         assert_eq!(q.path_prefix.as_deref(), Some("docs"));
-        assert_eq!(q.collections, vec!["工作".to_string()]);
     }
 
     #[test]
@@ -1220,18 +1190,33 @@ mod tests {
         let q = parse_query("ext:pdf ext:docx path:a path:b");
         assert_eq!(q.ext.as_deref(), Some("docx"));
         assert_eq!(q.path_prefix.as_deref(), Some("b"));
-        // coll: accumulates (repeats included; execution intersects anyway).
-        let q = parse_query("coll:a coll:b coll:a");
-        assert_eq!(
-            q.collections,
-            vec!["a".to_string(), "b".to_string(), "a".to_string()]
-        );
         // size: every token tightens the combined bounds.
         let kb = 1024u64;
         let gb = kb * kb * kb;
         let q = parse_query("size:>1kb size:<1gb size:>1mb");
         assert_eq!(q.min_size, Some(kb * kb + 1), "the larger lower bound wins");
         assert_eq!(q.max_size, Some(gb - 1), "the smaller upper bound wins");
+    }
+
+    #[test]
+    fn parse_coll_falls_back_to_literal() {
+        // v1.1: collections are gone, so `coll:` is no longer a modifier
+        // keyword — the token must degrade to free text verbatim (same
+        // discipline as `size:abc`), never panic, and still match files
+        // whose names literally contain the string.
+        let q = parse_query("coll:工作");
+        assert_eq!(q.text, "coll:工作");
+        assert_eq!(q.ext, None);
+        assert_eq!(q.path_prefix, None);
+        assert_eq!((q.min_size, q.max_size), (None, None));
+
+        // Free-text search over a file literally carrying the string in
+        // its name finds it (substring, case-insensitive).
+        let hot = HotIndex::synthetic(1);
+        let r = crate::search_index(&hot, "coll:工作", 0, 10);
+        // synthetic(1) names nothing like it — the query parses and runs
+        // without panicking, returning a plain (here empty) page.
+        assert_eq!(r.total, 0);
     }
 
     #[test]
@@ -1352,56 +1337,6 @@ mod tests {
         assert_eq!(engine.search("annual ext:zzz", 0, 10).total, 0);
         // Filters alone (empty free text) constrain the recent listing.
         assert_eq!(engine.search("ext:txt", 0, 10).total, 1);
-    }
-
-    #[test]
-    fn search_filter_collection() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("index.db");
-        let root = tmp.path().join("fixture");
-        fs::create_dir_all(root.join("docs")).unwrap();
-        fs::create_dir_all(root.join("other")).unwrap();
-        fs::write(root.join("docs").join("alpha.docx"), b"a").unwrap();
-        fs::write(root.join("docs").join("beta.docx"), b"b").unwrap();
-        fs::write(root.join("other").join("gamma.pdf"), b"g").unwrap();
-
-        let engine = open_engine(&db_path, &root);
-        let rx = engine.subscribe();
-        engine.start_full_scan();
-        wait_scan_finished(&rx);
-
-        let alpha = hit_id(&engine, "alpha.docx");
-        let beta = hit_id(&engine, "beta.docx");
-        let gamma = hit_id(&engine, "gamma.pdf");
-        let work = engine.coll_create("工作").unwrap();
-        let backup = engine.coll_create("backup").unwrap();
-        engine.coll_create("void").unwrap(); // stays empty
-        engine.coll_add(work.id, &[alpha, gamma]).unwrap();
-        engine.coll_add(backup.id, &[alpha, beta]).unwrap();
-
-        // coll: alone (empty free text) lists the collection's alive members.
-        let res = engine.search("coll:工作", 0, 10);
-        let mut listed: Vec<&str> = names(&res);
-        listed.sort_unstable();
-        assert_eq!((res.total, listed), (2, vec!["alpha.docx", "gamma.pdf"]));
-
-        // Repeated coll: names intersect membership.
-        assert_eq!(engine.search("coll:工作 coll:backup", 0, 10).total, 1);
-        // The collection filter combines with ext: and free text.
-        assert_eq!(engine.search("ext:docx coll:backup", 0, 10).total, 2);
-        assert_eq!(engine.search("beta coll:backup", 0, 10).total, 1);
-        assert_eq!(engine.search("gamma coll:backup", 0, 10).total, 0);
-        // An empty collection intersects anything to nothing.
-        assert_eq!(engine.search("coll:工作 coll:void", 0, 10).total, 0);
-        // An unknown name filters to no results, not an error.
-        let unknown = engine.search("coll:不存在的", 0, 10);
-        assert_eq!((unknown.total, unknown.hits.len()), (0, 0));
-        // A lone coll: falls back to literal text and matches no name here.
-        assert_eq!(engine.search("coll:", 0, 10).total, 0);
-
-        // Membership must be ALIVE: removing gamma drops it from coll:工作.
-        engine.coll_remove(work.id, gamma).unwrap();
-        assert_eq!(engine.search("coll:工作", 0, 10).total, 1);
     }
 
     #[test]

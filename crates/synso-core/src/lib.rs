@@ -1,6 +1,6 @@
 //! synso-core: the Synso file-indexing engine as one embeddable facade —
 //! SQLite store, scanner, in-memory hot index, query execution, watcher,
-//! dedup, collections, trash and directory-size aggregation, glued behind
+//! dedup, trash and directory-size aggregation, glued behind
 //! a single entry point.
 //!
 //! The crate stays UI-free and dependency-light (never depend on tauri) so
@@ -17,14 +17,13 @@
 //!   fixture constructor) and [`search_index`], the standalone query
 //!   pipeline over it
 //! - Feature data: [`SizeNode`], [`DedupPhase`], [`DedupState`],
-//!   [`DupeGroup`], [`Collection`], [`MemberHit`], [`FileId`],
-//!   [`VolumeInfo`], [`pinyin_keys`]
+//!   [`DupeGroup`], [`FileId`], [`VolumeInfo`], [`pinyin_keys`]
 //! - Errors: [`SynsoError`], [`Result`]
 //!
 //! With the optional `serde` feature enabled, the facade DATA types
 //! (`Hit`, `SearchResult`, `ParsedQuery`, `SizeNode`, `DedupPhase`,
-//! `DedupState`, `DupeGroup`, `Collection`, `MemberHit`, `EngineStats`,
-//! `EngineEvent`, `VolumeInfo`, `Settings`) derive `Serialize` /
+//! `DedupState`, `DupeGroup`, `EngineStats`,
+//! `EngineEvent`, `VolumeInfo`, `VolumeOverlay`, `Settings`) derive `Serialize` /
 //! `Deserialize` — the app layer and JSON bridges turn that on; core
 //! itself stays dependency-lean without it.
 //!
@@ -66,7 +65,6 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-pub(crate) mod collections;
 pub(crate) mod dedup;
 pub(crate) mod engine;
 pub(crate) mod hotindex;
@@ -82,9 +80,8 @@ pub(crate) mod volumes;
 pub(crate) mod watcher;
 
 // The public facade: the ONLY surface embedders program against.
-pub use collections::{Collection, MemberHit};
 pub use dedup::{DedupState, DupeGroup};
-pub use engine::{DedupPhase, Engine, EngineEvent, EngineOptions, EngineStats};
+pub use engine::{DedupPhase, Engine, EngineEvent, EngineOptions, EngineStats, VolumeOverlay};
 pub use hotindex::HotIndex;
 pub use model::{FileId, ParsedQuery};
 pub use pinyin::pinyin_keys;
@@ -99,13 +96,13 @@ pub use volumes::VolumeInfo;
 
 /// Runs [`parse_query`] plus the full query pipeline over a STANDALONE hot
 /// index — the same path [`Engine::search`] executes (parse, dimension
-/// filters, rank, page), minus only the store-side `coll:` resolution and
-/// the engine's RwLock snapshot. Exposed for embedders that hold a hot
-/// index directly and for the Task 20 perf harness (`benches/search.rs`,
-/// `tests/perf.rs`), which times this over [`HotIndex::synthetic`].
+/// filters, rank, page), minus only the engine's RwLock snapshot. Exposed
+/// for embedders that hold a hot index directly and for the Task 20 perf
+/// harness (`benches/search.rs`, `tests/perf.rs`), which times this over
+/// [`HotIndex::synthetic`].
 pub fn search_index(hot: &HotIndex, text: &str, offset: u32, limit: u32) -> SearchResult {
     let parsed = parse_query(text);
-    query::run_parsed(hot, &parsed, None, offset, limit, engine::unix_now())
+    query::run_parsed(hot, &parsed, offset, limit, engine::unix_now())
 }
 
 /// Error type for all synso-core operations.
@@ -120,8 +117,7 @@ pub enum SynsoError {
     /// Target row does not exist.
     #[error("not found")]
     NotFound,
-    /// Requested state conflicts with what already exists (e.g. a
-    /// collection name is already taken).
+    /// Requested state conflicts with what already exists.
     #[error("conflict: {0}")]
     Conflict(String),
     /// Malformed input from the caller (e.g. a path-segment resolution

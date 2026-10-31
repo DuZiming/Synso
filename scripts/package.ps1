@@ -66,10 +66,10 @@ if ($nsisExes.Count -eq 0) {
 Write-Host ''
 Write-Host 'Package OK. Artifacts:' -ForegroundColor Green
 if (Test-Path $exe) {
-    $size = '{0:N1} MiB' -f ((Get-Item $exe).Length / 1MiB)
+    $size = '{0:N1} MiB' -f ((Get-Item $exe).Length / 1MB)
     Write-Host "  app exe     : $exe ($size)"
 }
 foreach ($bundle in $nsisExes) {
-    $size = '{0:N1} MiB' -f ($bundle.Length / 1MiB)
+    $size = '{0:N1} MiB' -f ($bundle.Length / 1MB)
     Write-Host "  NSIS bundle : $($bundle.FullName) ($size)"
 }
