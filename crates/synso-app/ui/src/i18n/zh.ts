@@ -138,6 +138,11 @@ const zh: Dict = {
     total: "共",
     unindexed: "未索引",
     freeSpace: "剩余空间",
+    updatedAt: "更新于",
+    updatedAtHint:
+      "每次刷新完成都会更新这个时间。改了磁盘后时间不动 = 刷新没触发；时间变了但图没变 = 刷新成功、数据确实没变（如删除进了回收站）。",
+    pinned: "已固定",
+    pinnedHint: "已点击固定这个块；再点一次取消固定，悬停恢复实时跟随。",
   },
   settings: {
     langTitle: "语言",

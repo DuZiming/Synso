@@ -146,6 +146,12 @@ const en = {
     total: "Total",
     unindexed: "Unindexed",
     freeSpace: "Free space",
+    updatedAt: "Updated at",
+    updatedAtHint:
+      "This time advances on every completed refresh. After a disk edit: time frozen = refresh never triggered; time moved but the map identical = refresh worked, the data really is unchanged (e.g. the deletion went to the recycle bin).",
+    pinned: "Pinned",
+    pinnedHint:
+      "This block is click-pinned; click it again to unpin and let hover take over.",
   },
   settings: {
     langTitle: "Language",

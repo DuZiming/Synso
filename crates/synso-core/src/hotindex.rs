@@ -179,6 +179,40 @@ fn synthetic_record(
     }
 }
 
+/// [`HotIndex::mem_breakdown`]'s payload: the estimated live bytes each
+/// component of the hot index accounts for (see that method for what the
+/// estimates deliberately exclude).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemBreakdown {
+    /// File slots (rows in the parallel columns).
+    pub slots: u64,
+    /// Rows in the interned dir tree.
+    pub dir_rows: u64,
+    /// THE byte arena (all interned strings).
+    pub arena_bytes: u64,
+    /// The four arena-reference columns.
+    pub slot_refs_bytes: u64,
+    /// The scalar per-slot columns.
+    pub slot_cols_bytes: u64,
+    pub slot_by_id_bytes: u64,
+    pub slot_by_parent_name_bytes: u64,
+    /// The dir tree map itself.
+    pub dir_tree_bytes: u64,
+    /// The dir (parent, name-hash) secondary index.
+    pub dir_index_bytes: u64,
+    /// Extension text map, including the strings' heap.
+    pub exts_bytes: u64,
+    /// Sum of all of the above.
+    pub total_estimated: u64,
+}
+
+/// capacity × (key + value) bytes — the live-entry estimate the breakdown
+/// uses for hash maps (allocator headers and control bytes excluded by
+/// design).
+fn est_map<K, V>(m: &HashMap<K, V>) -> u64 {
+    m.capacity() as u64 * (std::mem::size_of::<K>() + std::mem::size_of::<V>()) as u64
+}
+
 /// In-memory search index over the store (see module docs).
 #[derive(Debug, Default)]
 pub struct HotIndex {
@@ -983,6 +1017,58 @@ impl HotIndex {
         self.interned_bytes
     }
 
+    /// Per-structure memory breakdown (v1.1 Task 6 diagnostics): the
+    /// estimated LIVE bytes each component of the hot index accounts
+    /// for. Vecs are counted as `len × element size` (capacity overshoot
+    /// excluded); hash maps as `capacity × (key + value)` — allocator
+    /// headers, hashbrown control bytes and fragmentation are all
+    /// deliberately NOT in these numbers, so `total_estimated` vs. the
+    /// process working set separates "live structures" from "overhead /
+    /// high water" at a glance in the memlog output.
+    pub fn mem_breakdown(&self) -> MemBreakdown {
+        let slots = self.ids.len() as u64;
+        let arena_bytes = self.bytes.len() as u64;
+        // Four arena-reference columns (lower/orig/pinyin full/init).
+        let slot_refs_bytes = slots * 4 * std::mem::size_of::<StrRef>() as u64;
+        // Scalar columns: logical_bytes, ids, parents, sizes, mtimes,
+        // ext_ids, is_dirs.
+        let slot_cols_bytes = slots
+            * (std::mem::size_of::<u32>()
+                + std::mem::size_of::<FileId>()
+                + std::mem::size_of::<FileId>()
+                + std::mem::size_of::<u64>()
+                + std::mem::size_of::<i64>()
+                + std::mem::size_of::<i64>()
+                + std::mem::size_of::<bool>()) as u64;
+        let slot_by_id_bytes = est_map(&self.slot_by_id);
+        let slot_by_parent_name_bytes = est_map(&self.slot_by_parent_name);
+        let dir_tree_bytes = est_map(&self.dirs);
+        let dir_index_bytes = est_map(&self.dir_by_parent_name);
+        let exts_bytes =
+            est_map(&self.exts) + self.exts.values().map(|s| s.capacity() as u64).sum::<u64>();
+        let total_estimated = arena_bytes
+            + slot_refs_bytes
+            + slot_cols_bytes
+            + slot_by_id_bytes
+            + slot_by_parent_name_bytes
+            + dir_tree_bytes
+            + dir_index_bytes
+            + exts_bytes;
+        MemBreakdown {
+            slots,
+            dir_rows: self.dirs.len() as u64,
+            arena_bytes,
+            slot_refs_bytes,
+            slot_cols_bytes,
+            slot_by_id_bytes,
+            slot_by_parent_name_bytes,
+            dir_tree_bytes,
+            dir_index_bytes,
+            exts_bytes,
+            total_estimated,
+        }
+    }
+
     /// Lowercased name of `slot` (case-insensitive matching).
     #[inline]
     pub fn name_lower(&self, slot: usize) -> &str {
@@ -1423,5 +1509,41 @@ mod tests {
             assert_eq!(key_slot, slot);
         }
         assert!(!hot.slot_by_id.contains_key(&ids[1]));
+    }
+
+    /// The breakdown's invariants (v1.1 diagnostics): every component of
+    /// a populated index is non-zero, the arena matches the authoritative
+    /// `interned_bytes`, and `total_estimated` is exactly the sum of the
+    /// parts — so the memlog line's live-vs-working-set gap is real, not
+    /// arithmetic drift.
+    #[test]
+    fn mem_breakdown_sums_its_parts() {
+        let hot = HotIndex::synthetic(1000);
+        let b = hot.mem_breakdown();
+
+        // synthetic's slots include its dir entries — the invariant is
+        // the slot count, not the file count.
+        assert_eq!(b.slots, hot.slot_count() as u64);
+        assert!(b.slots >= 1000);
+        assert!(b.dir_rows > 0);
+        assert_eq!(b.arena_bytes, hot.interned_bytes());
+        assert!(b.slot_refs_bytes > 0);
+        assert!(b.slot_cols_bytes > 0);
+        assert!(b.slot_by_id_bytes > 0);
+        assert!(b.slot_by_parent_name_bytes > 0);
+        assert!(b.dir_tree_bytes > 0);
+        assert!(b.dir_index_bytes > 0);
+        assert!(b.exts_bytes > 0);
+        assert_eq!(
+            b.total_estimated,
+            b.arena_bytes
+                + b.slot_refs_bytes
+                + b.slot_cols_bytes
+                + b.slot_by_id_bytes
+                + b.slot_by_parent_name_bytes
+                + b.dir_tree_bytes
+                + b.dir_index_bytes
+                + b.exts_bytes
+        );
     }
 }

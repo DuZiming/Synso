@@ -48,6 +48,24 @@ pub fn spawn(engine: Arc<synso_core::Engine>) {
                     stats.dirs,
                     stats.interned_bytes as f64 / 1e6,
                 );
+                // Per-structure breakdown (v1.1 diagnostics): the
+                // live-bytes estimate next to the working set — the gap
+                // between the two IS allocator overhead + high water.
+                let b = engine.mem_breakdown();
+                log::info!(
+                    "mem breakdown: live≈{:.0}MB | arena {:.0} + refs {:.0} + cols {:.0} + slot_by_id {:.0} + slot_by_name {:.0} + dir_tree {:.0} + dir_index {:.0} + exts {:.0} | slots={} dirs={}",
+                    b.total_estimated as f64 / 1e6,
+                    b.arena_bytes as f64 / 1e6,
+                    b.slot_refs_bytes as f64 / 1e6,
+                    b.slot_cols_bytes as f64 / 1e6,
+                    b.slot_by_id_bytes as f64 / 1e6,
+                    b.slot_by_parent_name_bytes as f64 / 1e6,
+                    b.dir_tree_bytes as f64 / 1e6,
+                    b.dir_index_bytes as f64 / 1e6,
+                    b.exts_bytes as f64 / 1e6,
+                    b.slots,
+                    b.dir_rows,
+                );
             }
         })
         .inspect_err(|err| log::warn!("synso: mem sampler failed to spawn: {err}"))

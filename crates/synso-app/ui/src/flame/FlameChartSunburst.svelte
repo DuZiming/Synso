@@ -14,13 +14,19 @@
 
   let {
     root,
-    onDrill,
+    onPin,
     onHover,
     overlay = null,
   }: {
     root: SizeNode;
-    onDrill: (path: string) => void;
-    onReveal: (path: string) => void;
+    /// Click PINS an arc (v1.1 user decision: no drill, no hover
+    /// dimming): the parent freezes the side lists on the clicked arc
+    /// (`key` is the index path, or the arc name for the synthetic
+    /// overlay arcs). Clicking is a toggle from the parent's side.
+    onPin: (key: string, info: {
+      chain: { name: string; size: number }[];
+      children: { name: string; size: number }[];
+    }) => void;
     /// Physical-capacity overlay for a pane root that names exactly one
     /// volume (null at every other level): two synthetic gray arcs —
     /// 「未索引」 (used-but-unindexed bytes) and 「剩余空间」 — make the
@@ -118,9 +124,19 @@
           width: el.clientWidth || 600,
           height: el.clientHeight || 400,
         });
+        // Click PINS the arc (v1.1: no drill) — same shape the hover tap
+        // emits, plus the stable key the parent toggles on. The
+        // synthetic overlay arcs pin by name (they carry no path).
         chart.on("click", (params) => {
           const datum = params.data as SunDatum | undefined;
-          if (datum && datum.path !== undefined) onDrill(datum.path);
+          if (!datum) return;
+          const children = [...(datum.children ?? [])].sort(
+            (a, b) => b.value - a.value,
+          );
+          onPin(datum.path ?? datum.name, {
+            chain: datum.chain,
+            children: children.map((c) => ({ name: c.name, size: c.value })),
+          });
         });
         // Hover tap for the side panels. Guarded by path: ECharts fires
         // mouseover per arc entry, and re-emitting the same arc on every
@@ -241,17 +257,14 @@
               // No tooltip (hover-lag culprit #2): the side panels carry
               // richer info than the floating bubble did.
               tooltip: { show: false },
-              // Ancestor highlight on hover (user-kept effect): the
-              // hovered dir's whole lineage lights up, everything else
-              // dims. Costs a canvas repaint per arc crossing — the other
-              // hover-path optimizations (no tooltip, guarded panel
-              // updates) keep the total feel smooth.
-              emphasis: { focus: "ancestor" },
+              // No emphasis focus (v1.1 user decision): hovering must NOT
+              // dim everything else — the side panels are the feedback.
+              emphasis: { focus: "none" },
               // series.data is an ARRAY of roots — a bare object renders
               // as a single childless disc (the blank-cake bug).
               data,
               radius,
-              nodeClick: false, // we drill via our own click handler
+              nodeClick: false, // clicks are our own pin handler
               // No labels (user preference): on a radial map they rotate
               // with the arcs and read badly; the side panels carry names.
               label: { show: false },

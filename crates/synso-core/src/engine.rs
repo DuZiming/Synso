@@ -426,6 +426,12 @@ impl Engine {
         }
     }
 
+    /// Per-structure memory breakdown of the hot index (v1.1 Task 6
+    /// diagnostics — see [`crate::hotindex::HotIndex::mem_breakdown`]).
+    pub fn mem_breakdown(&self) -> crate::hotindex::MemBreakdown {
+        read_unpoisoned(&self.hot).mem_breakdown()
+    }
+
     // ---------------- Task 13: user settings -----------------------------
 
     /// The persisted user settings (see [`crate::settings`]), served from

@@ -9,13 +9,12 @@
   // unknown root renders 路径不存在 but keeps its breadcrumb so the user
   // can climb back out.
   //
-  // The synthetic "(other)" aggregate node is not drillable (it names no
-  // real directory — the engine would answer None): clicking it shows a
-  // toast instead of a missing-path pane. Reveal goes through
-  // `reveal_index_path`; failures surface in the same toast.
+  // Per-pane state machine: root changes come from the breadcrumb or the
+  // root-picker input; arcs no longer drill (v1.1 user decision) — a
+  // click PINS the arc's side lists instead.
   import { onMount } from "svelte";
   import { t } from "../i18n";
-  import { listVolumes, revealIndexPath, sizeTree, volumeOverlay } from "../lib/tauri";
+  import { listVolumes, sizeTree, volumeOverlay } from "../lib/tauri";
   import { listen } from "@tauri-apps/api/event";
   import type { SizeNode, VolumeInfo, VolumeOverlay } from "../lib/types";
   import FlameChartSunburst from "./FlameChartSunburst.svelte";
@@ -52,6 +51,14 @@
     /// Fixed volumes with their totals, fetched when this pane sits at the
     /// (all) root — the promoted volume arcs hover with their usage line.
     volumes: VolumeInfo[];
+    /// Wall-clock of the last load that COMPLETED (success or error —
+    /// either way the refresh FIRED; a stuck timestamp means no trigger).
+    /// Displayed beside the breadcrumb so a stale map is diagnosable at
+    /// a glance: time moved + map identical = refreshed-but-unchanged
+    /// data; time frozen = the fs-changed trigger never landed.
+    updatedAt: number | null;
+    /// The click-pinned arc (see [`togglePin`]); null = follow the hover.
+    pinned: { key: string; info: HoverInfo } | null;
   }
 
   function newPane(root: string): Pane {
@@ -66,7 +73,15 @@
       hover: null,
       overlay: null,
       volumes: [],
+      updatedAt: null,
+      pinned: null,
     };
+  }
+
+  /// HH:MM:SS for the refresh-time chip.
+  function clockOf(ts: number | null): string {
+    if (ts === null) return "--:--:--";
+    return new Date(ts).toLocaleTimeString([], { hour12: false });
   }
 
   const MAX_CHILDREN = 40;
@@ -127,22 +142,26 @@
         pane.tree = null;
         pane.missing = true;
       }
+      pane.updatedAt = Date.now();
     } catch (err) {
       if (seq !== pane.seq) return;
       pane.tree = null;
       pane.error = String(err);
+      pane.updatedAt = Date.now();
     } finally {
       if (seq === pane.seq) pane.loading = false;
     }
   }
 
-  /// At the (all) root with a hovered promoted arc: the volume that arc
-  /// names, if any (the arc's own name is the scan-root segment, e.g.
-  /// `C:` — matched against mounts trailing-separator-trimmed and
+  /// At the (all) root with a hovered/pinned promoted arc: the volume
+  /// that arc names, if any (the arc's own name is the scan-root segment,
+  /// e.g. `C:` — matched against mounts trailing-separator-trimmed and
   /// case-insensitively, mirroring the engine's `match_volume`).
   function hoveredVolume(pane: Pane): VolumeInfo | null {
-    if (pane.root !== "" || !pane.hover) return null;
-    const name = pane.hover.chain[0]?.name;
+    if (pane.root !== "") return null;
+    const info = listInfo(pane);
+    if (!info) return null;
+    const name = info.chain[0]?.name;
     if (!name) return null;
     const key = name.trimEnd().toLowerCase();
     const key2 = key.replace(/[/\\]+$/, "");
@@ -158,34 +177,22 @@
   function jump(pane: Pane, path: string): void {
     pane.root = path.trim();
     pane.picker = pane.root;
+    pane.pinned = null; // the pinned arc belonged to the old view
     void load(pane);
   }
 
-  function findNode(tree: SizeNode, path: string): SizeNode | null {
-    if (tree.path === path) return tree;
-    for (const child of tree.children) {
-      const found = findNode(child, path);
-      if (found) return found;
-    }
-    return null;
+  /// Click PINS an arc (v1.1 user request: no drill, no hover dimming —
+  /// click freezes the side lists on that arc). Clicking the pinned arc
+  /// again unpins; clicking any other arc re-pins. Hover still drives
+  /// the lists while nothing is pinned.
+  function togglePin(pane: Pane, key: string, info: HoverInfo): void {
+    pane.pinned = pane.pinned?.key === key ? null : { key, info };
   }
 
-  function drill(pane: Pane, path: string): void {
-    // The engine's own tree tells us whether this path is the synthetic
-    // aggregate (a real dir could legitimately carry the name).
-    if (pane.tree && findNode(pane.tree, path)?.name === "(other)") {
-      showToast($t("flame.aggregateNoDrill"));
-      return;
-    }
-    jump(pane, path);
-  }
-
-  async function reveal(path: string): Promise<void> {
-    try {
-      await revealIndexPath(path);
-    } catch (err) {
-      showToast(String(err));
-    }
+  /// What the side lists show: the pinned arc when one is pinned, the
+  /// live hover otherwise.
+  function listInfo(pane: Pane): HoverInfo | null {
+    return pane.pinned?.info ?? pane.hover;
   }
 
   function refresh(): void {
@@ -314,15 +321,25 @@
             {$t("flame.total")} {humanBytes(pane.overlay.total_bytes)}
           </span>
         {/if}
+        <span class="usage-line" title={$t("flame.updatedAtHint")}>
+          {$t("flame.updatedAt")} {clockOf(pane.updatedAt)}
+        </span>
 
         {#if pane.tree}
           <div class="pane-body">
             <aside class="side-panel" aria-label={$t("flame.pathPanel")}>
-              {#if pane.hover && pane.hover.chain.length > 0}
-                <h3>{$t("flame.pathPanel")}</h3>
-                <!-- Hovered first, then each parent up to the root. -->
+              {#if listInfo(pane) && listInfo(pane)!.chain.length > 0}
+                <h3>
+                  {$t("flame.pathPanel")}
+                  {#if pane.pinned}
+                    <span class="pin-chip" title={$t("flame.pinnedHint")}>
+                      📌 {$t("flame.pinned")}
+                    </span>
+                  {/if}
+                </h3>
+                <!-- Pinned/hovered first, then each parent up to the root. -->
                 <ol>
-                  {#each [...pane.hover.chain].reverse() as level, i (i)}
+                  {#each [...listInfo(pane)!.chain].reverse() as level, i (i)}
                     <li class:current={i === 0}>
                       <span class="lvl-name" title={level.name}>{level.name}</span>
                       <span class="lvl-size">{humanBytes(level.size)}</span>
@@ -364,22 +381,21 @@
                     )}`,
                   }
                 : null}
-              onDrill={(path) => drill(pane, path)}
-              onReveal={(path) => void reveal(path)}
+              onPin={(key, info) => togglePin(pane, key, info)}
               onHover={(info) => (pane.hover = info)}
             />
             <aside class="side-panel" aria-label={$t("flame.childrenPanel")}>
-              {#if pane.hover && pane.hover.children.length > 0}
+              {#if listInfo(pane) && listInfo(pane)!.children.length > 0}
                 <h3>{$t("flame.childrenPanel")}</h3>
                 <ol>
-                  {#each pane.hover.children as child (child.name)}
+                  {#each listInfo(pane)!.children as child (child.name)}
                     <li>
                       <span class="lvl-name" title={child.name}>{child.name}</span>
                       <span class="lvl-size">{humanBytes(child.size)}</span>
                     </li>
                   {/each}
                 </ol>
-              {:else if pane.hover}
+              {:else if listInfo(pane)}
                 <p class="path-hint">{$t("flame.childrenEmpty")}</p>
               {:else}
                 <p class="path-hint">{$t("flame.childrenHint")}</p>
