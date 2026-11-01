@@ -24,6 +24,7 @@
     /// (`key` is the index path, or the arc name for the synthetic
     /// overlay arcs). Clicking is a toggle from the parent's side.
     onPin: (key: string, info: {
+      path: string | null;
       chain: { name: string; size: number }[];
       children: { name: string; size: number }[];
     }) => void;
@@ -46,6 +47,7 @@
     /// size desc (left panel). Null on leave. The chart's rendering
     /// options are untouched by this — pure event tap.
     onHover?: (info: {
+      path: string | null;
       chain: { name: string; size: number }[];
       children: { name: string; size: number }[];
     } | null) => void;
@@ -134,6 +136,7 @@
             (a, b) => b.value - a.value,
           );
           onPin(datum.path ?? datum.name, {
+            path: datum.path ?? null,
             chain: datum.chain,
             children: children.map((c) => ({ name: c.name, size: c.value })),
           });
@@ -154,7 +157,7 @@
           // The synthetic overlay arcs (未索引 / 剩余空间) carry no path:
           // they hover as a chain of just themselves, no children.
           if (path === undefined) {
-            onHover?.({ chain: datum.chain, children: [] });
+            onHover?.({ path: null, chain: datum.chain, children: [] });
             return;
           }
           // Children arrive engine-sorted (size desc); sort again so the
@@ -163,6 +166,7 @@
             (a, b) => b.value - a.value,
           );
           onHover?.({
+            path,
             chain: datum.chain,
             children: children.map((c) => ({ name: c.name, size: c.value })),
           });

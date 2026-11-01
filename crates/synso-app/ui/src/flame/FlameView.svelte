@@ -33,6 +33,10 @@
 
   /// What the side panels show for the hovered block.
   interface HoverInfo {
+    /// The hovered/pinned arc's index path (null on the synthetic overlay
+    /// arcs) — the key [`refreshSelection`] re-locates after every data
+    /// refresh so the side lists never show a stale snapshot.
+    path: string | null;
     chain: ChainLevel[];
     children: ChainLevel[];
   }
@@ -147,6 +151,9 @@
         pane.tree = null;
         pane.missing = true;
       }
+      // The fresh tree invalidates the side lists' snapshots — re-locate
+      // the hover/pin selections (deleted arcs drop out of the lists).
+      refreshSelection(pane);
       pane.updatedAt = Date.now();
     } catch (err) {
       if (seq !== pane.seq) return;
@@ -219,6 +226,63 @@
   /// live hover otherwise.
   function listInfo(pane: Pane): HoverInfo | null {
     return pane.pinned?.info ?? pane.hover;
+  }
+
+  /// Depth-first lookup of `path` in `tree`, pushing every VISITED
+  /// ancestor's (name, size) into `chain` — on a hit the caller appends
+  /// the node itself, yielding the same root-first chain the chart emits.
+  function findByPath(
+    tree: SizeNode,
+    path: string,
+    chain: ChainLevel[],
+  ): SizeNode | null {
+    for (const child of tree.children) {
+      if (child.path === path) {
+        chain.push({ name: tree.name, size: tree.size });
+        return child;
+      }
+    }
+    for (const child of tree.children) {
+      chain.push({ name: child.name, size: child.size });
+      const found = findByPath(child, path, chain);
+      if (found) return found;
+      chain.pop();
+    }
+    return null;
+  }
+
+  /// Re-derives the hover/pin selections from the FRESH tree after every
+  /// load: without this the side lists kept rendering the pre-refresh
+  /// snapshot (a deleted folder stayed listed until the next mouse move),
+  /// and a PIN on a deleted folder lived forever. Synthetic overlay arcs
+  /// (未索引 / 剩余空间, path null / name not a tree path) simply unpin.
+  function refreshSelection(pane: Pane): void {
+    const tree = pane.tree;
+    const rederive = (path: string | null): HoverInfo | null => {
+      if (!tree || !path) return null;
+      const chain: ChainLevel[] = [];
+      const node = findByPath(tree, path, chain);
+      if (!node) return null;
+      chain.push({ name: node.name, size: node.size });
+      // Match the chart's chain shape: at the (all) root the promoted
+      // volume arcs carry just themselves (no "(all)" wrapper level).
+      if (pane.root === "" && chain[0]?.name === "(all)") chain.shift();
+      return {
+        path,
+        chain,
+        children: node.children.map((c) => ({
+          name: c.name,
+          size: c.size,
+        })),
+      };
+    };
+    if (pane.pinned) {
+      const info = rederive(pane.pinned.info.path);
+      pane.pinned = info ? { key: pane.pinned.key, info } : null;
+    }
+    if (pane.hover) {
+      pane.hover = rederive(pane.hover.path);
+    }
   }
 
   function refresh(): void {
