@@ -77,6 +77,12 @@ impl Store {
         // short busy wait turns their rare overlap into a wait instead of an
         // immediate SQLITE_BUSY error.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // WAL (v1.2): the cold-tier dimension reader runs on its own
+        // read-only connection and must see committed data without
+        // contending the writer's mutex — WAL snapshot reads are exactly
+        // that. Persistent `-wal`/`-shm` siblings beside the DB are
+        // expected.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         migrate(&mut conn)?;
         // Generation resumes above anything a previous run ever stamped, so
         // a stale row from an interrupted scan can never look current.

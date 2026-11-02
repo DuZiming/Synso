@@ -66,6 +66,7 @@
 //! ```
 
 pub(crate) mod dedup;
+pub(crate) mod dimensions;
 pub(crate) mod engine;
 pub(crate) mod hotindex;
 pub(crate) mod model;

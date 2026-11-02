@@ -58,6 +58,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
 use crate::dedup::{self, DedupState, DupeGroup, StoredGroup};
+use crate::dimensions::{ColdReader, FileDetail};
 use crate::hotindex::HotIndex;
 use crate::model::{FileId, ParsedQuery};
 use crate::query::{self, SearchResult};
@@ -65,6 +66,7 @@ use crate::scanner::{self, effective_roots, root_segment, ScanOptions};
 use crate::settings::{self, Settings};
 use crate::sizeagg::{self, SizeNode};
 use crate::store::Store;
+use crate::tiers::{self, TierCache};
 use crate::trash;
 use crate::volumes::{match_volume, VolumeInfo};
 use crate::watcher::{self, Watcher};
@@ -192,6 +194,12 @@ pub struct Engine {
     /// scans hold for their whole duration (a store-lock read froze the
     /// app's main thread at startup: the v1 "not responding" bug).
     settings_cache: Mutex<Settings>,
+    /// The dimension cache (v1.2): hot → staging tiers keyed by file id.
+    /// `None` until first use so opening an engine costs nothing extra.
+    tiers: Arc<Mutex<TierCache<FileId, FileDetail>>>,
+    /// The dedicated read-only WAL connection for cold dimension reads —
+    /// deliberately NOT behind the store mutex (see `dimensions` docs).
+    cold: std::sync::Mutex<ColdReader>,
 }
 
 /// State shared between the engine, the dedup worker thread and the
@@ -258,6 +266,8 @@ impl Engine {
             watcher: Mutex::new(None),
             dedup,
             settings_cache: Mutex::new(initial_settings),
+            tiers: Arc::new(Mutex::new(TierCache::new(tiers::MemoryPolicy::default()))),
+            cold: std::sync::Mutex::new(ColdReader::open(db_path)?),
         };
         if let Err(err) = thread::Builder::new()
             .name("synso-hot-load".into())
@@ -293,6 +303,56 @@ impl Engine {
         {
             return;
         }
+        // v1.2: a companion listener flushes the dimension caches when
+        // the scan lands (every walked row was re-stamped, so cached
+        // details are suspect) and preheats the hot tier from the ids it
+        // held. Subscribed BEFORE the scan spawns (no missed terminal
+        // event); exits after the first one.
+        let flush_rx = self.subscribe();
+        let flush_tiers = Arc::clone(&self.tiers);
+        let flush_db = self.db_path.clone();
+        let _ = thread::Builder::new()
+            .name("synso-dim-flush".into())
+            .spawn(move || {
+                loop {
+                    match flush_rx.recv_timeout(std::time::Duration::from_secs(600)) {
+                        Ok(EngineEvent::ScanFinished { .. })
+                        | Ok(EngineEvent::ScanFailed { .. }) => break,
+                        Ok(_) => continue,
+                        Err(_) => return, // sender gone: engine dropped
+                    }
+                }
+                let preheat_ids: Vec<FileId> = {
+                    let mut tiers = lock_unpoisoned(&flush_tiers);
+                    let preload = tiers.policy().preload_on_start;
+                    let ids = tiers
+                        .hot_snapshot()
+                        .into_iter()
+                        .map(|(id, _, _)| id)
+                        .collect();
+                    tiers.clear();
+                    if preload {
+                        ids
+                    } else {
+                        Vec::new()
+                    }
+                };
+                if preheat_ids.is_empty() {
+                    return;
+                }
+                // A throwaway reader in THIS thread (the engine's own
+                // ColdReader connection is not Sync).
+                if let Ok(cold) = crate::dimensions::ColdReader::open(&flush_db) {
+                    if let Ok(fresh) = cold.file_details(&preheat_ids) {
+                        let mut tiers = lock_unpoisoned(&flush_tiers);
+                        for detail in fresh {
+                            let bytes = detail.cached_bytes();
+                            let id = detail.id;
+                            tiers.put_hot_direct(id, detail, bytes);
+                        }
+                    }
+                }
+            });
         let spawn = thread::Builder::new().name("synso-scan".into()).spawn({
             let store = self.store.clone();
             let hot = self.hot.clone();
@@ -335,6 +395,10 @@ impl Engine {
             let opts = lock_unpoisoned(&self.scan_opts);
             (effective_roots(&opts.roots), opts.exclusions.clone())
         };
+        // Capture ONLY the tiers Arc (the engine itself is not Sync —
+        // the cold reader's connection isn't shareable, and the closure
+        // doesn't need it).
+        let tiers_for_watcher = Arc::clone(&self.tiers);
         let watcher = Watcher::start(
             &roots,
             &exclusions,
@@ -342,6 +406,12 @@ impl Engine {
             Arc::clone(&self.store),
             Arc::clone(&self.hot),
             Arc::clone(&self.subscribers),
+            Arc::new(move |ids: &[FileId]| {
+                let mut tiers = lock_unpoisoned(&tiers_for_watcher);
+                for id in ids {
+                    tiers.invalidate(id);
+                }
+            }),
         )?;
         *slot = Some(watcher);
         Ok(())
@@ -430,6 +500,122 @@ impl Engine {
     /// diagnostics — see [`crate::hotindex::HotIndex::mem_breakdown`]).
     pub fn mem_breakdown(&self) -> crate::hotindex::MemBreakdown {
         read_unpoisoned(&self.hot).mem_breakdown()
+    }
+
+    // ---------------- v1.2: dimension tiers ------------------------------
+
+    /// The pilot dimension: per-file detail (ctime/atime/dedup hashes)
+    /// through the tier ladder — hot → staging → the read-only WAL
+    /// connection — cached per the live memory policy. Unknown ids yield
+    /// no row (deleted or never indexed).
+    pub fn file_detail(&self, id: FileId) -> Option<FileDetail> {
+        {
+            let mut tiers = lock_unpoisoned(&self.tiers);
+            if let Some(hit) = tiers.get_hot(&id) {
+                return Some(hit.clone());
+            }
+            if let Some(hit) = tiers.get_staging(&id) {
+                // A staging hit builds heat; crossing the threshold moves
+                // the staged value into hot (no refetch).
+                tiers.record_hit(&id);
+                tiers.promote_from_staging(&id);
+                return Some(hit);
+            }
+        }
+        // Cold: read storage on the dedicated connection (never the store
+        // mutex), then place into staging.
+        let fetched = lock_unpoisoned(&self.cold)
+            .file_details(&[id])
+            .ok()?
+            .pop()?;
+        let mut tiers = lock_unpoisoned(&self.tiers);
+        tiers.record_hit(&id);
+        tiers.put_staging(id, fetched.clone(), fetched.cached_bytes());
+        Some(fetched)
+    }
+
+    /// A page of details (≤100 ids per call by convention). Uncached ids
+    /// are fetched in one batched cold read; every returned row lands in
+    /// staging.
+    pub fn file_details(&self, ids: &[FileId]) -> Vec<FileDetail> {
+        let mut result: Vec<FileDetail> = Vec::with_capacity(ids.len());
+        let mut misses: Vec<FileId> = Vec::new();
+        {
+            let mut tiers = lock_unpoisoned(&self.tiers);
+            for &id in ids {
+                if let Some(hit) = tiers.get_hot(&id) {
+                    result.push(hit.clone());
+                } else if let Some(hit) = tiers.get_staging(&id) {
+                    tiers.record_hit(&id);
+                    result.push(hit);
+                } else {
+                    misses.push(id);
+                }
+            }
+        }
+        if !misses.is_empty() {
+            if let Ok(fetched) = lock_unpoisoned(&self.cold).file_details(&misses) {
+                let mut tiers = lock_unpoisoned(&self.tiers);
+                for detail in &fetched {
+                    tiers.record_hit(&detail.id);
+                    tiers.put_staging(detail.id, detail.clone(), detail.cached_bytes());
+                }
+                result.extend(fetched);
+            }
+        }
+        result
+    }
+
+    /// Tier observability for the settings dashboard and the memlog line.
+    pub fn tier_stats(&self) -> tiers::TierStats {
+        lock_unpoisoned(&self.tiers).stats()
+    }
+
+    /// Live-applies the memory policy (settings UI path).
+    pub fn apply_memory_policy(&self, policy: tiers::MemoryPolicy) {
+        lock_unpoisoned(&self.tiers).set_policy(policy);
+    }
+
+    /// Drops the given ids' tier entries (watcher invalidation hook: an
+    /// updated row's cached detail is stale by definition).
+    pub fn invalidate_dimensions(&self, ids: &[FileId]) {
+        let mut tiers = lock_unpoisoned(&self.tiers);
+        for id in ids {
+            tiers.invalidate(id);
+        }
+    }
+
+    /// Flushes every dimension cache entry (rescan-completion hook) and,
+    /// when preheating is on, reloads the hot tier with the ids the
+    /// flushed hot tier held — yesterday's hot files are today's first
+    /// residents again after one cold burst.
+    pub fn flush_dimensions_and_preheat(&self) {
+        let preheat_ids: Vec<FileId> = {
+            let mut tiers = lock_unpoisoned(&self.tiers);
+            let preload = tiers.policy().preload_on_start;
+            let ids = tiers
+                .hot_snapshot()
+                .into_iter()
+                .map(|(id, _, _)| id)
+                .collect();
+            tiers.clear();
+            if preload {
+                ids
+            } else {
+                Vec::new()
+            }
+        };
+        if preheat_ids.is_empty() {
+            return;
+        }
+        if let Ok(fresh) = lock_unpoisoned(&self.cold).file_details(&preheat_ids) {
+            let mut tiers = lock_unpoisoned(&self.tiers);
+            for detail in fresh {
+                let bytes = detail.cached_bytes();
+                let id = detail.id;
+                tiers.put_hot_direct(id, detail, bytes);
+            }
+        }
     }
 
     // ---------------- Task 13: user settings -----------------------------
@@ -2344,5 +2530,108 @@ mod tests {
             available_bytes: 1,
         }];
         assert!(engine.volume_overlay_in("fixture", &volumes).is_none());
+    }
+
+    // ---------------- v1.2: dimension tiers --------------------------------
+
+    /// Fixture: a scanned engine with one known file, its detail fetched
+    /// once (so the value sits in a tier).
+    fn detail_fixture(tmp: &tempfile::TempDir) -> (Engine, FileId) {
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("notes.txt"), b"hello").unwrap();
+        let engine = open_engine(&tmp.path().join("index.db"), &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+        let hit = engine.search("notes", 0, 5);
+        assert_eq!(hit.total, 1);
+        (engine, hit.hits[0].id)
+    }
+
+    /// The cold read must not queue behind the store mutex: with the main
+    /// write connection HELD for two seconds, a detail fetch (cold miss —
+    /// nothing cached) still completes fast. This is the freeze class
+    /// v1.1 fought; the read-only WAL connection is the guarantee.
+    #[test]
+    fn readonly_connection_unblocked_by_write_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id) = detail_fixture(&tmp);
+
+        let _store_guard = lock_unpoisoned(&engine.store);
+        let started = Instant::now();
+        let detail = engine
+            .file_detail(id)
+            .expect("the cold read succeeds while the writer holds its lock");
+        assert_eq!(detail.id, id);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cold read took {:?} — it queued behind the store mutex",
+            started.elapsed()
+        );
+    }
+
+    /// A watcher upsert invalidates the cached detail: the store's
+    /// hash-cache rule NULLs hashes when mtime+size change, so a cached
+    /// hash that no longer exists must never be served after the update.
+    #[test]
+    fn stale_entry_invalidated_by_upsert() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id) = detail_fixture(&tmp);
+
+        let first = engine.file_detail(id).expect("cold fetch works");
+        // Simulate the watcher's invalidation callback (the engine wiring
+        // calls invalidate on upserted ids; here: same ids path).
+        engine.invalidate_dimensions(&[id]);
+        // And prove the ladder re-reads: touch the row's ctime directly on
+        // the store so the refetched value differs from any cache.
+        {
+            let mut store = lock_unpoisoned(&engine.store);
+            store
+                .conn_mut()
+                .execute("UPDATE files SET ctime = 12345 WHERE id = ?1", [id])
+                .unwrap();
+        }
+        let second = engine.file_detail(id).expect("refetch after invalidate");
+        assert_eq!(
+            second.ctime,
+            Some(12345),
+            "stale cached ctime must not be served"
+        );
+        assert_ne!(first.ctime, second.ctime);
+    }
+
+    /// Rescan completion flushes every tier entry, then preheats the hot
+    /// tier with the ids it held (preload on by default).
+    #[test]
+    fn rescan_flushes_then_preheats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id) = detail_fixture(&tmp);
+
+        // Promote the id to hot: enough recorded hits under a tiny
+        // threshold, then the flush+preheat cycle must keep it hot.
+        {
+            let mut tiers = lock_unpoisoned(&engine.tiers);
+            tiers.set_policy(crate::tiers::MemoryPolicy {
+                hot_threshold: 1,
+                ..crate::tiers::MemoryPolicy::default()
+            });
+            drop(tiers);
+        }
+        let _ = engine.file_detail(id); // staging
+        let _ = engine.file_detail(id); // hit → promote path
+        {
+            let mut tiers = lock_unpoisoned(&engine.tiers);
+            assert!(tiers.get_hot(&id).is_some(), "precondition: id is hot");
+        }
+
+        engine.flush_dimensions_and_preheat();
+
+        let mut tiers = lock_unpoisoned(&engine.tiers);
+        assert!(
+            tiers.get_hot(&id).is_some(),
+            "preload re-inserts the previously-hot id"
+        );
+        assert_eq!(tiers.stats().staging_entries, 0, "everything was flushed");
     }
 }

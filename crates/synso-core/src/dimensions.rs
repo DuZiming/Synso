@@ -1,0 +1,91 @@
+//! Cold-tier dimension access (v1.2): the read path for per-file data
+//! that is NOT part of the search scan — ctime/atime and the dedup
+//! hashes today, summaries and any future per-file dimension tomorrow.
+//! Values flow through the engine's [`crate::tiers::TierCache`] (hot →
+//! staging → this cold read) and are cached per the memory policy.
+//!
+//! The cold read runs on a DEDICATED read-only SQLite connection in WAL
+//! mode, deliberately outside the main write connection's mutex: a full
+//! rescan holds that mutex for its whole walk, and queuing every
+//! dimension touch behind it would recreate the freeze class v1.1
+//! fought. WAL adds persistent `-wal`/`-shm` siblings next to the index
+//! database — expected.
+
+use std::path::Path;
+
+use rusqlite::{Connection, OpenFlags};
+
+use crate::model::FileId;
+use crate::Result;
+
+/// The pilot dimension's payload: everything a "file detail" surface
+/// shows. Future dimensions register their own row types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FileDetail {
+    pub id: FileId,
+    pub ctime: Option<i64>,
+    pub atime: Option<i64>,
+    /// First-block hash (None until a dedup run covered this file).
+    pub hash_first: Option<u64>,
+    /// Full-content hash (None likewise).
+    pub hash_full: Option<u64>,
+}
+
+impl FileDetail {
+    /// Serde-friendly byte cost for the tier cache's budget accounting:
+    /// the Option<u64> trio is 3×9 bytes + id 8 + slack — call it 64.
+    pub fn cached_bytes(&self) -> u64 {
+        64
+    }
+}
+
+/// A read-only view over the index database for dimension reads.
+pub(crate) struct ColdReader {
+    conn: Connection,
+}
+
+impl ColdReader {
+    /// Opens the database read-only with WAL. `journal_mode=WAL` must be
+    /// set ONCE by the writer (Store::open does it); a reader then sees
+    /// committed data without locking the writer out.
+    pub(crate) fn open(db_path: &Path) -> Result<ColdReader> {
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_millis(500))?;
+        Ok(ColdReader { conn })
+    }
+
+    /// Fetches the detail rows for `ids` (order not guaranteed; missing
+    /// ids are simply absent from the result).
+    pub(crate) fn file_details(&self, ids: &[FileId]) -> Result<Vec<FileDetail>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Chunked IN lists stay under SQLite's parameter cap.
+        let mut out = Vec::with_capacity(ids.len());
+        for chunk in ids.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT id, ctime, atime, hash_first, hash_full FROM files \
+                 WHERE id IN ({placeholders})"
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| {
+                Ok(FileDetail {
+                    id: row.get(0)?,
+                    ctime: row.get(1)?,
+                    atime: row.get(2)?,
+                    hash_first: row.get(3)?,
+                    hash_full: row.get(4)?,
+                })
+            })?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+}

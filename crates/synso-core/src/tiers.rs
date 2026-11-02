@@ -298,6 +298,53 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
 
     /// Direct hot insert for startup preheat (persisted heat already
     /// earned the entry; no threshold re-check).
+    /// Promotes a STAGING resident to hot by MOVING its value — no
+    /// refetch. Returns false when the score is below threshold, the key
+    /// is not staged, or the budget refuses the entry.
+    pub fn promote_from_staging(&mut self, key: &K) -> bool {
+        let now = self.now();
+        let policy = self.policy;
+        let score = match self.heat.get_mut(key) {
+            Some(heat) => {
+                heat.decay(now, policy.decay_half_life);
+                heat.score / 256
+            }
+            None => return false,
+        };
+        if score < self.policy.hot_threshold {
+            return false;
+        }
+        let Some((value, bytes, _)) = self.staging.remove(key) else {
+            return false;
+        };
+        self.stats.staging_bytes = self.stats.staging_bytes.saturating_sub(bytes);
+        while self.stats.hot_bytes + bytes > self.policy.hot_budget_bytes && !self.hot.is_empty() {
+            self.evict_lowest_hot();
+        }
+        if self.stats.hot_bytes + bytes > self.policy.hot_budget_bytes {
+            // Budget refuses: back to staging rather than dropping.
+            let expires_at = now + self.policy.staging_ttl;
+            self.staging.insert(key.clone(), (value, bytes, expires_at));
+            self.stats.staging_bytes += bytes;
+            return false;
+        }
+        if let Some((_, old_bytes)) = self.hot.insert(key.clone(), (value, bytes)) {
+            self.stats.hot_bytes = self.stats.hot_bytes.saturating_sub(old_bytes);
+        } else {
+            self.stats.hot_bytes += bytes;
+        }
+        self.stats.promotions += 1;
+        true
+    }
+
+    /// Snapshot of the hot tier's contents (rescan-preheat path).
+    pub fn hot_snapshot(&self) -> Vec<(K, V, u64)> {
+        self.hot
+            .iter()
+            .map(|(k, (v, bytes))| (k.clone(), v.clone(), *bytes))
+            .collect()
+    }
+
     pub fn put_hot_direct(&mut self, key: K, value: V, bytes: u64) {
         while self.stats.hot_bytes + bytes > self.policy.hot_budget_bytes && !self.hot.is_empty() {
             self.evict_lowest_hot();

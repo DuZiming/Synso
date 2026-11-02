@@ -88,7 +88,7 @@ use notify::{
 
 use crate::engine::{broadcast, EngineEvent};
 use crate::hotindex::HotIndex;
-use crate::model::FileRecord;
+use crate::model::{FileId, FileRecord};
 use crate::scanner;
 use crate::store::Store;
 use crate::{Result, SynsoError};
@@ -125,10 +125,19 @@ struct PendingOp {
 }
 
 /// Everything the debounce thread needs, captured once at start.
+/// v1.2 invalidation callback: file ids each applied batch UPSERTED.
+type UpsertHook = Arc<dyn Fn(&[FileId]) + Send + Sync>;
+
 struct Ctx {
     store: Arc<Mutex<Store>>,
     hot: Arc<RwLock<HotIndex>>,
     subscribers: Arc<Mutex<Vec<Sender<EngineEvent>>>>,
+    /// v1.2 dimension-cache invalidation: called with the file ids each
+    /// applied batch UPSERTED (their cached detail rows are stale by
+    /// definition — the store may have nulled hashes on mtime/size
+    /// change). Removals don't need it: a deleted file's id stops being
+    /// reachable, so its cache entry merely occupies budget until TTL.
+    on_upserted_ids: UpsertHook,
     matcher: GlobSet,
     /// Watch roots, in the spelling the watches were registered with (so
     /// `strip_prefix` on event paths always succeeds).
@@ -211,6 +220,7 @@ impl Watcher {
         store: Arc<Mutex<Store>>,
         hot: Arc<RwLock<HotIndex>>,
         subscribers: Arc<Mutex<Vec<Sender<EngineEvent>>>>,
+        on_upserted_ids: UpsertHook,
     ) -> Result<Watcher> {
         let matcher = scanner::build_matcher(exclusions)?;
         let (event_tx, event_rx) = unbounded();
@@ -235,6 +245,7 @@ impl Watcher {
             store,
             hot,
             subscribers,
+            on_upserted_ids,
             matcher,
             roots,
             root_segments,
@@ -509,6 +520,17 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
     }
     pending.clear();
     if applied > 0 {
+        // v1.2: upserted rows invalidate their cached dimension data.
+        let upserted: Vec<FileId> = hot_ops
+            .iter()
+            .filter_map(|op| match op {
+                HotOp::Upsert(rec) => Some(rec.id),
+                HotOp::Remove { .. } => None,
+            })
+            .collect();
+        if !upserted.is_empty() {
+            (ctx.on_upserted_ids)(&upserted);
+        }
         broadcast(&ctx.subscribers, EngineEvent::FsChanged);
     }
 }
