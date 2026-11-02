@@ -39,7 +39,7 @@ use crate::store::Store;
 use crate::Result;
 
 /// A string's location in the shared byte arena.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 struct StrRef {
     start: u32,
     len: u32,
@@ -212,6 +212,10 @@ pub struct MemBreakdown {
 fn est_map<K, V>(m: &HashMap<K, V>) -> u64 {
     m.capacity() as u64 * (std::mem::size_of::<K>() + std::mem::size_of::<V>()) as u64
 }
+
+/// Dead-byte floor before an arena compaction is worth its pause: below
+/// this the absolute waste is noise for any realistic index.
+const COMPACT_MIN_WASTE: u64 = 64 * 1024 * 1024;
 
 /// In-memory search index over the store (see module docs).
 #[derive(Debug, Default)]
@@ -1017,6 +1021,70 @@ impl HotIndex {
         self.interned_bytes
     }
 
+    /// The arena buffer's CURRENT size — after churn this exceeds
+    /// [`HotIndex::interned_bytes`] by the dead bytes removals stranded.
+    pub(crate) fn arena_len(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    /// Rebuilds the byte arena with ONLY the bytes live refs point at,
+    /// remapping every ref (aliasing preserved via dedupe). The arena is
+    /// append-only under incremental updates — upserts append, removals
+    /// strand holes — and on an all-day instance 112MB of content was
+    /// observed ballooned to 1.78GB. Returns the bytes reclaimed.
+    pub(crate) fn compact_arena(&mut self) -> u64 {
+        let before = self.bytes.len() as u64;
+        let mut fresh: Vec<u8> = Vec::with_capacity(self.interned_bytes as usize);
+        // old ref -> new ref, so aliased ranges (pinyin aliasing the
+        // lowercased name) copy once.
+        let mut seen: HashMap<StrRef, StrRef> = HashMap::new();
+        let bytes = &self.bytes;
+
+        let mut remap_vec = |refs: &mut Vec<StrRef>| {
+            for r in refs.iter_mut() {
+                let nr = *seen.entry(*r).or_insert_with(|| {
+                    let start = fresh.len() as u32;
+                    fresh.extend_from_slice(&bytes[r.start as usize..(r.start + r.len) as usize]);
+                    StrRef { start, len: r.len }
+                });
+                *r = nr;
+            }
+        };
+
+        remap_vec(&mut self.lower_refs);
+        remap_vec(&mut self.orig_refs);
+        remap_vec(&mut self.py_full_refs);
+        remap_vec(&mut self.py_init_refs);
+        for entry in self.dirs.values_mut() {
+            let nr = *seen.entry(entry.name).or_insert_with(|| {
+                let start = fresh.len() as u32;
+                let r = entry.name;
+                fresh.extend_from_slice(&bytes[r.start as usize..(r.start + r.len) as usize]);
+                StrRef { start, len: r.len }
+            });
+            entry.name = nr;
+        }
+
+        self.bytes = fresh;
+        before - self.bytes.len() as u64
+    }
+
+    /// Compacts the arena when churn has stranded enough dead bytes:
+    /// more than [`COMPACT_MIN_WASTE`] absolute AND more than half the
+    /// live content. Called after every watcher batch — the comparison
+    /// is two integers, the rebuild is rare and bounded.
+    pub(crate) fn maybe_compact_arena(&mut self) {
+        let len = self.bytes.len() as u64;
+        if len > self.interned_bytes + COMPACT_MIN_WASTE && len > self.interned_bytes * 3 / 2 {
+            let reclaimed = self.compact_arena();
+            log::info!(
+                "synso: arena compacted — {reclaimed} bytes reclaimed, now {} for {} live",
+                self.bytes.len(),
+                self.interned_bytes
+            );
+        }
+    }
+
     /// Per-structure memory breakdown (v1.1 Task 6 diagnostics): the
     /// estimated LIVE bytes each component of the hot index accounts
     /// for. Vecs are counted as `len × element size` (capacity overshoot
@@ -1027,7 +1095,7 @@ impl HotIndex {
     /// high water" at a glance in the memlog output.
     pub fn mem_breakdown(&self) -> MemBreakdown {
         let slots = self.ids.len() as u64;
-        let arena_bytes = self.bytes.len() as u64;
+        let arena_bytes = self.arena_len();
         // Four arena-reference columns (lower/orig/pinyin full/init).
         let slot_refs_bytes = slots * 4 * std::mem::size_of::<StrRef>() as u64;
         // Scalar columns: logical_bytes, ids, parents, sizes, mtimes,
@@ -1545,5 +1613,67 @@ mod tests {
                 + b.dir_index_bytes
                 + b.exts_bytes
         );
+    }
+
+    /// The arena compaction contract (v1.2 memory fix): churn leaves the
+    /// arena append-only — upserts append, removals leave holes — and on
+    /// an all-day instance 112MB of content was observed ballooned to
+    /// 1.78GB. `compact_arena` must rebuild the buffer with ONLY the
+    /// bytes live refs point at (aliasing preserved), remap every ref,
+    /// and leave every survivor fully functional.
+    #[test]
+    fn compact_arena_reclaims_holes_and_keeps_lookups_alive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
+
+        // Fill, then churn: upsert a wave of files, remove most of them,
+        // upsert another wave. Every removed name's bytes stay in the
+        // arena as holes.
+        fn upsert(store: &mut Store, dir: &str, name: &str, id: u8) {
+            let mut r = rec(name, false);
+            r.name = format!("{name}{id}");
+            store.upsert_file(&[dir], &mut r).unwrap();
+        }
+        for i in 0..50u8 {
+            upsert(&mut store, "docs", "keep", i);
+            upsert(&mut store, "docs", "drop", i);
+        }
+        let mut hot = HotIndex::load(&store).unwrap();
+        for i in 0..50u8 {
+            hot.remove_by_dir_name(&["docs"], &format!("drop{i}"))
+                .expect("each drop row removes");
+        }
+        let live_interned = hot.interned_bytes();
+        // Two holes per removed name (lower + original); the arena must
+        // currently exceed the logical content.
+        let holed = hot.arena_len();
+        assert!(
+            holed > live_interned,
+            "churn must leave holes: arena {holed} > interned {live_interned}"
+        );
+
+        let reclaimed = hot.compact_arena();
+        assert!(reclaimed > 0, "compaction reclaims the holes");
+        let compact = hot.arena_len();
+        assert!(
+            compact <= live_interned + 1024,
+            "compacted arena {compact} must match live content {live_interned} (±alias bookkeeping)"
+        );
+
+        // Every survivor still resolves end to end: name lookups, the
+        // original-case spelling, pinyin keys, and slot-by-id.
+        for i in 0..50u8 {
+            let name = format!("keep{i}");
+            let key = (
+                hot.dir_child(None, "docs").expect("docs still interned"),
+                name_hash(&name),
+            );
+            let &slot = hot
+                .slot_by_parent_name
+                .get(&key)
+                .unwrap_or_else(|| panic!("{name} must resolve after compaction"));
+            assert!(hot.name_original(slot).ends_with(&name));
+            assert_eq!(hot.name_lower(slot), name);
+        }
     }
 }

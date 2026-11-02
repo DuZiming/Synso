@@ -734,6 +734,9 @@ impl Engine {
                 watcher::remove_path(&mut store, &mut hot, &segments, &entry.name, &entry.abs);
                 deleted += 1;
             }
+            // Trash deletions strand arena bytes like any other churn —
+            // the same compaction check the watcher's batches run.
+            hot.maybe_compact_arena();
         }
         Ok(deleted)
     }

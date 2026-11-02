@@ -502,6 +502,10 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
                 }
             }
         }
+        // Churn check: the arena is append-only, so a busy day strands
+        // dead bytes until compaction (user-observed 112MB ballooning to
+        // 1.78GB). Two integer compares per batch; the rebuild is rare.
+        hot.maybe_compact_arena();
     }
     pending.clear();
     if applied > 0 {
