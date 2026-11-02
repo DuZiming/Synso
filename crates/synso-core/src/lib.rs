@@ -75,6 +75,7 @@ pub(crate) mod scanner;
 pub(crate) mod settings;
 pub(crate) mod sizeagg;
 pub(crate) mod store;
+pub(crate) mod tiers;
 pub(crate) mod trash;
 pub(crate) mod volumes;
 pub(crate) mod watcher;
