@@ -18,6 +18,28 @@ export interface Settings {
   volumes: string[];
   shortcut: string;
   first_run_done: boolean;
+  // v1.2 memory policy (live-appliable; defaults in the engine).
+  mem_hot_budget_mb: number;
+  mem_staging_budget_mb: number;
+  mem_staging_ttl_secs: number;
+  mem_promote_hits: number;
+  mem_promote_window_min: number;
+  mem_hot_threshold: number;
+  mem_decay_half_life_h: number;
+  mem_preload_on_start: boolean;
+}
+
+/// Mirror of `synso_core::TierStats` (the settings dashboard's gauges).
+export interface TierStats {
+  hot_bytes: number;
+  hot_entries: number;
+  hot_hits: number;
+  hot_misses: number;
+  staging_bytes: number;
+  staging_entries: number;
+  staging_hits: number;
+  evictions: number;
+  promotions: number;
 }
 
 /// Mirror of `synso_core::VolumeInfo`.

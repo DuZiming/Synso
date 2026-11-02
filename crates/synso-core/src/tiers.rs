@@ -66,6 +66,7 @@ impl Default for MemoryPolicy {
 
 /// Observability snapshot for the settings dashboard and the memlog line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TierStats {
     pub hot_bytes: u64,
     pub hot_entries: u64,

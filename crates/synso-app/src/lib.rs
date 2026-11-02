@@ -135,6 +135,7 @@ pub fn run() {
             commands::engine_stats,
             commands::start_full_scan,
             commands::settings_get,
+            commands::tier_stats,
             commands::settings_set,
             commands::set_shortcut,
             commands::autostart_set,

@@ -30,6 +30,7 @@
     settingsGet,
     settingsSet,
     startFullScan,
+    tierStats,
   } from "../lib/tauri";
   import {
     parseExclusions,
@@ -37,7 +38,8 @@
     volumesChecked,
     volumesSavedWithCustoms,
   } from "../lib/settings";
-  import type { Settings, VolumeInfo } from "../lib/types";
+  import { humanBytes } from "../lib/format";
+  import type { Settings, TierStats, VolumeInfo } from "../lib/types";
 
   const langOptions = ["auto", "zh", "en"] as const;
 
@@ -78,6 +80,67 @@
 
   const checkedCount = $derived(volumes.filter((v) => checked[v.path]).length);
   const anyScope = $derived(checkedCount > 0 || customRoots.length > 0);
+
+  // v1.2 memory policy: drafts over `base`, applied LIVE through the
+  // normal settings_set flow (engine evicts to the new budgets at once).
+  let memDraft = $state({
+    hot: 64,
+    staging: 32,
+    ttl: 300,
+    hits: 3,
+    window: 10,
+    threshold: 8,
+    decay: 24,
+    preload: true,
+  });
+  let memBusy = $state(false);
+  let memSavedAt = $state<number | null>(null);
+  /** Gauges, polled while the section renders. */
+  let gauges = $state<TierStats | null>(null);
+  let gaugeTimer: ReturnType<typeof setInterval> | undefined;
+
+  const hotRate = $derived.by(() => {
+    const g = gauges;
+    if (!g || g.hot_hits + g.hot_misses === 0) return "—";
+    return `${Math.round((g.hot_hits / (g.hot_hits + g.hot_misses)) * 100)}%`;
+  });
+
+  async function applyMemory(): Promise<void> {
+    if (!base || memBusy) return;
+    memBusy = true;
+    const next: Settings = {
+      ...base,
+      mem_hot_budget_mb: memDraft.hot,
+      mem_staging_budget_mb: memDraft.staging,
+      mem_staging_ttl_secs: memDraft.ttl,
+      mem_promote_hits: memDraft.hits,
+      mem_promote_window_min: memDraft.window,
+      mem_hot_threshold: memDraft.threshold,
+      mem_decay_half_life_h: memDraft.decay,
+      mem_preload_on_start: memDraft.preload,
+    };
+    try {
+      await settingsSet(next);
+      base = next;
+      memSavedAt = Date.now();
+    } catch {
+      /* errors keep the previous policy; the toast pattern is overkill here */
+    }
+    memBusy = false;
+  }
+
+  function syncMemDraft(s: Settings): void {
+    memDraft = {
+      hot: s.mem_hot_budget_mb,
+      staging: s.mem_staging_budget_mb,
+      ttl: s.mem_staging_ttl_secs,
+      hits: s.mem_promote_hits,
+      window: s.mem_promote_window_min,
+      threshold: s.mem_hot_threshold,
+      decay: s.mem_decay_half_life_h,
+      preload: s.mem_preload_on_start,
+    };
+  }
 
   function gb(bytes: number): string {
     return (bytes / 2 ** 30).toFixed(1);
@@ -164,8 +227,16 @@
       volumes = list;
       checked = volumesChecked(list, settings.volumes);
       customRoots = customRootsOf(settings.volumes, list);
+      syncMemDraft(settings);
       loaded = true;
     })();
+
+    // Tier gauges: poll while the section is mounted.
+    void tierStats().then((g) => (gauges = g)).catch(() => {});
+    gaugeTimer = setInterval(() => {
+      void tierStats().then((g) => (gauges = g)).catch(() => {});
+    }, 5000);
+    return () => clearInterval(gaugeTimer);
   });
 </script>
 
@@ -314,6 +385,102 @@
         <p class="hint" role="status">{$t("settings.rescanStarted")}</p>
       {/if}
     </section>
+
+    <!-- v1.2: the memory policy — every knob live-appliable, with the
+         tier gauges beside it for immediate feedback. -->
+    <section class="step">
+      <h2>{$t("settings.memTitle")}</h2>
+      <p class="hint">{$t("settings.memHint")}</p>
+
+      <div class="mem-grid">
+        <label>
+          {$t("settings.memHotBudget")}
+          <input
+            type="number" min="8" max="1024" step="8"
+            bind:value={memDraft.hot}
+          />
+          MB
+        </label>
+        <label>
+          {$t("settings.memStagingBudget")}
+          <input
+            type="number" min="8" max="512" step="8"
+            bind:value={memDraft.staging}
+          />
+          MB
+        </label>
+        <label>
+          {$t("settings.memTtl")}
+          <input
+            type="number" min="30" max="3600" step="30"
+            bind:value={memDraft.ttl}
+          />
+          s
+        </label>
+        <label>
+          {$t("settings.memPromoteHits")}
+          <input
+            type="number" min="1" max="10"
+            bind:value={memDraft.hits}
+          />
+        </label>
+        <label>
+          {$t("settings.memPromoteWindow")}
+          <input
+            type="number" min="1" max="120"
+            bind:value={memDraft.window}
+          />
+          min
+        </label>
+        <label>
+          {$t("settings.memHotThreshold")}
+          <input
+            type="number" min="1" max="100"
+            bind:value={memDraft.threshold}
+          />
+        </label>
+        <label>
+          {$t("settings.memDecay")}
+          <input
+            type="number" min="1" max="168"
+            bind:value={memDraft.decay}
+          />
+          h
+        </label>
+        <label class="mem-toggle">
+          <input type="checkbox" bind:checked={memDraft.preload} />
+          {$t("settings.memPreload")}
+        </label>
+      </div>
+
+      <p>
+        <button class="primary" disabled={memBusy} onclick={() => void applyMemory()}>
+          {$t("settings.memApply")}
+        </button>
+        {#if memSavedAt}
+          <span class="ok">{$t("settings.memApplied")}</span>
+        {/if}
+      </p>
+
+      {#if gauges}
+        <div class="gauges" aria-label={$t("settings.memGauges")}>
+          <span>
+            {$t("settings.memHot")}
+            {humanBytes(gauges.hot_bytes)} · {gauges.hot_entries}
+            {$t("settings.memEntries")} · {$t("settings.memHitRate")} {hotRate}
+          </span>
+          <span>
+            {$t("settings.memStaging")}
+            {humanBytes(gauges.staging_bytes)} · {gauges.staging_entries}
+            {$t("settings.memEntries")}
+          </span>
+          <span>
+            {$t("settings.memEvictions")} {gauges.evictions} ·
+            {$t("settings.memPromotions")} {gauges.promotions}
+          </span>
+        </div>
+      {/if}
+    </section>
   {/if}
 </main>
 
@@ -347,5 +514,42 @@
     gap: 10px;
     flex-wrap: wrap;
     overflow-wrap: anywhere;
+  }
+
+  .mem-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+    gap: 10px 18px;
+    margin: 12px 0;
+  }
+
+  .mem-grid label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+  }
+
+  .mem-grid input[type="number"] {
+    width: 76px;
+    font: inherit;
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+  }
+
+  .mem-toggle input {
+    margin: 0;
+  }
+
+  .gauges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    font-size: 12px;
+    opacity: 0.8;
+    margin-top: 10px;
   }
 </style>

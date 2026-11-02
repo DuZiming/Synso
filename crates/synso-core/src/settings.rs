@@ -51,6 +51,25 @@ pub struct Settings {
     /// The first-run wizard has completed: the app opens on the dashboard
     /// instead of the wizard (the wizard writes `true` on its final step).
     pub first_run_done: bool,
+    // ---- v1.2 memory policy (all live-appliable; defaults = design doc) ----
+    /// Hot-tier value budget in MiB (dimension data only, never the
+    /// search core).
+    pub mem_hot_budget_mb: u32,
+    /// Staging-tier value budget in MiB.
+    pub mem_staging_budget_mb: u32,
+    /// Staging TTL in seconds (no-hit expiry).
+    pub mem_staging_ttl_secs: u32,
+    /// Hits inside `mem_promote_window_min` that keep an entry alive and
+    /// building heat.
+    pub mem_promote_hits: u32,
+    /// The promotion window in minutes.
+    pub mem_promote_window_min: u32,
+    /// Decayed hit count needed for staging → hot.
+    pub mem_hot_threshold: u32,
+    /// Heat half-life in hours.
+    pub mem_decay_half_life_h: u32,
+    /// Preload the hot tier from persisted heat at startup / after scans.
+    pub mem_preload_on_start: bool,
 }
 
 impl Default for Settings {
@@ -62,6 +81,34 @@ impl Default for Settings {
             volumes: Vec::new(),
             shortcut: DEFAULT_SHORTCUT.to_owned(),
             first_run_done: false,
+            mem_hot_budget_mb: 64,
+            mem_staging_budget_mb: 32,
+            mem_staging_ttl_secs: 300,
+            mem_promote_hits: 3,
+            mem_promote_window_min: 10,
+            mem_hot_threshold: 8,
+            mem_decay_half_life_h: 24,
+            mem_preload_on_start: true,
+        }
+    }
+}
+
+impl Settings {
+    /// The memory policy these settings spell (the tier cache's knobs).
+    pub fn memory_policy(&self) -> crate::tiers::MemoryPolicy {
+        crate::tiers::MemoryPolicy {
+            hot_budget_bytes: self.mem_hot_budget_mb as u64 * 1024 * 1024,
+            staging_budget_bytes: self.mem_staging_budget_mb as u64 * 1024 * 1024,
+            staging_ttl: std::time::Duration::from_secs(self.mem_staging_ttl_secs.max(1) as u64),
+            promote_hits: self.mem_promote_hits.max(1),
+            promote_window: std::time::Duration::from_secs(
+                self.mem_promote_window_min.max(1) as u64 * 60,
+            ),
+            hot_threshold: self.mem_hot_threshold,
+            decay_half_life: std::time::Duration::from_secs(
+                self.mem_decay_half_life_h.max(1) as u64 * 3600,
+            ),
+            preload_on_start: self.mem_preload_on_start,
         }
     }
 }
@@ -89,6 +136,34 @@ pub fn load(store: &Store) -> Settings {
                 _ => None,
             })
             .unwrap_or(false),
+        mem_hot_budget_mb: read(store, "mem_hot_budget_mb")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64),
+        mem_staging_budget_mb: read(store, "mem_staging_budget_mb")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(32),
+        mem_staging_ttl_secs: read(store, "mem_staging_ttl_secs")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300),
+        mem_promote_hits: read(store, "mem_promote_hits")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3),
+        mem_promote_window_min: read(store, "mem_promote_window_min")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10),
+        mem_hot_threshold: read(store, "mem_hot_threshold")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8),
+        mem_decay_half_life_h: read(store, "mem_decay_half_life_h")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(24),
+        mem_preload_on_start: read(store, "mem_preload_on_start")
+            .and_then(|v| match v.as_str() {
+                "0" => Some(false),
+                "1" => Some(true),
+                _ => None,
+            })
+            .unwrap_or(true),
     }
 }
 
@@ -119,6 +194,42 @@ pub fn save(store: &Store, settings: &Settings) -> Result<()> {
     store.set_meta(
         &format!("{KEY_PREFIX}first_run_done"),
         if settings.first_run_done { "1" } else { "0" },
+    )?;
+    store.set_meta(
+        &format!("{KEY_PREFIX}mem_hot_budget_mb"),
+        &settings.mem_hot_budget_mb.to_string(),
+    )?;
+    store.set_meta(
+        &format!("{KEY_PREFIX}mem_staging_budget_mb"),
+        &settings.mem_staging_budget_mb.to_string(),
+    )?;
+    store.set_meta(
+        &format!("{KEY_PREFIX}mem_staging_ttl_secs"),
+        &settings.mem_staging_ttl_secs.to_string(),
+    )?;
+    store.set_meta(
+        &format!("{KEY_PREFIX}mem_promote_hits"),
+        &settings.mem_promote_hits.to_string(),
+    )?;
+    store.set_meta(
+        &format!("{KEY_PREFIX}mem_promote_window_min"),
+        &settings.mem_promote_window_min.to_string(),
+    )?;
+    store.set_meta(
+        &format!("{KEY_PREFIX}mem_hot_threshold"),
+        &settings.mem_hot_threshold.to_string(),
+    )?;
+    store.set_meta(
+        &format!("{KEY_PREFIX}mem_decay_half_life_h"),
+        &settings.mem_decay_half_life_h.to_string(),
+    )?;
+    store.set_meta(
+        &format!("{KEY_PREFIX}mem_preload_on_start"),
+        if settings.mem_preload_on_start {
+            "1"
+        } else {
+            "0"
+        },
     )?;
     Ok(())
 }
@@ -182,14 +293,18 @@ mod tests {
         assert!(!first.settings().first_run_done);
 
         // Save a modified set.
-        let modified = Settings {
+        let mut modified = Settings {
             lang: "zh".to_owned(),
             autostart: false,
             exclusions: vec!["*.tmp".to_owned(), "**/node_modules/**".to_owned()],
             volumes: vec!["C:\\".to_owned()],
             shortcut: "Ctrl+Alt+S".to_owned(),
             first_run_done: true,
+            ..Settings::default()
         };
+        modified.mem_hot_budget_mb = 128;
+        modified.mem_staging_ttl_secs = 60;
+        modified.mem_preload_on_start = false;
         first.set_settings(&modified).unwrap();
         assert_eq!(first.settings(), modified, "read-back after save");
 

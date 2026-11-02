@@ -46,6 +46,15 @@ pub async fn settings_get(state: State<'_, AppState>) -> Result<Settings, String
     Ok(state.engine.settings())
 }
 
+/// The dimension tiers' observability snapshot (v1.2 settings
+/// dashboard): sizes, hit counts, evictions, promotions. Cheap (a copy
+/// of counters) — the dashboard polls it.
+// Sync is safe: one small-mutex read, no engine locks.
+#[tauri::command]
+pub fn tier_stats(state: State<'_, AppState>) -> synso_core::TierStats {
+    state.engine.tier_stats()
+}
+
 /// Persists the user settings; errors surface to the webview as a string.
 /// Two live side effects:
 /// - a changed index scope (volumes/exclusions) is applied to the ENGINE

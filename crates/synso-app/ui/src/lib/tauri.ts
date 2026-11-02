@@ -12,6 +12,7 @@ import type {
   SearchResult,
   Settings,
   SizeNode,
+  TierStats,
   VolumeInfo,
   VolumeOverlay,
 } from "./types";
@@ -30,6 +31,11 @@ export function settingsGet(): Promise<Settings> {
 
 export function settingsSet(settings: Settings): Promise<void> {
   return invoke("settings_set", { settings });
+}
+
+/** The dimension tiers' gauges (v1.2 memory dashboard). */
+export function tierStats(): Promise<TierStats> {
+  return invoke("tier_stats");
 }
 
 export function listVolumes(): Promise<VolumeInfo[]> {

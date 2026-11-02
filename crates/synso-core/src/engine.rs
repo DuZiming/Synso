@@ -265,8 +265,8 @@ impl Engine {
             db_path: db_path.to_path_buf(),
             watcher: Mutex::new(None),
             dedup,
-            settings_cache: Mutex::new(initial_settings),
-            tiers: Arc::new(Mutex::new(TierCache::new(tiers::MemoryPolicy::default()))),
+            settings_cache: Mutex::new(initial_settings.clone()),
+            tiers: Arc::new(Mutex::new(TierCache::new(initial_settings.memory_policy()))),
             cold: std::sync::Mutex::new(ColdReader::open(db_path)?),
         };
         if let Err(err) = thread::Builder::new()
@@ -638,6 +638,9 @@ impl Engine {
     pub fn set_settings(&self, settings: &Settings) -> Result<()> {
         settings::save(&lock_unpoisoned(&self.store), settings)?;
         *lock_unpoisoned(&self.settings_cache) = settings.clone();
+        // The memory policy is live-appliable — new budgets evict to size
+        // immediately (v1.2 settings UI path).
+        lock_unpoisoned(&self.tiers).set_policy(settings.memory_policy());
         Ok(())
     }
 
@@ -2420,6 +2423,40 @@ mod tests {
     /// in one step: the next `settings()` sees the new value without a
     /// store round-trip, and a fresh `Engine::open` over the same database
     /// reads it back from disk (cache and store never disagree).
+    /// set_settings carries the memory policy live: a shrunken hot
+    /// budget evicts to size immediately, no restart (v1.2 settings UI).
+    #[test]
+    fn policy_live_apply_through_set_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+
+        let engine = open_engine(&db_path, &root);
+        // Defaults from a fresh DB.
+        assert_eq!(
+            lock_unpoisoned(&engine.tiers).policy().hot_budget_bytes,
+            64 * 1024 * 1024
+        );
+        // Shrink through the normal settings flow.
+        let mut s = engine.settings();
+        s.mem_hot_budget_mb = 8;
+        engine.set_settings(&s).unwrap();
+        assert_eq!(
+            lock_unpoisoned(&engine.tiers).policy().hot_budget_bytes,
+            8 * 1024 * 1024,
+            "set_settings applies the policy without a restart"
+        );
+        // And it persists: a fresh engine over the same DB reads it back.
+        drop(engine);
+        let reopened = Engine::open(&db_path, EngineOptions::default()).unwrap();
+        assert_eq!(
+            lock_unpoisoned(&reopened.tiers).policy().hot_budget_bytes,
+            8 * 1024 * 1024
+        );
+    }
+
     #[test]
     fn set_settings_roundtrip_cache_and_persist() {
         let tmp = tempfile::tempdir().unwrap();
