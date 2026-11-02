@@ -36,7 +36,7 @@ use std::path::MAIN_SEPARATOR;
 
 use crate::model::{FileId, FileRecord};
 use crate::store::Store;
-use crate::Result;
+use crate::{Result, SynsoError};
 
 /// A string's location in the shared byte arena.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -209,6 +209,25 @@ pub struct MemBreakdown {
 /// capacity × (key + value) bytes — the live-entry estimate the breakdown
 /// uses for hash maps (allocator headers and control bytes excluded by
 /// design).
+/// Narrowing guards for the compact columns (Task 5): our own upserts
+/// only ever produce dense rowids far below u32::MAX, so a value that
+/// does not fit means a foreign/edited database — refuse it.
+fn narrow_id(id: FileId) -> Result<u32> {
+    u32::try_from(id).map_err(|_| {
+        SynsoError::BadQuery(format!(
+            "row id {id} exceeds u32 — the compact hot index cannot hold it"
+        ))
+    })
+}
+
+fn narrow_ext(ext: i64) -> Result<i32> {
+    i32::try_from(ext).map_err(|_| {
+        SynsoError::BadQuery(format!(
+            "extension id {ext} exceeds i32 — the compact hot index cannot hold it"
+        ))
+    })
+}
+
 fn est_map<K, V>(m: &HashMap<K, V>) -> u64 {
     m.capacity() as u64 * (std::mem::size_of::<K>() + std::mem::size_of::<V>()) as u64
 }
@@ -253,17 +272,20 @@ pub struct HotIndex {
     /// pinyin), kept so `interned_bytes` stays exact through incremental
     /// updates without re-measuring refs.
     logical_bytes: Vec<u32>,
-    /// `files` row id per slot (search hits expose the store id, which
-    /// later tasks key on; the slot index itself is internal).
-    ids: Vec<FileId>,
-    /// Containing directory's `dirs` row id per slot.
-    parents: Vec<FileId>,
+    /// `files` row id per slot (u32: SQLite rowids from our own upserts
+    /// are dense and far below u32::MAX — the load guard rejects any
+    /// database that violates that; see [`HotIndex::load`]). Search hits
+    /// widen back to [`FileId`] at the accessor.
+    ids: Vec<u32>,
+    /// Containing directory's `dirs` row id per slot (u32, same guard).
+    parents: Vec<u32>,
     /// File size in bytes per slot (0 for directory entries).
     sizes: Vec<u64>,
     /// mtime in Unix-epoch seconds per slot.
     mtimes: Vec<i64>,
-    /// Interned extension id per slot (0 = no extension).
-    ext_ids: Vec<i64>,
+    /// Interned extension id per slot (0 = no extension; i32 — the
+    /// extensions table is tiny).
+    ext_ids: Vec<i32>,
     /// Extension text per ext id, loaded from the `extensions` table
     /// (`Hit.ext`); ext id 0 (no extension) has no row.
     exts: HashMap<FileId, String>,
@@ -358,7 +380,7 @@ impl HotIndex {
             if let Some(parent) = parent {
                 let rec = synthetic_record(*next_file_id, parent, name, 0, 0, 0, true);
                 *next_file_id += 1;
-                hot.push(rec);
+                hot.push(rec).expect("synthetic ids fit u32");
             }
             file_dirs.push(id);
             id
@@ -418,7 +440,7 @@ impl HotIndex {
                 false,
             );
             next_file_id += 1;
-            hot.push(rec);
+            hot.push(rec).expect("synthetic ids fit u32");
         }
         hot
     }
@@ -465,7 +487,7 @@ impl HotIndex {
             index.exts.insert(id, ext);
         }
         for rec in store.all_files()? {
-            index.push(rec);
+            index.push(rec)?;
         }
         Ok(index)
     }
@@ -474,7 +496,11 @@ impl HotIndex {
     /// indexes (whole-table load and incremental watcher pushes).
     /// Pinyin keys equal to the lowercased name (every pure-ASCII name)
     /// alias the name's ref — no second copy in the arena.
-    fn push(&mut self, rec: FileRecord) {
+    ///
+    /// Errors only on the compact-column guards: a row id, dir id or
+    /// extension id beyond its narrowed type means the database predates
+    /// or bypassed our own upserts — refusing beats wrapping.
+    fn push(&mut self, rec: FileRecord) -> Result<()> {
         let lower = rec.name.to_lowercase();
         let lower_ref = self.put(&lower);
         let orig_ref = self.put(&rec.name);
@@ -515,12 +541,13 @@ impl HotIndex {
         self.py_full_refs.push(py_full_ref);
         self.py_init_refs.push(py_init_ref);
         self.logical_bytes.push(logical as u32);
-        self.ids.push(rec.id);
-        self.parents.push(rec.parent);
+        self.ids.push(narrow_id(rec.id)?);
+        self.parents.push(narrow_id(rec.parent)?);
         self.sizes.push(rec.size);
         self.mtimes.push(rec.mtime);
-        self.ext_ids.push(rec.ext_id);
+        self.ext_ids.push(narrow_ext(rec.ext_id)?);
         self.is_dirs.push(rec.is_dir);
+        Ok(())
     }
 
     /// Incremental upsert (watcher path, Task 8). `rec` must come straight
@@ -554,9 +581,9 @@ impl HotIndex {
             }
         }
         if let Some(&slot) = self.slot_by_id.get(&rec.id) {
-            self.update_slot(slot, rec);
+            self.update_slot(slot, rec)?;
         } else {
-            self.push(rec.clone());
+            self.push(rec.clone())?;
         }
         Ok(())
     }
@@ -565,7 +592,7 @@ impl HotIndex {
     /// counters, byte budget and secondary indexes coherent. New strings
     /// are APPENDED to the arena (the old bytes become unreachable until
     /// the next wholesale reload compacts them — bounded by rename churn).
-    fn update_slot(&mut self, slot: usize, rec: &FileRecord) {
+    fn update_slot(&mut self, slot: usize, rec: &FileRecord) -> Result<()> {
         let lower = rec.name.to_lowercase();
         let lower_ref = self.put(&lower);
         let orig_ref = self.put(&rec.name);
@@ -606,7 +633,7 @@ impl HotIndex {
             }
         }
         let old_key = (
-            self.parents[slot],
+            self.parents[slot] as FileId,
             name_hash(self.str_of(self.orig_refs[slot])),
         );
         self.lower_refs[slot] = lower_ref;
@@ -616,13 +643,14 @@ impl HotIndex {
         self.logical_bytes[slot] = logical as u32;
         self.sizes[slot] = rec.size;
         self.mtimes[slot] = rec.mtime;
-        self.ext_ids[slot] = rec.ext_id;
-        self.parents[slot] = rec.parent;
+        self.ext_ids[slot] = narrow_ext(rec.ext_id)?;
+        self.parents[slot] = narrow_id(rec.parent)?;
         let new_key = (rec.parent, name_hash(&rec.name));
         if old_key != new_key {
             self.slot_by_parent_name.remove(&old_key);
         }
         self.slot_by_parent_name.insert(new_key, slot);
+        Ok(())
     }
 
     /// Incremental removal (watcher path, Task 8): deletes the slot whose
@@ -709,7 +737,7 @@ impl HotIndex {
         // keep their indices while higher ones are processed first.
         let doomed_set: HashSet<FileId> = doomed.iter().copied().collect();
         let mut victims: Vec<usize> = (0..self.parents.len())
-            .filter(|&slot| doomed_set.contains(&self.parents[slot]))
+            .filter(|&slot| doomed_set.contains(&(self.parents[slot] as FileId)))
             .collect();
         victims.sort_unstable_by(|a, b| b.cmp(a));
         for slot in victims {
@@ -737,10 +765,10 @@ impl HotIndex {
     /// budget and secondary index consistent — the last slot moves into the
     /// hole and its index entries are repointed. Returns the removed row id.
     fn remove_slot_at(&mut self, slot: usize) -> FileId {
-        let removed_id = self.ids[slot];
+        let removed_id = self.ids[slot] as FileId;
         let last = self.lower_refs.len() - 1;
         let key = (
-            self.parents[slot],
+            self.parents[slot] as FileId,
             name_hash(self.str_of(self.orig_refs[slot])),
         );
 
@@ -756,9 +784,9 @@ impl HotIndex {
         // Bookkeeping for the slot that moves into the hole (if any).
         let moved = if slot != last {
             Some((
-                self.ids[last],
+                self.ids[last] as FileId,
                 (
-                    self.parents[last],
+                    self.parents[last] as FileId,
                     name_hash(self.str_of(self.orig_refs[last])),
                 ),
             ))
@@ -832,7 +860,7 @@ impl HotIndex {
     /// The `files` row id of `slot`.
     #[inline]
     pub fn file_id(&self, slot: usize) -> FileId {
-        self.ids[slot]
+        self.ids[slot] as FileId
     }
 
     /// The slot whose `files` row id is `id` (O(1) reverse lookup), or
@@ -944,7 +972,7 @@ impl HotIndex {
     /// watcher batch can swap dir rows between passes).
     #[inline]
     pub(crate) fn path_len_memo(&self, memo: &mut HashMap<FileId, u64>, slot: usize) -> u64 {
-        self.orig_refs[slot].len as u64 + self.dir_chain_bytes(memo, self.parents[slot])
+        self.orig_refs[slot].len as u64 + self.dir_chain_bytes(memo, self.parents[slot] as FileId)
     }
 
     /// Total byte length of dir `id`'s reconstructed path — its own name
@@ -996,7 +1024,7 @@ impl HotIndex {
     /// store's API) terminates.
     fn walk_chain<'a, V: FnMut(&'a str)>(&'a self, slot: usize, mut visit: V) {
         let mut budget = self.dirs.len() + 1;
-        let mut current = self.parents[slot];
+        let mut current = self.parents[slot] as FileId;
         while budget > 0 {
             budget -= 1;
             let Some((parent, name)) = self.dir_row(current) else {
@@ -1101,13 +1129,13 @@ impl HotIndex {
         // Scalar columns: logical_bytes, ids, parents, sizes, mtimes,
         // ext_ids, is_dirs.
         let slot_cols_bytes = slots
-            * (std::mem::size_of::<u32>()
-                + std::mem::size_of::<FileId>()
-                + std::mem::size_of::<FileId>()
-                + std::mem::size_of::<u64>()
-                + std::mem::size_of::<i64>()
-                + std::mem::size_of::<i64>()
-                + std::mem::size_of::<bool>()) as u64;
+            * (std::mem::size_of::<u32>() // logical_bytes
+                + std::mem::size_of::<u32>() // ids (narrowed, Task 5)
+                + std::mem::size_of::<u32>() // parents (narrowed)
+                + std::mem::size_of::<u64>() // sizes
+                + std::mem::size_of::<i64>() // mtimes
+                + std::mem::size_of::<i32>() // ext_ids (narrowed)
+                + std::mem::size_of::<bool>()) as u64; // is_dirs
         let slot_by_id_bytes = est_map(&self.slot_by_id);
         let slot_by_parent_name_bytes = est_map(&self.slot_by_parent_name);
         let dir_tree_bytes = est_map(&self.dirs);
@@ -1179,7 +1207,7 @@ impl HotIndex {
     /// Containing directory's `dirs` row id of `slot`.
     #[inline]
     pub fn parent_dir(&self, slot: usize) -> FileId {
-        self.parents[slot]
+        self.parents[slot] as FileId
     }
 
     /// Size in bytes of `slot` (0 for directory entries).
@@ -1197,7 +1225,7 @@ impl HotIndex {
     /// Interned extension id of `slot` (0 = no extension).
     #[inline]
     pub fn ext_id(&self, slot: usize) -> i64 {
-        self.ext_ids[slot]
+        self.ext_ids[slot] as i64
     }
 
     /// Whether `slot` is a directory entry.
@@ -1675,5 +1703,38 @@ mod tests {
             assert!(hot.name_original(slot).ends_with(&name));
             assert_eq!(hot.name_lower(slot), name);
         }
+    }
+
+    /// The compact u32 columns cannot hold a row id beyond u32::MAX —
+    /// load must refuse such a database with an error, never panic or
+    /// silently wrap (Task 5 Review Focus: the narrowing guard).
+    #[test]
+    fn id_beyond_u32_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
+        // One sane row so the schema is exercised, then one poisoned row
+        // with a huge id straight through SQL (the store's own upsert
+        // never produces such ids — this simulates a foreign/edited DB).
+        let mut a = rec("a.txt", false);
+        store.upsert_file(&["docs"], &mut a).unwrap();
+        store
+            .conn_mut()
+            .execute(
+                "INSERT INTO files (id, dir, name, size, mtime, ctime, atime, ext_id, is_dir, scan_gen) \
+                 VALUES (4294967296, 1, 'poison.txt', 1, 1, 1, 1, 0, 0, 1)",
+                [],
+            )
+            .unwrap();
+        let err = HotIndex::load(&store);
+        assert!(
+            err.is_err(),
+            "a row id beyond u32::MAX must fail the load with an error"
+        );
+        // Without the poison the same database loads fine.
+        store
+            .conn_mut()
+            .execute("DELETE FROM files WHERE id = 4294967296", [])
+            .unwrap();
+        assert!(HotIndex::load(&store).is_ok());
     }
 }
