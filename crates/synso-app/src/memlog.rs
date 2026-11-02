@@ -66,6 +66,21 @@ pub fn spawn(engine: Arc<synso_core::Engine>) {
                     b.slots,
                     b.dir_rows,
                 );
+                // v1.2 tier line: the dimension caches next to the core,
+                // so a day's log tells the whole memory story at a glance.
+                let t = engine.tier_stats();
+                let hot_total = t.hot_hits + t.hot_misses;
+                let hot_pct = (t.hot_hits * 100).checked_div(hot_total).unwrap_or(0);
+                log::info!(
+                    "tiers: hot={}MB/{}条(hit {}%) staging={}MB/{}条 淘汰={} 晋升={}",
+                    t.hot_bytes as f64 / 1e6,
+                    t.hot_entries,
+                    hot_pct,
+                    t.staging_bytes as f64 / 1e6,
+                    t.staging_entries,
+                    t.evictions,
+                    t.promotions,
+                );
             }
         })
         .inspect_err(|err| log::warn!("synso: mem sampler failed to spawn: {err}"))
