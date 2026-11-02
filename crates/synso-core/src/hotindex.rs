@@ -246,8 +246,12 @@ pub struct HotIndex {
     /// lookups verify the arena bytes (see [`name_hash`]).
     dir_by_parent_name: HashMap<(Option<FileId>, u64), FileId>,
     /// Secondary index: `files` row id -> slot, for incremental upserts of
-    /// rows that already hold a slot (same id = update in place).
-    slot_by_id: HashMap<FileId, usize>,
+    /// rows that already hold a slot (same id = update in place). DENSE
+    /// direct-indexed array (Task 5 item 2): `slot_by_id[id] = slot + 1`,
+    /// 0 = hole — row ids from our own upserts are near-contiguous, so a
+    /// Vec answers in one cache line where the old HashMap spent 59MB on
+    /// 2.1M entries. Guarded by [`narrow_id`] (u32 ids).
+    slot_by_id: Vec<u32>,
     /// Secondary index: (containing dir id, name hash) -> slot, EXACT-case
     /// (see [`dir_by_parent_name`]), verified against the arena on read.
     slot_by_parent_name: HashMap<(FileId, u64), usize>,
@@ -533,7 +537,11 @@ impl HotIndex {
             self.file_count += 1;
         }
         let slot = self.lower_refs.len();
-        self.slot_by_id.insert(rec.id, slot);
+        let id32 = narrow_id(rec.id)?;
+        if (id32 as usize) >= self.slot_by_id.len() {
+            self.slot_by_id.resize(id32 as usize + 1, 0);
+        }
+        self.slot_by_id[id32 as usize] = (slot as u32) + 1;
         self.slot_by_parent_name
             .insert((rec.parent, name_hash(&rec.name)), slot);
         self.lower_refs.push(lower_ref);
@@ -580,7 +588,7 @@ impl HotIndex {
                 self.exts.insert(rec.ext_id, text);
             }
         }
-        if let Some(&slot) = self.slot_by_id.get(&rec.id) {
+        if let Some(slot) = self.slot_of_id(rec.id) {
             self.update_slot(slot, rec)?;
         } else {
             self.push(rec.clone())?;
@@ -817,10 +825,18 @@ impl HotIndex {
         self.is_dirs.swap(slot, last);
         self.is_dirs.pop();
 
-        self.slot_by_id.remove(&removed_id);
+        if let Ok(id32) = u32::try_from(removed_id) {
+            if (id32 as usize) < self.slot_by_id.len() {
+                self.slot_by_id[id32 as usize] = 0;
+            }
+        }
         self.slot_by_parent_name.remove(&key);
         if let Some((moved_id, moved_key)) = moved {
-            self.slot_by_id.insert(moved_id, slot);
+            if let Ok(id32) = u32::try_from(moved_id) {
+                if (id32 as usize) < self.slot_by_id.len() {
+                    self.slot_by_id[id32 as usize] = (slot as u32) + 1;
+                }
+            }
             self.slot_by_parent_name.insert(moved_key, slot);
         }
         removed_id
@@ -867,7 +883,12 @@ impl HotIndex {
     /// `None` when the row is not indexed. The dedup groups view (Task 9)
     /// materializes stored groups' members through this.
     pub fn slot_of_id(&self, id: FileId) -> Option<usize> {
-        self.slot_by_id.get(&id).copied()
+        let id32 = u32::try_from(id).ok()? as usize;
+        // slot+1 encoding: 0 = hole.
+        match *self.slot_by_id.get(id32)? {
+            0 => None,
+            encoded => Some(encoded as usize - 1),
+        }
     }
 
     /// Iterates every interned dir row as `(id, parent, name)` (`None`
@@ -1136,7 +1157,7 @@ impl HotIndex {
                 + std::mem::size_of::<i64>() // mtimes
                 + std::mem::size_of::<i32>() // ext_ids (narrowed)
                 + std::mem::size_of::<bool>()) as u64; // is_dirs
-        let slot_by_id_bytes = est_map(&self.slot_by_id);
+        let slot_by_id_bytes = self.slot_by_id.len() as u64 * std::mem::size_of::<u32>() as u64;
         let slot_by_parent_name_bytes = est_map(&self.slot_by_parent_name);
         let dir_tree_bytes = est_map(&self.dirs);
         let dir_index_bytes = est_map(&self.dir_by_parent_name);
@@ -1481,11 +1502,7 @@ mod tests {
         assert_eq!(hot.slot_count(), 2);
         assert_eq!(hot.dir_tree_len(), 2, "docs and docs/inner interned");
         assert!(hot.interned_bytes() > bytes_before);
-        let fresh_slot = hot
-            .slot_by_id
-            .get(&fresh.id)
-            .copied()
-            .expect("test may index");
+        let fresh_slot = hot.slot_of_id(fresh.id).expect("test may index");
         assert_eq!(
             hot.path_of(fresh_slot),
             format!("docs{sep}inner{sep}Fresh.TXT")
@@ -1502,7 +1519,7 @@ mod tests {
         hot.upsert_slot(&store, &updated).unwrap();
         assert_eq!(hot.file_count(), 2);
         assert_eq!(hot.slot_count(), 2);
-        assert_eq!(hot.size(hot.slot_by_id[&fresh.id]), 99);
+        assert_eq!(hot.size(hot.slot_of_id(fresh.id).unwrap()), 99);
 
         // Remove the file by its path spelling (case-insensitive): slot
         // gone, seed untouched, dir rows stay (still referenced).
@@ -1569,8 +1586,8 @@ mod tests {
         assert_eq!(hot.name_lower(0), "a.txt", "the sibling outside survives");
         assert_eq!(hot.dir_tree_len(), 1, "only docs remains interned");
         // The swept slots left no dangling index entries behind.
-        assert!(!hot.slot_by_id.contains_key(&b.id));
-        assert!(!hot.slot_by_id.contains_key(&c.id));
+        assert!(hot.slot_of_id(b.id).is_none());
+        assert!(hot.slot_of_id(c.id).is_none());
     }
 
     /// Swap-remove keeps the secondary indexes pointing at the right slots
@@ -1598,13 +1615,13 @@ mod tests {
         // Every remaining id resolves to a slot whose name matches, and
         // every remaining name resolves to a slot whose id matches.
         for (name, id) in [("a.txt", ids[0]), ("c.txt", ids[2]), ("d.txt", ids[3])] {
-            let slot = hot.slot_by_id[&id];
+            let slot = hot.slot_of_id(id).expect("survivor resolves");
             assert_eq!(hot.name_original(slot), name);
             assert_eq!(hot.file_id(slot), id);
             let key_slot = hot.slot_by_parent_name[&(hot.parent_dir(slot), name_hash(name))];
             assert_eq!(key_slot, slot);
         }
-        assert!(!hot.slot_by_id.contains_key(&ids[1]));
+        assert!(hot.slot_of_id(ids[1]).is_none());
     }
 
     /// The breakdown's invariants (v1.1 diagnostics): every component of
@@ -1736,5 +1753,50 @@ mod tests {
             .execute("DELETE FROM files WHERE id = 4294967296", [])
             .unwrap();
         assert!(HotIndex::load(&store).is_ok());
+    }
+
+    /// The dense slot_by_id (Task 5 item 2): row ids are near-contiguous,
+    /// so a direct-indexed Vec answers lookups — and holes (deleted ids)
+    /// must read as absent, exactly like the HashMap did.
+    #[test]
+    fn slot_by_id_dense_with_holes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
+        // ids 1..=10 with 3,5,9 deleted by hand (gaps that never re-fill
+        // until SQLite reuses them — the dense array must treat them as
+        // EMPTY, and a later upsert AT a reused id must repoint it).
+        let mut kept = Vec::new();
+        for i in 1..=10i64 {
+            let name = format!("f{i}.txt");
+            let mut r = rec(&name, false);
+            store.upsert_file(&["docs"], &mut r).unwrap();
+            kept.push(r.id);
+        }
+        for id in [kept[2], kept[4], kept[8]] {
+            store
+                .conn_mut()
+                .execute("DELETE FROM files WHERE id = ?1", [id])
+                .unwrap();
+        }
+        let mut hot = HotIndex::load(&store).unwrap();
+        for (i, id) in kept.iter().enumerate() {
+            let expected = !(i == 2 || i == 4 || i == 8);
+            assert_eq!(
+                hot.slot_of_id(*id).is_some(),
+                expected,
+                "id {id} (index {i}) presence must be {expected}"
+            );
+            if let Some(slot) = hot.slot_of_id(*id) {
+                assert_eq!(hot.file_id(slot), *id);
+            }
+        }
+        // A fresh upsert lands at its id even inside a hole region.
+        let mut again = rec("f3-reborn.txt", false);
+        store.upsert_file(&["docs"], &mut again).unwrap();
+        // (SQLite may or may not reuse id kept[2]; either way the lookup
+        // must agree with the push.)
+        hot.upsert_slot(&store, &again).unwrap();
+        let slot = hot.slot_of_id(again.id).expect("fresh upsert resolvable");
+        assert_eq!(hot.file_id(slot), again.id);
     }
 }
