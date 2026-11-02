@@ -164,16 +164,6 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
         }
     }
 
-    fn cms_estimate(&self, key: &K) -> u32 {
-        (0..CMS_ROWS)
-            .map(|row| {
-                let h = self.cms_hash(row, key);
-                self.cms[row][h % CMS_WIDTH] as u32
-            })
-            .min()
-            .unwrap_or(0)
-    }
-
     fn cms_hash(&self, row: usize, key: &K) -> usize {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -217,14 +207,18 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
 
     /// Records a hit: bumps the sketch, updates heat, applies the
     /// promotion rules. Returns the key's current decayed heat score.
+    /// Records a hit: bumps the global sketch, and updates heat ONLY for
+    /// keys already holding a Heat entry (staging/hot residents) — the
+    /// Heat map stays bounded by the tier budgets, never the access
+    /// stream (a day of millions of one-off keys creates nothing).
+    /// Returns the key's decayed score, 0 when it holds no entry.
     pub fn record_hit(&mut self, key: &K) -> u32 {
         let now = self.now();
         self.cms_bump(key);
         let policy = self.policy;
-        let heat = self
-            .heat
-            .entry(key.clone())
-            .or_insert_with(|| Heat::new(now));
+        let Some(heat) = self.heat.get_mut(key) else {
+            return 0;
+        };
         heat.decay(now, policy.decay_half_life);
         heat.record_hit();
         // Sliding promotion window: reset when the previous window aged
@@ -271,13 +265,14 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
     pub fn maybe_promote_to_hot(&mut self, key: &K, value: V, bytes: u64) -> bool {
         let now = self.now();
         let policy = self.policy;
-        let score = {
-            let heat = self
-                .heat
-                .entry(key.clone())
-                .or_insert_with(|| Heat::new(now));
-            heat.decay(now, policy.decay_half_life);
-            heat.score / 256
+        let score = match self.heat.get_mut(key) {
+            Some(heat) => {
+                heat.decay(now, policy.decay_half_life);
+                heat.score / 256
+            }
+            // No Heat entry = the key is not a tier resident (a cold
+            // key's score is 0 by definition — it cannot promote).
+            None => return false,
         };
         if score < self.policy.hot_threshold {
             return false;
@@ -384,7 +379,16 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
         for key in expired {
             if let Some((_, bytes, _)) = self.staging.remove(&key) {
                 self.stats.staging_bytes = self.stats.staging_bytes.saturating_sub(bytes);
+                self.drop_orphan_heat(&key);
             }
+        }
+    }
+
+    /// Removes the key's Heat bookkeeping once it holds residency in
+    /// neither tier — the Heat map stays bounded by the tier budgets.
+    fn drop_orphan_heat(&mut self, key: &K) {
+        if !self.hot.contains_key(key) && !self.staging.contains_key(key) {
+            self.heat.remove(key);
         }
     }
 
@@ -409,6 +413,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
             if let Some((_, bytes, _)) = self.staging.remove(&k) {
                 self.stats.staging_bytes = self.stats.staging_bytes.saturating_sub(bytes);
                 self.stats.evictions += 1;
+                self.drop_orphan_heat(&k);
             }
         }
     }
@@ -434,6 +439,7 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
             if let Some((_, bytes)) = self.hot.remove(&k) {
                 self.stats.hot_bytes = self.stats.hot_bytes.saturating_sub(bytes);
                 self.stats.evictions += 1;
+                self.drop_orphan_heat(&k);
             }
         }
     }
@@ -462,7 +468,7 @@ mod tests {
 
     #[test]
     fn tiers_capacity_never_exceeded_under_flood() {
-        let mut t0 = Instant::now();
+        let t0 = Instant::now();
         set_test_now(t0);
         let policy = MemoryPolicy {
             hot_budget_bytes: 1_000,
@@ -476,7 +482,8 @@ mod tests {
             c.put_staging(key.clone(), "v".repeat(200), 200);
         }
         assert!(c.stats().staging_bytes <= 1_000, "staging over budget");
-        // And through hot (threshold 0 so every entry qualifies).
+        // And through hot (threshold 0 so every RESIDENT qualifies —
+        // promotion requires tier residency, so stage each first).
         let policy0 = MemoryPolicy {
             hot_budget_bytes: 1_000,
             hot_threshold: 0,
@@ -486,6 +493,7 @@ mod tests {
         for i in 0..10 {
             let key = format!("h{i}");
             let v = "v".repeat(200);
+            c.put_staging(key.clone(), v.clone(), 200);
             assert!(c.maybe_promote_to_hot(&key, v, 200));
         }
         assert!(c.stats().hot_bytes <= 1_000, "hot over budget");
@@ -494,30 +502,37 @@ mod tests {
 
     #[test]
     fn promotion_cold_to_staging_to_hot() {
-        let mut t0 = Instant::now();
+        let t0 = Instant::now();
         set_test_now(t0);
-        let mut c = cache(MemoryPolicy::default());
-        // Three hits inside the window promote the key's heat enough to
-        // cross the (low) hot threshold in this configured cache.
+        // First access loads the value into STAGING (a displayed page
+        // needs its data — cold→staging is unconditional); repeated hits
+        // then build the heat that promotes it into the hot tier.
         let policy = MemoryPolicy {
             hot_threshold: 2,
             promote_hits: 3,
             ..MemoryPolicy::default()
         };
-        c.set_policy(policy);
+        let mut c = cache(policy);
+        c.put_staging("a".into(), "value".into(), 10);
         for _ in 0..3 {
             c.record_hit(&"a".to_string());
         }
         let promoted = c.maybe_promote_to_hot(&"a".to_string(), "value".to_string(), 10);
         assert!(promoted, "3 hits (score 3) cross threshold 2");
         assert!(c.get_hot(&"a".to_string()).is_some());
-        // A key with no hits does not promote.
-        assert!(!c.maybe_promote_to_hot(&"b".to_string(), "v".to_string(), 10));
+        // A key with no residency (pure cold) has no heat and cannot
+        // promote — and recording hits on it allocates nothing.
+        let before = c.stats();
+        for _ in 0..5 {
+            c.record_hit(&"stranger".to_string());
+        }
+        assert!(!c.maybe_promote_to_hot(&"stranger".to_string(), "v".to_string(), 10));
+        assert_eq!(c.stats().hot_entries, before.hot_entries);
     }
 
     #[test]
     fn ttl_expiry_returns_to_cold() {
-        let mut t0 = Instant::now();
+        let t0 = Instant::now();
         set_test_now(t0);
         let policy = MemoryPolicy {
             staging_ttl: Duration::from_secs(60),
@@ -535,7 +550,7 @@ mod tests {
 
     #[test]
     fn decay_demotes_yesterdays_hot() {
-        let mut t0 = Instant::now();
+        let t0 = Instant::now();
         set_test_now(t0);
         let policy = MemoryPolicy {
             hot_threshold: 4,
@@ -543,6 +558,7 @@ mod tests {
             ..MemoryPolicy::default()
         };
         let mut c = cache(policy);
+        c.put_staging("old".into(), "v".into(), 10);
         for _ in 0..8 {
             c.record_hit(&"old".to_string());
         }
@@ -555,7 +571,7 @@ mod tests {
 
     #[test]
     fn policy_live_apply_resizes_tiers() {
-        let mut t0 = Instant::now();
+        let t0 = Instant::now();
         set_test_now(t0);
         let mut c = cache(MemoryPolicy {
             hot_budget_bytes: 10_000,
@@ -579,7 +595,7 @@ mod tests {
 
     #[test]
     fn invalidate_drops_everywhere() {
-        let mut t0 = Instant::now();
+        let t0 = Instant::now();
         set_test_now(t0);
         let mut c = cache(MemoryPolicy {
             hot_threshold: 0,
