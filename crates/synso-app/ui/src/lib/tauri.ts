@@ -7,6 +7,7 @@ import type {
   DedupState,
   DupeGroup,
   EngineStats,
+  FileDetail,
   ParsedQuery,
   QuickInfo,
   SearchResult,
@@ -36,6 +37,11 @@ export function settingsSet(settings: Settings): Promise<void> {
 /** The dimension tiers' gauges (v1.2 memory dashboard). */
 export function tierStats(): Promise<TierStats> {
   return invoke("tier_stats");
+}
+
+/** One file's detail through the tier ladder (the pilot dimension). */
+export function fileDetail(id: number): Promise<FileDetail | null> {
+  return invoke("file_detail", { id });
 }
 
 export function listVolumes(): Promise<VolumeInfo[]> {

@@ -83,6 +83,10 @@ pub(crate) mod watcher;
 
 // The public facade: the ONLY surface embedders program against.
 pub use dedup::{DedupState, DupeGroup};
+/// The fixed local volumes, under the name the first-run wizard consumes
+/// (`Task 13` facade ruling): a thin re-export of
+/// [`crate::volumes::fixed_volumes`].
+pub use dimensions::FileDetail;
 pub use engine::{DedupPhase, Engine, EngineEvent, EngineOptions, EngineStats, VolumeOverlay};
 pub use hotindex::HotIndex;
 pub use model::{FileId, ParsedQuery};
@@ -90,9 +94,6 @@ pub use pinyin::pinyin_keys;
 pub use query::{parse_query, Hit, SearchResult};
 pub use settings::{load_persisted, Settings};
 pub use sizeagg::SizeNode;
-/// The fixed local volumes, under the name the first-run wizard consumes
-/// (`Task 13` facade ruling): a thin re-export of
-/// [`crate::volumes::fixed_volumes`].
 pub use tiers::{MemoryPolicy, TierCache, TierStats};
 pub use volumes::fixed_volumes as list_volumes;
 pub use volumes::VolumeInfo;

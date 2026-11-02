@@ -55,6 +55,17 @@ pub fn tier_stats(state: State<'_, AppState>) -> synso_core::TierStats {
     state.engine.tier_stats()
 }
 
+/// The pilot dimension consumer (v1.2 Task 4): one file's detail
+/// (ctime/atime/dedup-hash state) through the tier ladder — every open
+/// of the detail panel walks hot → staging → cold, which is exactly the
+/// traffic that feeds the hit-rate gauges.
+// Sync is safe: the ladder takes the small tiers mutex and (on a miss)
+// the read-only WAL connection — never the store mutex.
+#[tauri::command]
+pub fn file_detail(state: State<'_, AppState>, id: i64) -> Option<synso_core::FileDetail> {
+    state.engine.file_detail(id)
+}
+
 /// Persists the user settings; errors surface to the webview as a string.
 /// Two live side effects:
 /// - a changed index scope (volumes/exclusions) is applied to the ENGINE

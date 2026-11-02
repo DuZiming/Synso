@@ -42,6 +42,16 @@ export interface TierStats {
   promotions: number;
 }
 
+/// Mirror of `synso_core::FileDetail` (`file_detail`'s payload): the
+/// pilot dimension — per-file data the search core does not hold.
+export interface FileDetail {
+  id: number;
+  ctime: number | null;
+  atime: number | null;
+  hash_first: number | null;
+  hash_full: number | null;
+}
+
 /// Mirror of `synso_core::VolumeInfo`.
 export interface VolumeInfo {
   path: string;

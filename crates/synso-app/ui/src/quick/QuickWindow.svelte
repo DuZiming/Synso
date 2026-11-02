@@ -14,13 +14,14 @@
   import { formatTime, humanBytes } from "../lib/format";
   import {
     engineStats,
+    fileDetail,
     openPath,
     parsePreview,
     quickHide,
     revealPath,
     search,
   } from "../lib/tauri";
-  import type { Hit, ParsedQuery } from "../lib/types";
+  import type { FileDetail, Hit, ParsedQuery } from "../lib/types";
 
   /// Fixed row height — the pixel grid the windowing slices on (and the
   /// rows' CSS height; both sides must agree).
@@ -42,6 +43,24 @@
   let warming = $state(false);
   /// Last open/reveal failure (stays visible so the user can read it).
   let openError = $state<string | null>(null);
+
+  // ---- v1.2: the detail panel (pilot dimension consumer) ----
+  let detailOpen = $state(false);
+  let detail = $state<FileDetail | null>(null);
+  let detailLoading = $state(false);
+
+  // Re-fetch whenever the panel is open and the selection moves; every
+  // fetch walks the tier ladder — the gauges' hit-rate traffic.
+  $effect(() => {
+    if (!detailOpen) return;
+    const hit = hits[selected];
+    if (!hit) return;
+    detailLoading = true;
+    void fileDetail(hit.id)
+      .then((d) => (detail = d))
+      .catch(() => (detail = null))
+      .finally(() => (detailLoading = false));
+  });
 
   let listEl: HTMLDivElement | undefined = $state();
   let inputEl: HTMLInputElement | undefined = $state();
@@ -280,7 +299,46 @@
         <span class="muted">{total.toLocaleString()} {$t("quick.results")}</span>
       {/if}
       <span class="muted">{$t("quick.hints")}</span>
+      <!-- v1.2 pilot dimension consumer: the selected row's detail panel,
+           fetched through the tier ladder (hot → staging → disk). -->
+      {#if selected >= 0 && hits[selected]}
+        <button
+          class="ghost detail-btn"
+          onclick={() => (detailOpen = !detailOpen)}
+        >
+          {$t("quick.detail")}
+        </button>
+      {/if}
     </div>
+    {#if detailOpen && selected >= 0 && hits[selected]}
+      {@const sel = hits[selected]}
+      <div class="detail" role="region" aria-label={$t("quick.detail")}>
+        {#if detail}
+          <div class="detail-row">
+            <span class="muted">{$t("quick.detailCreated")}</span>
+            <span>{formatTime(detail.ctime ?? 0)}</span>
+          </div>
+          <div class="detail-row">
+            <span class="muted">{$t("quick.detailAccessed")}</span>
+            <span>{formatTime(detail.atime ?? 0)}</span>
+          </div>
+          <div class="detail-row">
+            <span class="muted">{$t("quick.detailHash")}</span>
+            <span>
+              {detail.hash_full
+                ? $t("quick.detailHashDone")
+                : detail.hash_first
+                  ? $t("quick.detailHashFirst")
+                  : $t("quick.detailHashNone")}
+            </span>
+          </div>
+        {:else if detailLoading}
+          <span class="muted">{$t("quick.detailLoading")}</span>
+        {:else}
+          <span class="muted">{$t("quick.detailMissing")}</span>
+        {/if}
+      </div>
+    {/if}
     <!-- Keyboard interaction lives on the window-level keydown handler
          (the input keeps focus), so the listbox itself needs no key
          handling; tabindex="-1" only marks it programmatically focusable. -->
@@ -410,6 +468,27 @@
     justify-content: space-between;
     gap: 12px;
     padding: 6px 12px;
+    font-size: 12px;
+  }
+
+  .detail {
+    flex-shrink: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 24px;
+    padding: 8px 12px;
+    border-top: 1px solid var(--border);
+    font-size: 12px;
+  }
+
+  .detail-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .detail-btn {
+    padding: 2px 10px;
     font-size: 12px;
   }
 
