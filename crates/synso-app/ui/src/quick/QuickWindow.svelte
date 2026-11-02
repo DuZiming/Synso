@@ -50,16 +50,34 @@
   let detailLoading = $state(false);
 
   // Re-fetch whenever the panel is open and the selection moves; every
-  // fetch walks the tier ladder — the gauges' hit-rate traffic.
+  // fetch walks the tier ladder — the gauges' hit-rate traffic. The
+  // previous row's values clear first (review fix #13): the panel must
+  // never show one file's times under another's selection while the
+  // fetch is in flight.
+  let detailShownId = $state<number | null>(null);
   $effect(() => {
     if (!detailOpen) return;
     const hit = hits[selected];
-    if (!hit) return;
+    if (!hit) {
+      detail = null;
+      detailShownId = null;
+      return;
+    }
+    if (detailShownId === hit.id) return; // already showing this row
+    detail = null;
+    detailShownId = hit.id;
     detailLoading = true;
-    void fileDetail(hit.id)
-      .then((d) => (detail = d))
-      .catch(() => (detail = null))
-      .finally(() => (detailLoading = false));
+    const wanted = hit.id;
+    void fileDetail(wanted)
+      .then((d) => {
+        if (detailShownId === wanted) detail = d;
+      })
+      .catch(() => {
+        if (detailShownId === wanted) detail = null;
+      })
+      .finally(() => {
+        if (detailShownId === wanted) detailLoading = false;
+      });
   });
 
   let listEl: HTMLDivElement | undefined = $state();

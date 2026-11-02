@@ -194,7 +194,7 @@ const en = {
     memPromoteWindow: "Promote window",
     memHotThreshold: "Hot threshold",
     memDecay: "Heat half-life",
-    memPreload: "Preload hot tier at startup",
+    memPreload: "Re-preheat the hot tier after rescans (persistent heat is a follow-up)",
     memApply: "Apply memory policy",
     memApplied: "Applied",
     memGauges: "Tier gauges",

@@ -184,7 +184,7 @@ const zh: Dict = {
     memPromoteWindow: "晋升窗口",
     memHotThreshold: "热区门槛",
     memDecay: "热度半衰期",
-    memPreload: "启动预热热区",
+    memPreload: "重扫后重预热热区（跨启动持久化热度为后续项）",
     memApply: "应用内存策略",
     memApplied: "已生效",
     memGauges: "三层仪表盘",

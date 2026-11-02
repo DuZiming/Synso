@@ -110,10 +110,12 @@ impl Heat {
         }
         // Halve for every full half-life; a partial half-life halves
         // proportionally (score is fixed-point x256 so this stays >0 for
-        // any realistic count until it truly rounds away).
+        // any realistic count until it truly rounds away). ROUND, never
+        // truncate: 256×(1−ε) truncating to 255 read as score 0 (the
+        // promotion gate bug caught by rescan_flushes_then_preheats).
         let halves = elapsed.as_secs_f64() / half_life.as_secs_f64();
         let factor = (0.5f64).powf(halves);
-        self.score = ((self.score as f64) * factor) as u32;
+        self.score = ((self.score as f64) * factor).round() as u32;
         self.at = now;
     }
 
@@ -186,6 +188,12 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
     }
 
     /// Staging lookup; an expired entry is dropped (cold again).
+    /// Staging lookup. A hit REFRESHES the TTL (a continuously-accessed
+    /// entry must not fall out mid-use — review fix #9) but does NOT
+    /// record heat: the ladders call [`TierCache::record_hit`] themselves,
+    /// and double-counting made promotion trigger at half the configured
+    /// threshold (review fix #4). An expired entry drops out (and its
+    /// orphan Heat bookkeeping with it — review fix #8).
     pub fn get_staging(&mut self, key: &K) -> Option<V> {
         let now = self.now();
         let expired = self
@@ -195,12 +203,15 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
         if expired {
             if let Some((_, bytes, _)) = self.staging.remove(key) {
                 self.stats.staging_bytes = self.stats.staging_bytes.saturating_sub(bytes);
+                self.drop_orphan_heat(key);
             }
         }
-        if self.staging.contains_key(key) {
-            self.record_hit(key);
+        if let Some((value, bytes, expires_at)) = self.staging.get_mut(key) {
             self.stats.staging_hits += 1;
-            self.staging.get(key).map(|(v, _, _)| v.clone())
+            let v = value.clone();
+            *expires_at = now + self.policy.staging_ttl; // TTL refresh on hit
+            let _ = bytes;
+            Some(v)
         } else {
             None
         }
@@ -266,16 +277,19 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
     pub fn maybe_promote_to_hot(&mut self, key: &K, value: V, bytes: u64) -> bool {
         let now = self.now();
         let policy = self.policy;
-        let score = match self.heat.get_mut(key) {
+        let (score, window_hits) = match self.heat.get_mut(key) {
             Some(heat) => {
                 heat.decay(now, policy.decay_half_life);
-                heat.score / 256
+                (heat.score / 256, heat.window_hits)
             }
             // No Heat entry = the key is not a tier resident (a cold
             // key's score is 0 by definition — it cannot promote).
             None => return false,
         };
-        if score < self.policy.hot_threshold {
+        // Burst gate (review fix #2): promotion needs BOTH the decayed
+        // score and ≥ promote_hits hits inside the promote window — the
+        // 晋升命中次数/晋升窗口 knobs the settings UI ships.
+        if score < self.policy.hot_threshold || window_hits < self.policy.promote_hits {
             return false;
         }
         while self.stats.hot_bytes + bytes > self.policy.hot_budget_bytes && !self.hot.is_empty() {
@@ -305,14 +319,15 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
     pub fn promote_from_staging(&mut self, key: &K) -> bool {
         let now = self.now();
         let policy = self.policy;
-        let score = match self.heat.get_mut(key) {
+        let (score, window_hits) = match self.heat.get_mut(key) {
             Some(heat) => {
                 heat.decay(now, policy.decay_half_life);
-                heat.score / 256
+                (heat.score / 256, heat.window_hits)
             }
             None => return false,
         };
-        if score < self.policy.hot_threshold {
+        // Same dual gate as maybe_promote_to_hot (review fix #2).
+        if score < self.policy.hot_threshold || window_hits < self.policy.promote_hits {
             return false;
         }
         let Some((value, bytes, _)) = self.staging.remove(key) else {
@@ -535,6 +550,7 @@ mod tests {
         let policy0 = MemoryPolicy {
             hot_budget_bytes: 1_000,
             hot_threshold: 0,
+            promote_hits: 1, // every staged entry qualifies immediately
             ..MemoryPolicy::default()
         };
         c.set_policy(policy0);
@@ -546,6 +562,38 @@ mod tests {
         }
         assert!(c.stats().hot_bytes <= 1_000, "hot over budget");
         assert!(c.stats().evictions > 0, "overflow must evict");
+    }
+
+    #[test]
+    fn promotion_requires_both_score_and_burst() {
+        let t0 = Instant::now();
+        set_test_now(t0);
+        // The burst rule (review fix #2): staging→hot needs the decayed
+        // score ≥ hot_threshold AND ≥ promote_hits hits inside the
+        // promote_window. Without the burst gate, a single access whose
+        // score somehow crossed the threshold would jump straight to hot
+        // — the knob the settings UI ships as 晋升命中次数.
+        let policy = MemoryPolicy {
+            hot_threshold: 1,
+            promote_hits: 5,
+            promote_window: Duration::from_secs(600),
+            ..MemoryPolicy::default()
+        };
+        let mut c = cache(policy);
+        c.put_staging("a".into(), "v".into(), 10);
+        for _ in 0..3 {
+            c.record_hit(&"a".to_string());
+        }
+        // put_staging seeds window_hits at 1; +3 record hits = 4 < 5.
+        assert!(
+            !c.maybe_promote_to_hot(&"a".to_string(), "v".to_string(), 10),
+            "score crossed but 4 window hits < promote_hits 5"
+        );
+        c.record_hit(&"a".to_string()); // 5th window hit
+        assert!(
+            c.maybe_promote_to_hot(&"a".to_string(), "v".to_string(), 10),
+            "score AND burst both satisfied"
+        );
     }
 
     #[test]

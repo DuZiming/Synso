@@ -530,6 +530,12 @@ impl HotIndex {
             } else {
                 rec.py_init.len()
             }) as u64;
+        // Narrowing guards BEFORE any mutation (review fix #5): a failed
+        // guard mid-push left the columns length-desynced and poisoned
+        // every later file_id(slot) in the watcher path.
+        let id32 = narrow_id(rec.id)?;
+        let parent32 = narrow_id(rec.parent)?;
+        let ext32 = narrow_ext(rec.ext_id)?;
         self.interned_bytes += logical;
         if rec.is_dir {
             self.dir_count += 1;
@@ -537,7 +543,6 @@ impl HotIndex {
             self.file_count += 1;
         }
         let slot = self.lower_refs.len();
-        let id32 = narrow_id(rec.id)?;
         if (id32 as usize) >= self.slot_by_id.len() {
             self.slot_by_id.resize(id32 as usize + 1, 0);
         }
@@ -549,11 +554,11 @@ impl HotIndex {
         self.py_full_refs.push(py_full_ref);
         self.py_init_refs.push(py_init_ref);
         self.logical_bytes.push(logical as u32);
-        self.ids.push(narrow_id(rec.id)?);
-        self.parents.push(narrow_id(rec.parent)?);
+        self.ids.push(id32);
+        self.parents.push(parent32);
         self.sizes.push(rec.size);
         self.mtimes.push(rec.mtime);
-        self.ext_ids.push(narrow_ext(rec.ext_id)?);
+        self.ext_ids.push(ext32);
         self.is_dirs.push(rec.is_dir);
         Ok(())
     }
@@ -644,6 +649,9 @@ impl HotIndex {
             self.parents[slot] as FileId,
             name_hash(self.str_of(self.orig_refs[slot])),
         );
+        // Guards before mutation (review fix #5 — see push).
+        let ext32 = narrow_ext(rec.ext_id)?;
+        let parent32 = narrow_id(rec.parent)?;
         self.lower_refs[slot] = lower_ref;
         self.orig_refs[slot] = orig_ref;
         self.py_full_refs[slot] = py_full_ref;
@@ -651,8 +659,8 @@ impl HotIndex {
         self.logical_bytes[slot] = logical as u32;
         self.sizes[slot] = rec.size;
         self.mtimes[slot] = rec.mtime;
-        self.ext_ids[slot] = narrow_ext(rec.ext_id)?;
-        self.parents[slot] = narrow_id(rec.parent)?;
+        self.ext_ids[slot] = ext32;
+        self.parents[slot] = parent32;
         let new_key = (rec.parent, name_hash(&rec.name));
         if old_key != new_key {
             self.slot_by_parent_name.remove(&old_key);

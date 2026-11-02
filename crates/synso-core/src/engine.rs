@@ -315,7 +315,13 @@ impl Engine {
             .name("synso-dim-flush".into())
             .spawn(move || {
                 loop {
-                    match flush_rx.recv_timeout(std::time::Duration::from_secs(600)) {
+                    // Blocking recv — the review-fix: recv_timeout conflated
+                    // Timeout with Disconnected, so a scan silent >600s
+                    // (stalled root mid-walk) silently killed the flush.
+                    // recv() only returns Err on a real disconnect (every
+                    // sender dropped with the engine), so the companion
+                    // always outlives the scan it watches.
+                    match flush_rx.recv() {
                         Ok(EngineEvent::ScanFinished { .. })
                         | Ok(EngineEvent::ScanFailed { .. }) => break,
                         Ok(_) => continue,
@@ -2647,10 +2653,12 @@ mod tests {
 
         // Promote the id to hot: enough recorded hits under a tiny
         // threshold, then the flush+preheat cycle must keep it hot.
+        // promote_hits 2: staging seed + one ladder hit qualifies the id.
         {
             let mut tiers = lock_unpoisoned(&engine.tiers);
             tiers.set_policy(crate::tiers::MemoryPolicy {
                 hot_threshold: 1,
+                promote_hits: 2,
                 ..crate::tiers::MemoryPolicy::default()
             });
             drop(tiers);
