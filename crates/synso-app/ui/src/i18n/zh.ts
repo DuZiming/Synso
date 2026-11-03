@@ -111,7 +111,7 @@ const zh: Dict = {
     noResults: "无结果",
     warming: "索引正在预热，结果马上就好。",
     results: "项结果",
-    hints: "回车打开 · Ctrl+回车 打开所在文件夹 · Esc 关闭",
+    hints: "连按两次 Ctrl 唤起 · 回车打开 · Ctrl+回车 打开所在文件夹 · Esc 关闭",
   },
   toast: {
     shortcut:

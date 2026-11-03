@@ -118,7 +118,7 @@ const en = {
     noResults: "No results",
     warming: "The index is warming up — results appear in a moment.",
     results: "results",
-    hints: "Enter open · Ctrl+Enter reveal · Esc close",
+    hints: "Double-tap Ctrl to summon · Enter open · Ctrl+Enter reveal · Esc close",
   },
   toast: {
     shortcut:

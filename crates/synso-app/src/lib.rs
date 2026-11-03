@@ -18,6 +18,7 @@
 //! engine.
 
 mod commands;
+mod doublectrl;
 mod events;
 mod logging;
 mod memlog;
@@ -86,6 +87,9 @@ pub fn run() {
             // Quick window: placement, focus-loss hide, global shortcut
             // (reads settings, so after `app.manage`).
             quick::init(app.handle());
+            // Double-Ctrl summon (v1.2 user request), always on; the
+            // configured combo stays registered as the fallback.
+            doublectrl::spawn(app.handle().clone());
 
             // Tray: icon + the five-item menu (best-effort — a failed
             // tray leaves the app running window-only, logged loudly).

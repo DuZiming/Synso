@@ -38,6 +38,8 @@ tauri-plugin-dialog = "2"
 # Clipboard write for the capacity map's pinned-path copy button (the
 # webview origin is not a secure context, so navigator.clipboard is out).
 tauri-plugin-clipboard-manager = "2"
+# Low-level keyboard hook for the double-Ctrl quick-search summon (v1.2).
+rdev = "0.5"
 tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
 # OS UI language for the tray menu's "auto" resolution (see tray.rs);
