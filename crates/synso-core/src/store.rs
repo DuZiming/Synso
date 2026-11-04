@@ -41,8 +41,20 @@ ALTER TABLE files ADD COLUMN scan_gen INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE dirs ADD COLUMN scan_gen INTEGER NOT NULL DEFAULT 0;
 ";
 
+/// Schema of `user_version` 4: the persisted heat snapshot (v1.4's heat
+/// persistence). One row per scored file id — `score` holds the raw
+/// ×256 fixed-point decayed hit count (the promotion gate on BOTH ends
+/// compares `raw / 256 >= hot_threshold`, never a floored unit), `at`
+/// the wall-clock unix second the snapshot was taken. The engine
+/// rewrites the whole table per snapshot ([`Store::replace_heat`]) and
+/// replays it through [`crate::dimensions::ColdReader::read_heat`] at
+/// startup, so heat survives a restart instead of re-earning from zero.
+const SCHEMA_V4_SQL: &str = "\
+CREATE TABLE heat(file_id INTEGER PRIMARY KEY, score INTEGER NOT NULL, at INTEGER NOT NULL);
+";
+
 /// Current schema version, stored in `PRAGMA user_version`.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// One row's freshly computed hashes, together with the snapshot identity
 /// the write is guarded by (`mtime` AND `size` from the dedup snapshot the
@@ -289,6 +301,31 @@ impl Store {
         Ok(updated)
     }
 
+    /// Replaces the whole persisted-heat snapshot: one transaction
+    /// deletes every `heat` row and inserts `rows` fresh. A snapshot
+    /// write, not an upsert stream — heat is one table-sized picture of
+    /// the tier cache, so the delete+insert pair must commit together or
+    /// not at all (a crash mid-write leaves the PREVIOUS snapshot, which
+    /// is merely stale, never half-old-half-new). Scores are the raw
+    /// ×256 fixed-point values the tier cache books (the
+    /// `raw / 256 >= hot_threshold` gate reads them directly).
+    /// No production caller yet — the engine's periodic heat flush wires
+    /// it up in the next heat-persistence step.
+    #[allow(dead_code)]
+    pub fn replace_heat(&mut self, rows: &[(FileId, u32, i64)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM heat", [])?;
+        {
+            let mut stmt =
+                tx.prepare("INSERT INTO heat(file_id, score, at) VALUES (?1, ?2, ?3)")?;
+            for (id, score, at) in rows {
+                stmt.execute(params![id, *score as i64, at])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Reads one `meta` value. Live consumers: the settings persistence
     /// (`crate::settings`).
     pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
@@ -394,6 +431,12 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         // first generation-based rescan re-stamps everything it walks
         // and the first sweep carries off whatever it did not.
         tx.execute_batch(SCHEMA_V3_SQL)?;
+    }
+    if version < 4 {
+        // No backfill: heat starts empty — an empty table simply means
+        // "no persisted heat yet", and the engine's first snapshot write
+        // populates it (re-earning from zero is the pre-v4 behavior).
+        tx.execute_batch(SCHEMA_V4_SQL)?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -602,6 +645,7 @@ fn intern_extension(conn: &Connection, name: &str) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::{HashUpdate, SCHEMA_V1_SQL, SCHEMA_VERSION};
+    use crate::dimensions::ColdReader;
     use crate::model::FileRecord;
     use crate::store::Store;
     use crate::SynsoError;
@@ -1029,5 +1073,83 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM extensions", [], |row| row.get(0))
             .unwrap();
         assert_eq!(exts, 1, "no sentinel/empty row is interned for missing ext");
+    }
+
+    #[test]
+    fn heat_snapshot_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
+
+        store.replace_heat(&[(1, 300, 10)]).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM heat", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        // A second snapshot replaces WHOLESALE: file 1's row is gone and
+        // only the new snapshot's row remains — replace, never accumulate.
+        store.replace_heat(&[(2, 500, 20)]).unwrap();
+        let rows: Vec<(i64, i64, i64)> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT file_id, score, at FROM heat")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(rows, vec![(2, 500, 20)]);
+    }
+
+    #[test]
+    fn heat_migration_reopen_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+
+        // First open migrates to v4 (fresh database: CREATE TABLE heat).
+        {
+            let store = Store::open(&db_path).unwrap();
+            let version: i64 = store
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, SCHEMA_VERSION);
+        }
+
+        // Second open is a no-op: the v4 step must not re-run (CREATE
+        // TABLE would error on an existing table) and the heat table
+        // keeps working across the reopen.
+        let mut store = Store::open(&db_path).unwrap();
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        store.replace_heat(&[(7, 256, 99)]).unwrap();
+    }
+
+    #[test]
+    fn read_heat_orders_and_limits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        {
+            let mut store = Store::open(&db_path).unwrap();
+            store
+                .replace_heat(&[
+                    (1, 100, 1_700_000_000),
+                    (2, 500, 1_700_000_000),
+                    (3, 300, 1_700_000_000),
+                ])
+                .unwrap();
+        }
+        // The cold reader (dedicated read-only connection) serves the
+        // startup preheat: hottest first, capped at `limit`.
+        let reader = ColdReader::open(&db_path).unwrap();
+        assert_eq!(
+            reader.read_heat(2).unwrap(),
+            vec![(2, 500, 1_700_000_000), (3, 300, 1_700_000_000)]
+        );
     }
 }

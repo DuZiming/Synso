@@ -88,4 +88,29 @@ impl ColdReader {
         }
         Ok(out)
     }
+
+    /// The persisted heat snapshot, hottest first, capped at `limit`:
+    /// `(file_id, score, at)` with `score` the raw ×256 fixed-point
+    /// value (`raw / 256 >= hot_threshold` is the gate on both ends) and
+    /// `at` the unix second the snapshot was taken. Read source for the
+    /// startup preheat: the engine replays these scores into the tier
+    /// cache so yesterday's hot files do not re-earn their heat from
+    /// zero. No production caller yet — the engine's startup preheat
+    /// wires it up in the next heat-persistence step.
+    #[allow(dead_code)]
+    pub(crate) fn read_heat(&self, limit: usize) -> Result<Vec<(FileId, u32, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT file_id, score, at FROM heat ORDER BY score DESC LIMIT ?1")?;
+        // score round-trips the same bit-preserving cast replace_heat
+        // used to store it (u32 → i64 → u32; scores are never negative).
+        let rows = stmt.query_map([limit as i64], |row| {
+            Ok((
+                row.get::<_, FileId>(0)?,
+                row.get::<_, i64>(1)? as u32,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
 }

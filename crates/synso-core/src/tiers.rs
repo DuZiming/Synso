@@ -92,6 +92,28 @@ struct Heat {
     window_started: Instant,
 }
 
+/// The wall-clock half-life decay for a ×256 fixed-point heat score —
+/// the formula `Heat::decay` books, extracted so the engine's
+/// persistence path (the periodic snapshot it writes through
+/// `Store::replace_heat`) applies EXACTLY the same decay the in-memory
+/// tier cache does: a score persisted, then replayed after a restart,
+/// must land where it would have had the cache never stopped running.
+/// Zero `half_life` (decay disabled) or zero `elapsed` returns the
+/// score unchanged.
+pub(crate) fn decay_score(score: u32, elapsed: Duration, half_life: Duration) -> u32 {
+    if elapsed.is_zero() || half_life.is_zero() {
+        return score;
+    }
+    // Halve for every full half-life; a partial half-life halves
+    // proportionally (score is fixed-point x256 so this stays >0 for
+    // any realistic count until it truly rounds away). ROUND, never
+    // truncate: 256×(1−ε) truncating to 255 read as score 0 (the
+    // promotion gate bug caught by rescan_flushes_then_preheats).
+    let halves = elapsed.as_secs_f64() / half_life.as_secs_f64();
+    let factor = (0.5f64).powf(halves);
+    ((score as f64) * factor).round() as u32
+}
+
 impl Heat {
     fn new(now: Instant) -> Heat {
         Heat {
@@ -103,19 +125,15 @@ impl Heat {
     }
 
     /// Decays `score` to `now` (called before any read/write of it).
+    /// The zero guards stay here (not only inside [`decay_score`]): an
+    /// early return also skips the `at` re-stamp, keeping pre-extraction
+    /// behavior byte-identical when decay is disabled.
     fn decay(&mut self, now: Instant, half_life: Duration) {
         let elapsed = now.saturating_duration_since(self.at);
         if elapsed.is_zero() || half_life.is_zero() {
             return;
         }
-        // Halve for every full half-life; a partial half-life halves
-        // proportionally (score is fixed-point x256 so this stays >0 for
-        // any realistic count until it truly rounds away). ROUND, never
-        // truncate: 256×(1−ε) truncating to 255 read as score 0 (the
-        // promotion gate bug caught by rescan_flushes_then_preheats).
-        let halves = elapsed.as_secs_f64() / half_life.as_secs_f64();
-        let factor = (0.5f64).powf(halves);
-        self.score = ((self.score as f64) * factor).round() as u32;
+        self.score = decay_score(self.score, elapsed, half_life);
         self.at = now;
     }
 
@@ -702,5 +720,24 @@ mod tests {
         c.invalidate(&"k".to_string());
         assert!(c.get_hot(&"k".to_string()).is_none());
         assert!(c.get_staging(&"k".to_string()).is_none());
+    }
+
+    #[test]
+    fn decay_score_rounds_never_truncates() {
+        let half = Duration::from_secs(24 * 3600);
+        // A 1ms-old score sits at 256×(1−ε): ROUND keeps the unit (the
+        // promotion gate reads raw / 256 — truncation turned 256 into
+        // 255, which floored to score 0 and silently broke promotion,
+        // the rescan_flushes_then_preheats bug).
+        assert_eq!(decay_score(256, Duration::from_millis(1), half), 256);
+        // Zero elapsed: nothing has decayed.
+        assert_eq!(decay_score(256, Duration::ZERO, half), 256);
+        // Exactly two half-lives: 1024 → 512 → 256, on the mark.
+        assert_eq!(decay_score(1024, 2 * half, half), 256);
+        // Zero half-life = decay disabled: the score passes through.
+        assert_eq!(
+            decay_score(100, Duration::from_secs(3600), Duration::ZERO),
+            100
+        );
     }
 }
