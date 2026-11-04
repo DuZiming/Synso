@@ -47,13 +47,23 @@
 //! [`Engine::resolve_absolute`] maps index-relative paths back to real
 //! disk paths — hashing needs them, and trash (Task 10) and reveal
 //! (Task 15) will reuse the same mapping.
+//!
+//! Heat persistence (v1.4): the tier cache's heat map is snapshotted
+//! into the store's `heat` table every [`HEAT_PERSIST_INTERVAL`] by the
+//! `synso-heat-persist` thread, after every rescan, and best-effort on
+//! the quit path ([`Engine::persist_heat_on_exit`] — a mid-scan exit
+//! SKIPS rather than blocking the main thread on a busy store lock).
+//! At startup the `synso-heat-preheat` thread replays that snapshot
+//! into the fresh tier cache with wall-clock offline decay applied, so
+//! yesterday's hot files do not re-earn their heat from zero.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
@@ -200,6 +210,17 @@ pub struct Engine {
     /// The dedicated read-only WAL connection for cold dimension reads —
     /// deliberately NOT behind the store mutex (see `dimensions` docs).
     cold: std::sync::Mutex<ColdReader>,
+    /// The send half of the persist thread's keepalive channel. Held
+    /// (never sent on) purely so the channel stays connected while the
+    /// engine lives: dropping the engine drops the sender, the thread's
+    /// `recv_timeout` turns `Disconnected`, and it exits without a
+    /// join. Behind a `Mutex` because `mpsc::Sender` is `Send` but not
+    /// `Sync`, and the engine must stay `Sync`.
+    // Keepalive-only field: the sender's Drop IS its function, so no
+    // code ever reads it — unlike the two allows Task 3 removed (real
+    // APIs that gained callers), this one has no reader by design.
+    #[allow(dead_code)]
+    heat_keepalive: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 /// State shared between the engine, the dedup worker thread and the
@@ -256,6 +277,10 @@ impl Engine {
             roots: RwLock::new(effective_roots(&scan_opts.roots)),
             subscribers: Arc::clone(&subscribers),
         });
+        // The persist thread's keepalive: the sender lives in the
+        // engine (heat_keepalive), the receiver parks in recv_timeout —
+        // engine drop disconnects the pair and the thread exits.
+        let (heat_tx, heat_rx) = std::sync::mpsc::channel::<()>();
         let engine = Engine {
             store: Arc::clone(&store),
             hot: hot.clone(),
@@ -268,12 +293,51 @@ impl Engine {
             settings_cache: Mutex::new(initial_settings.clone()),
             tiers: Arc::new(Mutex::new(TierCache::new(initial_settings.memory_policy()))),
             cold: std::sync::Mutex::new(ColdReader::open(db_path)?),
+            heat_keepalive: Mutex::new(Some(heat_tx)),
         };
         if let Err(err) = thread::Builder::new()
             .name("synso-hot-load".into())
             .spawn(move || reload_hot_index(&store, &hot))
         {
             log::error!("synso: failed to spawn the hot-index loader: {err}");
+        }
+        // Heat persistence (v1.4), after the hot-index loader: replay
+        // the persisted snapshot into the fresh tier cache, then keep
+        // snapshotting the heat map periodically. Both threads own Arc
+        // clones (never the engine), open their own ColdReader
+        // connections, and die with the engine — the preheat thread by
+        // simply finishing, the persist thread via the keepalive
+        // disconnect.
+        let preheat_tiers = Arc::clone(&engine.tiers);
+        let preheat_db = engine.db_path.clone();
+        if let Err(err) = thread::Builder::new()
+            .name("synso-heat-preheat".into())
+            .spawn(move || preheat_thread_side(&preheat_tiers, &preheat_db))
+        {
+            log::error!("synso: failed to spawn the heat-preheat thread: {err}");
+        }
+        let persist_tiers = Arc::clone(&engine.tiers);
+        let persist_store = Arc::clone(&engine.store);
+        if let Err(err) = thread::Builder::new()
+            .name("synso-heat-persist".into())
+            .spawn(move || {
+                loop {
+                    match heat_rx.recv_timeout(HEAT_PERSIST_INTERVAL) {
+                        // The keepalive exists to hold the connection
+                        // open, never to signal; a wake just restarts
+                        // the wait.
+                        Ok(()) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            let mut store = lock_unpoisoned(&persist_store);
+                            persist_heat_into(&mut store, &persist_tiers);
+                        }
+                        // Engine dropped (the keepalive sender with it).
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })
+        {
+            log::error!("synso: failed to spawn the heat-persist thread: {err}");
         }
         Ok(engine)
     }
@@ -303,13 +367,16 @@ impl Engine {
         {
             return;
         }
-        // v1.2: a companion listener flushes the dimension caches when
+        // v1.2→v1.4: a companion listener flushes the dimension caches when
         // the scan lands (every walked row was re-stamped, so cached
-        // details are suspect) and preheats the hot tier from the ids it
-        // held. Subscribed BEFORE the scan spawns (no missed terminal
-        // event); exits after the first one.
+        // details are suspect), reinserts the ids the flushed hot tier
+        // held WITH their scores (a rescan no longer zeroes heat), and
+        // persists the fresh snapshot (a rescan is one of heat
+        // persistence's triggers). Subscribed BEFORE the scan spawns
+        // (no missed terminal event); exits after the first one.
         let flush_rx = self.subscribe();
         let flush_tiers = Arc::clone(&self.tiers);
+        let flush_store = Arc::clone(&self.store);
         let flush_db = self.db_path.clone();
         let _ = thread::Builder::new()
             .name("synso-dim-flush".into())
@@ -328,36 +395,7 @@ impl Engine {
                         Err(_) => return, // sender gone: engine dropped
                     }
                 }
-                let preheat_ids: Vec<FileId> = {
-                    let mut tiers = lock_unpoisoned(&flush_tiers);
-                    let preload = tiers.policy().preload_on_start;
-                    let ids = tiers
-                        .hot_snapshot()
-                        .into_iter()
-                        .map(|(id, _, _)| id)
-                        .collect();
-                    tiers.clear();
-                    if preload {
-                        ids
-                    } else {
-                        Vec::new()
-                    }
-                };
-                if preheat_ids.is_empty() {
-                    return;
-                }
-                // A throwaway reader in THIS thread (the engine's own
-                // ColdReader connection is not Sync).
-                if let Ok(cold) = crate::dimensions::ColdReader::open(&flush_db) {
-                    if let Ok(fresh) = cold.file_details(&preheat_ids) {
-                        let mut tiers = lock_unpoisoned(&flush_tiers);
-                        for detail in fresh {
-                            let bytes = detail.cached_bytes();
-                            let id = detail.id;
-                            tiers.put_hot_direct(id, detail, bytes);
-                        }
-                    }
-                }
+                rescan_flush_thread_side(&flush_tiers, &flush_store, &flush_db);
             });
         let spawn = thread::Builder::new().name("synso-scan".into()).spawn({
             let store = self.store.clone();
@@ -593,33 +631,45 @@ impl Engine {
 
     /// Flushes every dimension cache entry (rescan-completion hook) and,
     /// when preheating is on, reloads the hot tier with the ids the
-    /// flushed hot tier held — yesterday's hot files are today's first
-    /// residents again after one cold burst.
+    /// flushed hot tier held — each WITH its score (a rescan no longer
+    /// zeroes heat) — then persists the fresh snapshot: a rescan is one
+    /// of heat persistence's three triggers (see the module docs).
+    /// Yesterday's hot files are today's first residents again after one
+    /// cold burst.
     pub fn flush_dimensions_and_preheat(&self) {
-        let preheat_ids: Vec<FileId> = {
+        let scored = flush_snapshot(&mut lock_unpoisoned(&self.tiers)).unwrap_or_default();
+        if !scored.is_empty() {
+            let cold = lock_unpoisoned(&self.cold);
             let mut tiers = lock_unpoisoned(&self.tiers);
-            let preload = tiers.policy().preload_on_start;
-            let ids = tiers
-                .hot_snapshot()
-                .into_iter()
-                .map(|(id, _, _)| id)
-                .collect();
-            tiers.clear();
-            if preload {
-                ids
-            } else {
-                Vec::new()
-            }
-        };
-        if preheat_ids.is_empty() {
-            return;
+            reinsert_with_scores(&mut tiers, &cold, &scored);
         }
-        if let Ok(fresh) = lock_unpoisoned(&self.cold).file_details(&preheat_ids) {
-            let mut tiers = lock_unpoisoned(&self.tiers);
-            for detail in fresh {
-                let bytes = detail.cached_bytes();
-                let id = detail.id;
-                tiers.put_hot_direct(id, detail, bytes);
+        self.persist_heat();
+    }
+
+    /// Snapshots the tier cache's heat into the store's `heat` table —
+    /// the periodic thread's and the rescan flush's shared path. Takes
+    /// the store's BLOCKING lock (callers on the main thread at quit
+    /// time use [`Engine::persist_heat_on_exit`] instead); everything
+    /// inside is best-effort, errors only logged.
+    pub fn persist_heat(&self) {
+        let mut store = lock_unpoisoned(&self.store);
+        persist_heat_into(&mut store, &self.tiers);
+    }
+
+    /// The quit-path persist: strictly best-effort. A mid-scan quit
+    /// finds the store mutex held for the scan's whole walk — blocking
+    /// the main thread there would hang the exit, so a busy OR poisoned
+    /// lock skips the snapshot outright (the table keeps its last
+    /// periodic/rescan snapshot; at worst one interval of heat is
+    /// re-earned next session).
+    pub fn persist_heat_on_exit(&self) {
+        match self.store.try_lock() {
+            Ok(mut store) => persist_heat_into(&mut store, &self.tiers),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                log::debug!("synso: exit heat persist skipped — the store lock is busy");
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                log::debug!("synso: exit heat persist skipped — the store lock is poisoned");
             }
         }
     }
@@ -1162,6 +1212,154 @@ fn reload_hot_index_locked(store: &Store, hot: &Arc<RwLock<HotIndex>>) {
         Ok(loaded) => *write_unpoisoned(hot) = loaded,
         Err(err) => log::error!("synso: hot-index load failed: {err}"),
     }
+}
+
+// ---------------- v1.4: heat persistence --------------------------------
+
+/// How many heat rows one snapshot write carries: the score-descending
+/// head of the floored heat map — a whole-table picture, capped so even
+/// a runaway heat map (bounded by the tier budgets, but still) can
+/// never make the snapshot unbounded.
+const HEAT_MAX_ROWS: usize = 10_000;
+
+/// How often the `synso-heat-persist` thread snapshots the heat map
+/// into the store between rescans.
+const HEAT_PERSIST_INTERVAL: Duration = Duration::from_secs(600);
+
+/// One heat snapshot write: the tier cache's heat map, decayed to now,
+/// floored (`raw / 256 >= hot_threshold` — the same unit gate the
+/// backfill side applies, so a one-touch entry never round-trips),
+/// capped at [`HEAT_MAX_ROWS`], every row stamped with the one snapshot
+/// epoch (the scores already carry all in-session ageing — the
+/// heat-persistence design doc's §5). Best-effort: a store failure
+/// logs and skips — the previous snapshot stays, merely stale.
+fn persist_heat_into(store: &mut Store, tiers: &Arc<Mutex<TierCache<FileId, FileDetail>>>) {
+    // One epoch for the whole snapshot: every score was decayed to the
+    // same instant, so one stamp is exact, not an approximation.
+    let at = unix_now();
+    let rows: Vec<(FileId, u32, i64)> = {
+        let mut cache = lock_unpoisoned(tiers);
+        let floor = cache.policy().hot_threshold;
+        cache
+            .heat_above_floor(floor)
+            .into_iter()
+            .take(HEAT_MAX_ROWS)
+            .map(|(id, raw)| (id, raw, at))
+            .collect()
+    };
+    if let Err(err) = store.replace_heat(&rows) {
+        log::warn!("synso: heat snapshot persist skipped: {err}");
+    }
+}
+
+/// The rescan flush's carry list: the hot tier's residents with their
+/// decayed scores, plus the flush itself. `None` when preloading is
+/// off — the flush still happens (cached details are suspect after a
+/// rescan either way), there is just nothing to carry back.
+fn flush_snapshot(tiers: &mut TierCache<FileId, FileDetail>) -> Option<Vec<(FileId, u32)>> {
+    if !tiers.policy().preload_on_start {
+        tiers.clear();
+        return None;
+    }
+    let ids = tiers.hot_ids_with_scores();
+    tiers.clear();
+    Some(ids)
+}
+
+/// Replays a scored id list into the hot tier: one batched cold read
+/// (`file_details` chunks its IN-lists at 500 internally) fetches the
+/// surviving rows — an id deleted since the score was booked is simply
+/// absent from the result and silently drops out — and each survivor
+/// re-enters hot WITH its score (the max-merge staging takeover of
+/// [`TierCache::put_hot_direct_with_score`]).
+fn reinsert_with_scores(
+    tiers: &mut TierCache<FileId, FileDetail>,
+    cold: &ColdReader,
+    scored: &[(FileId, u32)],
+) {
+    if scored.is_empty() {
+        return;
+    }
+    let ids: Vec<FileId> = scored.iter().map(|(id, _)| *id).collect();
+    // Best-effort: a failed read leaves the tier empty-handed — the
+    // next rescan or restart rebuilds it.
+    let Ok(fresh) = cold.file_details(&ids) else {
+        return;
+    };
+    let by_id: HashMap<FileId, FileDetail> = fresh
+        .into_iter()
+        .map(|detail| (detail.id, detail))
+        .collect();
+    for (id, score) in scored {
+        if let Some(detail) = by_id.get(id) {
+            tiers.put_hot_direct_with_score(*id, detail.clone(), detail.cached_bytes(), *score);
+        }
+    }
+}
+
+/// The rescan companion's body — the engine's own path
+/// ([`Engine::flush_dimensions_and_preheat`]) runs the same three steps
+/// through the engine's locks: flush the tier caches, reinsert the
+/// previously-hot ids with their scores, then persist the fresh
+/// snapshot. Opens its OWN ColdReader: this runs on a companion thread
+/// and the engine's connection is not `Sync`.
+fn rescan_flush_thread_side(
+    tiers: &Arc<Mutex<TierCache<FileId, FileDetail>>>,
+    store: &Arc<Mutex<Store>>,
+    db_path: &Path,
+) {
+    let scored = flush_snapshot(&mut lock_unpoisoned(tiers)).unwrap_or_default();
+    if !scored.is_empty() {
+        // A throwaway reader in THIS thread (same rule as the scan
+        // companion always followed).
+        if let Ok(cold) = ColdReader::open(db_path) {
+            let mut cache = lock_unpoisoned(tiers);
+            reinsert_with_scores(&mut cache, &cold, &scored);
+        }
+    }
+    let mut guard = lock_unpoisoned(store);
+    persist_heat_into(&mut guard, tiers);
+}
+
+/// The startup preheat's body: replay the persisted heat snapshot into
+/// the fresh tier cache, applying the OFFLINE decay first — each row's
+/// wall-clock age (`now − at`, clamped at zero for a future stamp:
+/// clock skew must neither inflate nor crash a score) halves per
+/// `decay_half_life`, and anything that fell below the floor
+/// (`raw / 256 < hot_threshold`, the same unit gate as the persist
+/// side) drops out — re-earning is the honest outcome for heat that
+/// decayed away. `preload_on_start` off skips the whole replay (the
+/// table is only ever read here); persistence itself is unaffected.
+/// Opens its own ColdReader (thread-side; see
+/// [`rescan_flush_thread_side`]).
+fn preheat_thread_side(tiers: &Arc<Mutex<TierCache<FileId, FileDetail>>>, db_path: &Path) {
+    // Best-effort at every step: no reader or no snapshot means no
+    // preheat, never an error.
+    let Ok(cold) = ColdReader::open(db_path) else {
+        return;
+    };
+    let Ok(rows) = cold.read_heat(HEAT_MAX_ROWS) else {
+        return;
+    };
+    let mut cache = lock_unpoisoned(tiers);
+    let policy = cache.policy();
+    if !policy.preload_on_start {
+        return;
+    }
+    let now = unix_now();
+    let scored: Vec<(FileId, u32)> = rows
+        .into_iter()
+        .map(|(id, score, at)| {
+            let elapsed = now.saturating_sub(at).max(0) as u64;
+            (
+                id,
+                tiers::decay_score(score, Duration::from_secs(elapsed), policy.decay_half_life),
+            )
+        })
+        // The floor in HITS, on both ends of the round trip.
+        .filter(|(_, raw)| raw / 256 >= policy.hot_threshold)
+        .collect();
+    reinsert_with_scores(&mut cache, &cold, &scored);
 }
 
 #[cfg(test)]
@@ -2678,5 +2876,235 @@ mod tests {
             "preload re-inserts the previously-hot id"
         );
         assert_eq!(tiers.stats().staging_entries, 0, "everything was flushed");
+    }
+
+    // ------------- v1.4: heat persistence --------------------------------
+
+    /// Heat persistence round trip: an id driven into the hot tier
+    /// persists, and the startup preheat thread's body replays it into
+    /// a FRESH engine over the same database — yesterday's hot file is
+    /// today's first hot resident again, no re-earning from zero.
+    #[test]
+    fn persist_then_preheat_restores_heat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id) = detail_fixture(&tmp);
+
+        // Same low-floor policy as rescan_flushes_then_preheats: one
+        // ladder hit qualifies the id for hot.
+        {
+            let mut tiers = lock_unpoisoned(&engine.tiers);
+            tiers.set_policy(crate::tiers::MemoryPolicy {
+                hot_threshold: 1,
+                promote_hits: 2,
+                ..crate::tiers::MemoryPolicy::default()
+            });
+        }
+        let _ = engine.file_detail(id); // staging
+        let _ = engine.file_detail(id); // hit → promote path
+        engine.persist_heat();
+
+        // The restart: a fresh engine over the same DB, the same low
+        // floor (the default 8 would floor the 1-hit score out at the
+        // backfill gate), then the preheat thread's body.
+        drop(engine);
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        let reopened = open_engine(&db_path, &root);
+        {
+            let mut tiers = lock_unpoisoned(&reopened.tiers);
+            tiers.set_policy(crate::tiers::MemoryPolicy {
+                hot_threshold: 1,
+                promote_hits: 2,
+                ..crate::tiers::MemoryPolicy::default()
+            });
+        }
+        preheat_thread_side(&reopened.tiers, &db_path);
+        let mut tiers = lock_unpoisoned(&reopened.tiers);
+        assert!(
+            tiers.get_hot(&id).is_some(),
+            "the persisted snapshot restores the id into the fresh engine's hot tier"
+        );
+    }
+
+    /// Offline decay at the backfill gate: a row three half-lives old
+    /// decays 8×256 → 1×256 and drops below the default floor 8; the
+    /// same score stamped now survives; a FUTURE stamp (clock skew)
+    /// clamps elapsed to zero — the score stands, nothing panics.
+    #[test]
+    fn offline_decay_drops_below_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id) = detail_fixture(&tmp);
+        let db_path = tmp.path().join("index.db");
+        let half_life = crate::tiers::MemoryPolicy::default().decay_half_life;
+        let now = unix_now();
+
+        // Three half-lives offline: 2048 → 256, floored 1 < 8 — dropped.
+        lock_unpoisoned(&engine.store)
+            .replace_heat(&[(id, 8 * 256, now - 3 * half_life.as_secs() as i64)])
+            .unwrap();
+        preheat_thread_side(&engine.tiers, &db_path);
+        {
+            let mut tiers = lock_unpoisoned(&engine.tiers);
+            assert!(
+                tiers.get_hot(&id).is_none(),
+                "three half-lives of decay must floor the score out of the backfill"
+            );
+        }
+
+        // Same score, stamped now: nothing decays, the id re-enters hot.
+        lock_unpoisoned(&engine.store)
+            .replace_heat(&[(id, 8 * 256, now)])
+            .unwrap();
+        preheat_thread_side(&engine.tiers, &db_path);
+        {
+            let mut tiers = lock_unpoisoned(&engine.tiers);
+            assert!(
+                tiers.get_hot(&id).is_some(),
+                "a fresh stamp survives the gate"
+            );
+        }
+
+        // A future stamp: elapsed clamps at zero, the score stands.
+        lock_unpoisoned(&engine.tiers).clear();
+        lock_unpoisoned(&engine.store)
+            .replace_heat(&[(id, 8 * 256, now + 3600)])
+            .unwrap();
+        preheat_thread_side(&engine.tiers, &db_path);
+        let mut tiers = lock_unpoisoned(&engine.tiers);
+        assert!(
+            tiers.get_hot(&id).is_some(),
+            "a future `at` decays nothing and must not panic"
+        );
+    }
+
+    /// A snapshot row whose file no longer exists (deleted between the
+    /// snapshot and the restart) silently disappears at the cold read —
+    /// no error, no hot resident.
+    #[test]
+    fn stale_id_absent_in_preheat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _id) = detail_fixture(&tmp);
+        let db_path = tmp.path().join("index.db");
+
+        lock_unpoisoned(&engine.store)
+            .replace_heat(&[(999_999, 100 * 256, unix_now())])
+            .unwrap();
+        preheat_thread_side(&engine.tiers, &db_path);
+
+        let tiers = lock_unpoisoned(&engine.tiers);
+        assert_eq!(
+            tiers.stats().hot_entries,
+            0,
+            "a stale id drops out at the cold read — no panic, no resident"
+        );
+    }
+
+    /// The floor is in HITS on both ends: one touch books raw 256
+    /// (÷256 = 1), which must NOT persist under the default threshold
+    /// 8 — the snapshot stays empty (an empty snapshot legitimately
+    /// clears the table: nothing qualified).
+    #[test]
+    fn floor_units_one_touch_not_persisted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id) = detail_fixture(&tmp);
+        let db_path = tmp.path().join("index.db");
+
+        // One touch: staging seed + one recorded hit = raw 256.
+        let _ = engine.file_detail(id);
+        lock_unpoisoned(&engine.tiers).record_hit(&id);
+
+        engine.persist_heat();
+
+        let rows = ColdReader::open(&db_path)
+            .unwrap()
+            .read_heat(HEAT_MAX_ROWS)
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "a one-touch entry (raw 256) must not persist under the default floor 8"
+        );
+    }
+
+    /// The quit-path persist must SKIP a busy store lock, never block
+    /// the main thread: with the lock held the way a mid-scan exit
+    /// would, the call returns in well under a second; once free, the
+    /// same call writes the snapshot.
+    #[test]
+    fn exit_persist_skips_when_store_locked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id) = detail_fixture(&tmp);
+        let db_path = tmp.path().join("index.db");
+
+        // An id above the floor so the unlocked retry writes a row.
+        {
+            let mut tiers = lock_unpoisoned(&engine.tiers);
+            tiers.set_policy(crate::tiers::MemoryPolicy {
+                hot_threshold: 1,
+                promote_hits: 2,
+                ..crate::tiers::MemoryPolicy::default()
+            });
+        }
+        let _ = engine.file_detail(id); // staging
+        let _ = engine.file_detail(id); // → hot, raw 256 ≥ floor 1
+
+        let store = Arc::clone(&engine.store);
+        let guard = lock_unpoisoned(&store);
+        let started = Instant::now();
+        engine.persist_heat_on_exit();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "exit persist took {:?} — it blocked on the held store lock",
+            started.elapsed()
+        );
+        drop(guard);
+
+        engine.persist_heat_on_exit();
+        let rows = ColdReader::open(&db_path)
+            .unwrap()
+            .read_heat(HEAT_MAX_ROWS)
+            .unwrap();
+        assert!(
+            !rows.is_empty(),
+            "with the lock free the exit persist writes the snapshot"
+        );
+    }
+
+    /// A rescan carries heat scores instead of zeroing them: an id
+    /// driven to a floored score ≥ 5 before the flush still clears the
+    /// floor afterwards — the zero-score reseed of the old
+    /// `put_hot_direct` flush is gone.
+    #[test]
+    fn rescan_carries_scores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id) = detail_fixture(&tmp);
+
+        {
+            let mut tiers = lock_unpoisoned(&engine.tiers);
+            tiers.set_policy(crate::tiers::MemoryPolicy {
+                hot_threshold: 1,
+                promote_hits: 2,
+                ..crate::tiers::MemoryPolicy::default()
+            });
+        }
+        let _ = engine.file_detail(id); // staging
+        let _ = engine.file_detail(id); // → hot, raw 256
+        {
+            let mut tiers = lock_unpoisoned(&engine.tiers);
+            for _ in 0..8 {
+                let _ = tiers.get_hot(&id); // each hit books +256
+            }
+            assert!(
+                tiers.heat_above_floor(5).iter().any(|(k, _)| *k == id),
+                "precondition: the id's floored score reaches 5"
+            );
+        }
+
+        engine.flush_dimensions_and_preheat();
+
+        let mut tiers = lock_unpoisoned(&engine.tiers);
+        assert!(
+            tiers.heat_above_floor(5).iter().any(|(k, _)| *k == id),
+            "the flush carries the score — it must not zero it"
+        );
     }
 }

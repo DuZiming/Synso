@@ -411,6 +411,47 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
         self.put_hot_direct_with_score(key, value, bytes, 0);
     }
 
+    /// Persistence snapshot of the whole heat map: every entry is first
+    /// decayed to now (the side effect re-stamps each `Heat.at` —
+    /// correct and harmless: the next decay measures from this
+    /// snapshot), then the entries whose floored score
+    /// `raw / 256 >= floor_hits` come back as `(key, raw)` pairs,
+    /// raw-score descending (the persist path keeps the head of this
+    /// order). The floor is the SAME `hot_threshold` gate the backfill
+    /// side applies, so a one-touch entry (raw 256) never round-trips
+    /// through the store.
+    pub fn heat_above_floor(&mut self, floor_hits: u32) -> Vec<(K, u32)> {
+        let now = self.now();
+        let policy = self.policy;
+        for heat in self.heat.values_mut() {
+            heat.decay(now, policy.decay_half_life);
+        }
+        let mut out: Vec<(K, u32)> = self
+            .heat
+            .iter()
+            .filter(|(_, heat)| heat.score / 256 >= floor_hits)
+            .map(|(key, heat)| (key.clone(), heat.score))
+            .collect();
+        out.sort_by_key(|(_, raw)| std::cmp::Reverse(*raw));
+        out
+    }
+
+    /// The hot tier's residents as `(key, decayed raw score)` — the
+    /// rescan flush's carry list: a rescan hands each previously-hot id
+    /// its score back instead of zeroing it. Decays to now first (same
+    /// side effect as [`TierCache::heat_above_floor`]).
+    pub fn hot_ids_with_scores(&mut self) -> Vec<(K, u32)> {
+        let now = self.now();
+        let policy = self.policy;
+        for heat in self.heat.values_mut() {
+            heat.decay(now, policy.decay_half_life);
+        }
+        self.hot
+            .keys()
+            .filter_map(|key| self.heat.get(key).map(|heat| (key.clone(), heat.score)))
+            .collect()
+    }
+
     /// Drops one entry everywhere (invalidation hook).
     pub fn invalidate(&mut self, key: &K) {
         if let Some((_, bytes)) = self.hot.remove(key) {

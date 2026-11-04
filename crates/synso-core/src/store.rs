@@ -308,10 +308,10 @@ impl Store {
     /// not at all (a crash mid-write leaves the PREVIOUS snapshot, which
     /// is merely stale, never half-old-half-new). Scores are the raw
     /// ×256 fixed-point values the tier cache books (the
-    /// `raw / 256 >= hot_threshold` gate reads them directly).
-    /// No production caller yet — the engine's periodic heat flush wires
-    /// it up in the next heat-persistence step.
-    #[allow(dead_code)]
+    /// `raw / 256 >= hot_threshold` gate reads them directly). Live
+    /// writers: the engine's heat persistence — the periodic
+    /// `synso-heat-persist` thread, the rescan flush and the quit path
+    /// all snapshot through here.
     pub fn replace_heat(&mut self, rows: &[(FileId, u32, i64)]) -> Result<()> {
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM heat", [])?;
