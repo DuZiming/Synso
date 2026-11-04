@@ -31,7 +31,7 @@ use tauri_plugin_autostart::{MacosLauncher, ManagerExt};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         // Single instance FIRST (plugin docs): the second process must be
         // waved off before any other plugin does work. The existing app
         // shows + focuses its main window (visible again if hidden).
@@ -162,8 +162,19 @@ pub fn run() {
             commands::reveal_index_path,
             commands::pick_folder
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .expect("error while running tauri application");
+    // Heat persistence (热度跨重启) — flush the heat table on the way out.
+    // `build` + `app.run` (instead of the builder's `.run`) exposes the run
+    // event stream; `persist_heat_on_exit` try-locks the store, so a busy
+    // engine skips the flush rather than block shutdown.
+    app.run(|app, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            if let Some(state) = app.try_state::<state::AppState>() {
+                state.engine.persist_heat_on_exit();
+            }
+        }
+    });
 }
 
 /// Dev convenience (debug builds only): with `SYNSO_DEV_ROOT` set, run one
