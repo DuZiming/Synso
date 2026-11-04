@@ -10,8 +10,9 @@
 //! [`crate::settings::Settings`] (live-appliable).
 //!
 //! Policy (see the v1.2 design doc):
-//! - every `get` records a hit in a count-min sketch (fixed ~256KB, never
-//!   per-entry bookkeeping);
+//! - recorded hits update Heat per entry (only tier residents hold a
+//!   Heat row — the Heat map stays bounded by the tier budgets, never
+//!   the access stream);
 //! - a key hit `promote_hits` times inside `promote_window` enters
 //!   staging (TTL `staging_ttl`, refreshed on each hit);
 //! - a key whose decayed hit-count reaches `hot_threshold` enters the hot
@@ -22,10 +23,6 @@
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-
-/// Fixed count-min sketch width. ~256KB: 4 rows × 65,536 counters × u16.
-const CMS_ROWS: usize = 4;
-const CMS_WIDTH: usize = 65_536;
 
 /// Tunable policy knobs (v1.2 design defaults; every field is exposed in
 /// the settings UI and live-appliable — see [`TierCache::set_policy`]).
@@ -149,7 +146,6 @@ pub struct TierCache<K, V> {
     hot: HashMap<K, (V, u64)>,
     staging: HashMap<K, (V, u64, Instant)>, // value, bytes, expires_at
     heat: HashMap<K, Heat>,
-    cms: Vec<Vec<u16>>,
     stats: TierStats,
     /// Injected clock (tests control it); production uses [`Instant::now`].
     now_fn: fn() -> Instant,
@@ -167,7 +163,6 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
             hot: HashMap::new(),
             staging: HashMap::new(),
             heat: HashMap::new(),
-            cms: vec![vec![0; CMS_WIDTH]; CMS_ROWS],
             stats: TierStats::default(),
             now_fn,
         }
@@ -175,22 +170,6 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
 
     fn now(&self) -> Instant {
         (self.now_fn)()
-    }
-
-    fn cms_bump(&mut self, key: &K) {
-        for row in 0..CMS_ROWS {
-            let h = self.cms_hash(row, key);
-            let cell = &mut self.cms[row][h % CMS_WIDTH];
-            *cell = cell.saturating_add(1);
-        }
-    }
-
-    fn cms_hash(&self, row: usize, key: &K) -> usize {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (row as u64).hash(&mut hasher);
-        key.hash(&mut hasher);
-        hasher.finish() as usize
     }
 
     /// Hot-tier lookup (a hit also refreshes heat).
@@ -235,16 +214,13 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
         }
     }
 
-    /// Records a hit: bumps the sketch, updates heat, applies the
-    /// promotion rules. Returns the key's current decayed heat score.
-    /// Records a hit: bumps the global sketch, and updates heat ONLY for
-    /// keys already holding a Heat entry (staging/hot residents) — the
-    /// Heat map stays bounded by the tier budgets, never the access
-    /// stream (a day of millions of one-off keys creates nothing).
-    /// Returns the key's decayed score, 0 when it holds no entry.
+    /// Records a hit: updates heat ONLY for keys already holding a Heat
+    /// entry (staging/hot residents) — the Heat map stays bounded by the
+    /// tier budgets, never the access stream (a day of millions of
+    /// one-off keys creates nothing). Returns the key's decayed score,
+    /// 0 when it holds no entry.
     pub fn record_hit(&mut self, key: &K) -> u32 {
         let now = self.now();
-        self.cms_bump(key);
         let policy = self.policy;
         let Some(heat) = self.heat.get_mut(key) else {
             return 0;
@@ -379,7 +355,17 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
             .collect()
     }
 
-    pub fn put_hot_direct(&mut self, key: K, value: V, bytes: u64) {
+    /// Direct hot insert carrying a persisted heat score — the
+    /// restart-backfill path (the snapshot's ×256 fixed-point score
+    /// re-enters with the entry; no threshold re-check). Budget eviction
+    /// is [`TierCache::put_hot_direct`]'s. Entering hot SUPERSEDES the
+    /// staging twin (staging_bytes 扣减 — the promote paths' pattern, so
+    /// one key never bills both tiers). Heat merge: no entry seeds
+    /// `Heat { score, at: now, window_hits: 1, window_started: now }`;
+    /// an existing entry decays to now first, then keeps
+    /// `max(existing, score)` — a persisted snapshot never clobbers a
+    /// higher live score — with the promotion window fields preserved.
+    pub fn put_hot_direct_with_score(&mut self, key: K, value: V, bytes: u64, score: u32) {
         while self.stats.hot_bytes + bytes > self.policy.hot_budget_bytes && !self.hot.is_empty() {
             self.evict_lowest_hot();
         }
@@ -391,8 +377,38 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
         } else {
             self.stats.hot_bytes += bytes;
         }
+        // Hot-tier residency supersedes staging (无双份计账).
+        if let Some((_, s_bytes, _)) = self.staging.remove(&key) {
+            self.stats.staging_bytes = self.stats.staging_bytes.saturating_sub(s_bytes);
+        }
         let now = self.now();
-        self.heat.entry(key).or_insert_with(|| Heat::new(now));
+        let policy = self.policy;
+        match self.heat.get_mut(&key) {
+            Some(heat) => {
+                heat.decay(now, policy.decay_half_life);
+                heat.score = heat.score.max(score);
+            }
+            None => {
+                self.heat.insert(
+                    key,
+                    Heat {
+                        score,
+                        at: now,
+                        window_hits: 1,
+                        window_started: now,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Direct hot insert for startup preheat (persisted heat already
+    /// earned the entry; no threshold re-check). The score-0 special
+    /// case of [`TierCache::put_hot_direct_with_score`]: a fresh entry
+    /// seeds the same zero-score Heat as before, an existing entry
+    /// keeps its decayed live score (max with 0 is a no-op).
+    pub fn put_hot_direct(&mut self, key: K, value: V, bytes: u64) {
+        self.put_hot_direct_with_score(key, value, bytes, 0);
     }
 
     /// Drops one entry everywhere (invalidation hook).
@@ -738,6 +754,42 @@ mod tests {
         assert_eq!(
             decay_score(100, Duration::from_secs(3600), Duration::ZERO),
             100
+        );
+    }
+
+    #[test]
+    fn with_score_supersedes_staging_and_merges_max() {
+        let t0 = Instant::now();
+        set_test_now(t0);
+        let mut c = cache(MemoryPolicy::default());
+        c.put_staging("k".into(), "v".into(), 10);
+        // Live score 2 < the incoming persisted score 8×256 (带分回填:
+        // the snapshot's fixed-point score re-enters the entry).
+        c.record_hit(&"k".to_string());
+        c.record_hit(&"k".to_string());
+        c.put_hot_direct_with_score("k".into(), "v".into(), 10, 8 * 256);
+        assert!(c.get_hot(&"k".to_string()).is_some());
+        assert_eq!(c.stats().staging_entries, 0, "入热接管 staging 孪生");
+        assert_eq!(c.stats().hot_bytes, 10, "无双份计账");
+        // The seeded score is live: 2048/256 = 8, plus this hit ≥ 8.
+        assert!(c.record_hit(&"k".to_string()) >= 8);
+    }
+
+    #[test]
+    fn with_score_does_not_clobber_higher_live() {
+        let t0 = Instant::now();
+        set_test_now(t0);
+        let mut c = cache(MemoryPolicy::default());
+        c.put_staging("k".into(), "v".into(), 10);
+        for _ in 0..20 {
+            c.record_hit(&"k".to_string());
+        }
+        // Live score 20×256 > the incoming 8×256: max keeps the live
+        // score — a persisted snapshot must never LOWER a hot entry.
+        c.put_hot_direct_with_score("k".into(), "v".into(), 10, 8 * 256);
+        assert!(
+            c.record_hit(&"k".to_string()) >= 20,
+            "max merge keeps the higher live score"
         );
     }
 }
