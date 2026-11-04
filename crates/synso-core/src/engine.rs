@@ -629,19 +629,27 @@ impl Engine {
         }
     }
 
-    /// Flushes every dimension cache entry (rescan-completion hook) and,
+    /// The synchronous/manual-entry twin of [`rescan_flush_thread_side`]
+    /// — the same flush → reinsert → persist sequence, run through the
+    /// engine's own locks; tests and any embedder driving a flush by
+    /// hand call this, while the real rescan completion runs the
+    /// companion-thread side. Flushes every dimension cache entry and,
     /// when preheating is on, reloads the hot tier with the ids the
-    /// flushed hot tier held — each WITH its score (a rescan no longer
-    /// zeroes heat) — then persists the fresh snapshot: a rescan is one
-    /// of heat persistence's three triggers (see the module docs).
-    /// Yesterday's hot files are today's first residents again after one
-    /// cold burst.
+    /// flushed hot tier held — each WITH its score (a flush no longer
+    /// zeroes heat) — then persists the fresh snapshot. When the
+    /// carry-back cold read fails, the persist is SKIPPED: overwriting
+    /// the last good snapshot with an empty table would lose heat the
+    /// next session could still restore.
     pub fn flush_dimensions_and_preheat(&self) {
-        let scored = flush_snapshot(&mut lock_unpoisoned(&self.tiers)).unwrap_or_default();
+        let Some(scored) = flush_snapshot(&mut lock_unpoisoned(&self.tiers)) else {
+            return; // preload off: nothing to carry, nothing to persist
+        };
         if !scored.is_empty() {
             let cold = lock_unpoisoned(&self.cold);
             let mut tiers = lock_unpoisoned(&self.tiers);
-            reinsert_with_scores(&mut tiers, &cold, &scored);
+            if !reinsert_with_scores(&mut tiers, &cold, &scored) {
+                return; // failed carry: persisting would wipe the table
+            }
         }
         self.persist_heat();
     }
@@ -1271,20 +1279,28 @@ fn flush_snapshot(tiers: &mut TierCache<FileId, FileDetail>) -> Option<Vec<(File
 /// surviving rows — an id deleted since the score was booked is simply
 /// absent from the result and silently drops out — and each survivor
 /// re-enters hot WITH its score (the max-merge staging takeover of
-/// [`TierCache::put_hot_direct_with_score`]).
+/// [`TierCache::put_hot_direct_with_score`]). Returns whether the cold
+/// reads succeeded — also `true` for an empty list (nothing to read).
+/// The rescan flushes use `false` to SKIP their persist: their heat map
+/// was already flushed, so writing the snapshot now would replace the
+/// last good table with an empty one.
 fn reinsert_with_scores(
     tiers: &mut TierCache<FileId, FileDetail>,
     cold: &ColdReader,
     scored: &[(FileId, u32)],
-) {
+) -> bool {
     if scored.is_empty() {
-        return;
+        return true;
     }
     let ids: Vec<FileId> = scored.iter().map(|(id, _)| *id).collect();
     // Best-effort: a failed read leaves the tier empty-handed — the
     // next rescan or restart rebuilds it.
-    let Ok(fresh) = cold.file_details(&ids) else {
-        return;
+    let fresh = match cold.file_details(&ids) {
+        Ok(fresh) => fresh,
+        Err(err) => {
+            log::warn!("synso: heat replay skipped — the cold read failed: {err}");
+            return false;
+        }
     };
     let by_id: HashMap<FileId, FileDetail> = fresh
         .into_iter()
@@ -1295,6 +1311,7 @@ fn reinsert_with_scores(
             tiers.put_hot_direct_with_score(*id, detail.clone(), detail.cached_bytes(), *score);
         }
     }
+    true
 }
 
 /// The rescan companion's body — the engine's own path
@@ -1308,13 +1325,29 @@ fn rescan_flush_thread_side(
     store: &Arc<Mutex<Store>>,
     db_path: &Path,
 ) {
-    let scored = flush_snapshot(&mut lock_unpoisoned(tiers)).unwrap_or_default();
+    let Some(scored) = flush_snapshot(&mut lock_unpoisoned(tiers)) else {
+        return; // preload off: nothing to carry, nothing to persist
+    };
     if !scored.is_empty() {
         // A throwaway reader in THIS thread (same rule as the scan
         // companion always followed).
-        if let Ok(cold) = ColdReader::open(db_path) {
-            let mut cache = lock_unpoisoned(tiers);
-            reinsert_with_scores(&mut cache, &cold, &scored);
+        let carried = match ColdReader::open(db_path) {
+            Ok(cold) => {
+                let mut cache = lock_unpoisoned(tiers);
+                reinsert_with_scores(&mut cache, &cold, &scored)
+            }
+            Err(err) => {
+                log::warn!("synso: heat carry-back skipped — cold reader open failed: {err}");
+                false
+            }
+        };
+        if !carried {
+            // The heat map was flushed and could not be rebuilt from the
+            // store: persisting now would replace the last good snapshot
+            // with an EMPTY table. Skip — the periodic persist or the
+            // next successful rescan re-snapshots whatever heat has
+            // re-earned by then.
+            return;
         }
     }
     let mut guard = lock_unpoisoned(store);
@@ -1335,11 +1368,19 @@ fn rescan_flush_thread_side(
 fn preheat_thread_side(tiers: &Arc<Mutex<TierCache<FileId, FileDetail>>>, db_path: &Path) {
     // Best-effort at every step: no reader or no snapshot means no
     // preheat, never an error.
-    let Ok(cold) = ColdReader::open(db_path) else {
-        return;
+    let cold = match ColdReader::open(db_path) {
+        Ok(cold) => cold,
+        Err(err) => {
+            log::warn!("synso: heat preheat skipped — cold reader open failed: {err}");
+            return;
+        }
     };
-    let Ok(rows) = cold.read_heat(HEAT_MAX_ROWS) else {
-        return;
+    let rows = match cold.read_heat(HEAT_MAX_ROWS) {
+        Ok(rows) => rows,
+        Err(err) => {
+            log::warn!("synso: heat preheat skipped — heat snapshot read failed: {err}");
+            return;
+        }
     };
     let mut cache = lock_unpoisoned(tiers);
     let policy = cache.policy();
@@ -3105,6 +3146,51 @@ mod tests {
         assert!(
             tiers.heat_above_floor(5).iter().any(|(k, _)| *k == id),
             "the flush carries the score — it must not zero it"
+        );
+    }
+
+    /// The no-wipe guard: when the carry-back cold read FAILS, the rescan
+    /// flush must SKIP its persist — the flush already emptied the heat
+    /// map, so persisting would overwrite the last good snapshot with an
+    /// empty table. The failure is forced with a db path no reader can
+    /// open (a read-only SQLite open cannot create a file); production
+    /// always passes the store's own db, so the seam stays test-only.
+    #[test]
+    fn rescan_flush_failed_carry_keeps_persisted_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id) = detail_fixture(&tmp);
+        let db_path = tmp.path().join("index.db");
+
+        {
+            let mut tiers = lock_unpoisoned(&engine.tiers);
+            tiers.set_policy(crate::tiers::MemoryPolicy {
+                hot_threshold: 1,
+                promote_hits: 2,
+                ..crate::tiers::MemoryPolicy::default()
+            });
+        }
+        let _ = engine.file_detail(id); // staging
+        let _ = engine.file_detail(id); // → hot, raw 256
+        engine.persist_heat();
+
+        let before = ColdReader::open(&db_path)
+            .unwrap()
+            .read_heat(HEAT_MAX_ROWS)
+            .unwrap();
+        assert!(!before.is_empty(), "precondition: a snapshot exists");
+
+        // The companion thread's body with an unopenable db path: the
+        // flush runs (preload on), the carry fails at ColdReader::open,
+        // and the persist must be skipped.
+        rescan_flush_thread_side(&engine.tiers, &engine.store, &tmp.path().join("absent.db"));
+
+        let after = ColdReader::open(&db_path)
+            .unwrap()
+            .read_heat(HEAT_MAX_ROWS)
+            .unwrap();
+        assert_eq!(
+            after, before,
+            "a failed carry must not wipe the persisted snapshot"
         );
     }
 }

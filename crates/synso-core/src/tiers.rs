@@ -347,14 +347,6 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone> TierCache<K, V> {
         true
     }
 
-    /// Snapshot of the hot tier's contents (rescan-preheat path).
-    pub fn hot_snapshot(&self) -> Vec<(K, V, u64)> {
-        self.hot
-            .iter()
-            .map(|(k, (v, bytes))| (k.clone(), v.clone(), *bytes))
-            .collect()
-    }
-
     /// Direct hot insert carrying a persisted heat score — the
     /// restart-backfill path (the snapshot's ×256 fixed-point score
     /// re-enters with the entry; no threshold re-check). Budget eviction
