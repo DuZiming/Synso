@@ -6,7 +6,7 @@
 
 use notify::{recommended_watcher, RecursiveMode, Watcher};
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 fn main() {
     let root = std::env::args().nth(1).unwrap_or_else(|| "C:\\".into());
