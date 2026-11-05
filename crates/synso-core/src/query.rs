@@ -308,13 +308,17 @@ pub(crate) fn run_parsed(
 /// budget at 1M entries, and even a memoized text lookup per slot kept it
 /// over the line). Full paths still never materialize for the whole
 /// population, only for the returned page.
+/// The `path:` filter, prepared once per pass: which directories' full
+/// path texts contain the (lowercased) needle. Semantics are
+/// DIRECTORY-ONLY (the manual's 限定目录, fixed 2026-11-05): the old
+/// "full path contains" reading also matched the FILE NAME component, so
+/// `path:docs` let every docs-named file in every other directory
+/// through — users read it as "no filtering". Separator needles work the
+/// same way (the dir texts are separator-joined), which also retired the
+/// old materialize-every-slot-path fallback entirely.
 enum PathFilter {
     None,
-    Materialize(String),
-    Fast {
-        needle: String,
-        dir_hits: HashSet<FileId>,
-    },
+    Dirs { dir_hits: HashSet<FileId> },
 }
 
 impl PathFilter {
@@ -324,9 +328,6 @@ impl PathFilter {
             return PathFilter::None;
         };
         let needle = raw.to_lowercase();
-        if needle.contains(['/', '\\']) {
-            return PathFilter::Materialize(needle);
-        }
         // Which dirs' full path texts contain the needle — built once per
         // pass over the interned tree through the per-dir text memo; a
         // scan-root tree holds orders of magnitude fewer dirs than slots.
@@ -336,7 +337,7 @@ impl PathFilter {
             .filter(|(id, _, _)| dir_path_lower(hot, *id, &mut memo).contains(&needle))
             .map(|(id, _, _)| id)
             .collect();
-        PathFilter::Fast { needle, dir_hits }
+        PathFilter::Dirs { dir_hits }
     }
 }
 
@@ -379,32 +380,16 @@ fn passes_filters(
     }
     match path_filter {
         PathFilter::None => {}
-        PathFilter::Materialize(needle) => {
-            if !hot.path_of(slot).to_lowercase().contains(needle) {
-                return false;
-            }
-        }
-        PathFilter::Fast { needle, dir_hits } => {
-            // The name check is the cheaper probe and short-circuits the
-            // dir-set lookup for name-bearing paths. The PREPARED needle
-            // (first-byte skip) beats `str::contains` on the reject-heavy
-            // path: the name misses dominate this filter's cost.
-            if !word_probe(needle, hot.name_lower(slot))
-                && !dir_hits.contains(&hot.parent_dir(slot))
-            {
+        // Directory-only (see [`PathFilter`]): one hash probe on the
+        // slot's parent dir. The name never participates — that was the
+        // 2026-11-05 bug this arm replaced.
+        PathFilter::Dirs { dir_hits } => {
+            if !dir_hits.contains(&hot.parent_dir(slot)) {
                 return false;
             }
         }
     }
     true
-}
-
-/// First-byte-probe substring scan of a prepared needle into `hay` —
-/// `PreparedWord::find_from`'s containment check, standalone for the path
-/// filter (whose needle is built once per pass like a PreparedWord but
-/// lives in `PathFilter`, not the words list).
-fn word_probe(needle: &str, hay: &str) -> bool {
-    PreparedWord::new(needle).contained_in(hay)
 }
 
 /// Full lowercased path text of dir `id` — root segment, ..., name,
@@ -1300,19 +1285,27 @@ mod tests {
             (small.total, names(&small)),
             (1, vec!["annual-report-small.docx"])
         );
-        // path: a case-insensitive substring on the full path.
+        // path: a case-insensitive substring on the DIRECTORY text only
+        // (2026-11-05 fix: the name never counts — see
+        // `path_filter_is_directory_only`).
         assert_eq!(engine.search("annual path:docs", 0, 10).total, 2);
         assert_eq!(engine.search("annual path:DOCS", 0, 10).total, 2);
         assert_eq!(engine.search("annual path:other ext:pdf", 0, 10).total, 1);
-        // A separator-bearing needle keeps the materialize-and-check path;
-        // it matches only when the separator spelling matches the
-        // platform's (the joined `Hit::path` spelling).
+        // A separator-bearing needle matches inside the dir text too ...
         let sep = MAIN_SEPARATOR;
+        assert_eq!(
+            engine
+                .search(&format!("annual path:fixture{sep}docs"), 0, 10)
+                .total,
+            2
+        );
+        // ... but crossing into the FILE NAME no longer matches: the
+        // name is not part of the path filter.
         assert_eq!(
             engine
                 .search(&format!("annual path:docs{sep}annual"), 0, 10)
                 .total,
-            2
+            0
         );
         assert_eq!(
             engine
@@ -1402,5 +1395,33 @@ mod tests {
         assert_eq!(engine.search("report pdf", 0, 10).total, 2);
         // A word matching nothing rejects the whole query.
         assert_eq!(engine.search("annual missingword", 0, 10).total, 0);
+    }
+
+    /// `path:` filters by the DIRECTORY part only (the manual's 限定目录,
+    /// 2026-11-05 fix): a needle matching the FILE NAME but not the path
+    /// must NOT pass — the old "full path contains" semantics let every
+    /// same-named file through and read as "no filtering".
+    #[test]
+    fn path_filter_is_directory_only() {
+        let hot = indexed(&[
+            (&["C:", "Users", "ad", "docs"], "report.txt", NOW, false),
+            (&["C:", "Users", "ad", "pics"], "docs-notes.txt", NOW, false),
+            (&["C:", "work", "docs"], "other.md", NOW, false),
+            (&["C:", "plain"], "plain.txt", NOW, false),
+        ]);
+        // "docs" in the PATH only: report.txt (docs dir) + other.md
+        // (work\docs) pass; docs-notes.txt (name says docs, path says
+        // pics) must NOT.
+        let r = run(&hot, "path:docs", 0, 10, NOW);
+        assert_eq!(r.total, 2, "directory-only: names never count");
+        // A separator needle matches inside the dir text too.
+        let r = run(&hot, r"path:work\docs", 0, 10, NOW);
+        assert_eq!(r.total, 1);
+        // Combined with free text.
+        let r = run(&hot, "path:docs report", 0, 10, NOW);
+        assert_eq!(r.total, 1);
+        // A needle nothing matches filters to zero.
+        let r = run(&hot, "path:zzz", 0, 10, NOW);
+        assert_eq!(r.total, 0);
     }
 }
