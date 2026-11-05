@@ -119,7 +119,7 @@ const SLOT_TABLE_MIN_CAPACITY: usize = 8;
 /// index used to carry as `slot_by_parent_name` (v1.2: the HashMap's
 /// estimate was ≈60MB at 2.1M entries, 24B per live entry before load
 /// slack; 8-byte entries over a power-of-two capacity land at roughly
-/// half that — exact numbers in the v1.3 mem_probe backfill).
+/// half that — exact numbers in `docs/known-issues-v1.md`'s v1.2 遗留 section).
 ///
 /// Entries are `(fingerprint, slot)` pairs — fingerprint = the high 32
 /// bits of [`parent_name_hash`], home bucket = the fingerprint's low
@@ -178,7 +178,7 @@ impl NameSlotTable {
         table
     }
 
-    /// Live bytes under the breakdown's口径: the entries vec's length
+    /// Live bytes under the breakdown's accounting: the entries vec's length
     /// × 8 (the power-of-two capacity IS the live allocation here —
     /// no separate load-factor slack like a std HashMap's).
     fn mem_bytes(&self) -> u64 {
@@ -843,7 +843,7 @@ impl HotIndex {
         // loop skip silently; the tally is the count).
         if index.skipped_oversized > 0 {
             log::warn!(
-                "synso: load skipped {} row(s) with names over 64 KiB (StrRef guard)",
+                "synso: load skipped {} row(s)/dir(s) with names over 64 KiB (StrRef guard)",
                 index.skipped_oversized
             );
         }
@@ -2292,6 +2292,37 @@ mod tests {
         t.rebind(300, 5, 9);
         assert_eq!(t.get_matching(300, |s| s == 9), Some(9));
         assert_eq!(t.len, 3);
+    }
+
+    /// Same-fingerprint collision (spec: "指纹碰撞走验证兜底"): two
+    /// entries sharing ONE fingerprint but holding distinct slots
+    /// coexist on one probe chain — the read walk hands each same-fp
+    /// candidate to the host predicate, so the entry whose host check
+    /// fails is SKIPPED (the verify-fallback branch) and the one it
+    /// matches still resolves. Removing one entry steps past its
+    /// same-fp neighbor (the victim is matched by the stored slot
+    /// number, not the first fingerprint hit), and the backward shift
+    /// keeps the survivor reachable.
+    #[test]
+    fn name_slot_table_same_fingerprint_collision() {
+        let mut t = NameSlotTable::new(0);
+        t.insert(777, 10);
+        t.insert(777, 11); // same fp, distinct slots: collides by design
+        assert_eq!(t.len, 2);
+        assert_eq!(
+            t.get_matching(777, |s| s == 11),
+            Some(11),
+            "host check skips the same-fp neighbor whose slot mismatches"
+        );
+        assert_eq!(t.get_matching(777, |s| s == 10), Some(10));
+        assert!(t.remove_by_slot(777, 10));
+        assert_eq!(t.len, 1);
+        assert_eq!(
+            t.get_matching(777, |s| s == 11),
+            Some(11),
+            "survivor stays reachable after the removal's backward shift"
+        );
+        assert_eq!(t.get_matching(777, |s| s == 10), None, "removed pair is gone");
     }
 
     /// Growth rehash (Review Focus 3): 100k synthetic fingerprints from an
