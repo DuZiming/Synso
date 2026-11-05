@@ -353,6 +353,25 @@ impl Watcher {
             sidecar_path.push(sidecar);
             db_filter.push(sidecar_path.to_string_lossy().to_lowercase());
         }
+        // The app's OWN log files join the self-feedback filter (same
+        // class as the db sidecars, 2026-11-05): every watcher batch /
+        // walk logs a line, the write re-enters as a file event, and a
+        // warn storm would amplify itself into an event flood — the log
+        // is pure churn from the index's point of view. All three
+        // rotation generations (`synso.log`, `.1`, `.2` — see the app's
+        // `logging` module) are listed; rotation renames land on one of
+        // them.
+        if let Some(data_dir) = db_path.parent() {
+            for name in ["synso.log", "synso.log.1", "synso.log.2"] {
+                db_filter.push(
+                    data_dir
+                        .join("logs")
+                        .join(name)
+                        .to_string_lossy()
+                        .to_lowercase(),
+                );
+            }
+        }
         let ctx = Ctx {
             store,
             hot,
