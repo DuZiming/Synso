@@ -644,6 +644,10 @@ fn apply_batch(ctx: &Ctx, walks: &WalkQueue, pending: &mut BTreeMap<PathBuf, Pen
         if let Err(err) = batch_result {
             log::error!("synso: watcher batch transaction failed: {err}");
         }
+        log::info!(
+            "synso: watcher batch: {applied} ops, {} queued walk(s)",
+            lock_unpoisoned(&walks.pending).len()
+        );
         // Renames already contribute removals through their from-side.
     }
     {
@@ -697,7 +701,8 @@ fn apply_batch(ctx: &Ctx, walks: &WalkQueue, pending: &mut BTreeMap<PathBuf, Pen
 /// time is the arbiter: rows the walk does not see on disk are never
 /// (re-)added, so a cancelled-but-delivered stale walk wastes effort at
 /// worst.
-fn walk_one(ctx: &Ctx, job: &WalkJob) {
+fn walk_one(ctx: &Ctx, walks: &WalkQueue, job: &WalkJob) {
+    let started = Instant::now();
     // Batch-priority yield: a small batch raising its flag beats this
     // walk to the store mutex. Bounded by BATCH_PRIORITY_YIELD_CAP so a
     // flag stranded by a panicked batch cannot starve walks forever.
@@ -750,6 +755,13 @@ fn walk_one(ctx: &Ctx, job: &WalkJob) {
         (ctx.on_upserted_ids)(&upserted);
         broadcast(&ctx.subscribers, EngineEvent::FsChanged);
     }
+    log::info!(
+        "synso: watcher walk: {:?} → {} row(s) in {}ms, {} queued",
+        job.path,
+        walked.len(),
+        started.elapsed().as_millis(),
+        lock_unpoisoned(&walks.pending).len()
+    );
 }
 
 /// The walker thread: drains the [`WalkQueue`] until stopped. On stop it
@@ -762,7 +774,7 @@ fn run_walker(ctx: &Ctx, walks: &WalkQueue, jobs: &Receiver<WalkJob>, stop_rx: &
             recv(jobs) -> msg => match msg {
                 Ok(job) => {
                     if walks.claim(&job.path) {
-                        walk_one(ctx, &job);
+                        walk_one(ctx, walks, &job);
                     }
                 }
                 Err(_) => return, // queue dropped: nothing walkable remains
@@ -770,7 +782,7 @@ fn run_walker(ctx: &Ctx, walks: &WalkQueue, jobs: &Receiver<WalkJob>, stop_rx: &
             recv(stop_rx) -> _ => {
                 while let Ok(job) = jobs.try_recv() {
                     if walks.claim(&job.path) {
-                        walk_one(ctx, &job);
+                        walk_one(ctx, walks, &job);
                     }
                 }
                 return;
