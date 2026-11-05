@@ -549,49 +549,70 @@ fn apply_batch(ctx: &Ctx, walks: &WalkQueue, pending: &mut BTreeMap<PathBuf, Pen
     let mut hot_ops: Vec<HotOp> = Vec::new();
     let mut applied = 0u32;
     {
-        // Pass 1: store writes only — the hot index is not held, so
-        // searches never wait on this pass's per-row commits.
+        // Pass 1: store writes only — ONE transaction for the whole batch
+        // (2026-11-05: per-row autocommit paid a WAL sync per row; a busy
+        // batch's rows serialised into seconds of latency for every small
+        // op riding it) — and the hot index is not held, so searches never
+        // wait on this pass's commits. Per-op failures stay per-op: each
+        // is logged inside the closure and the batch continues, so a
+        // partial batch still commits its successful rows like before.
         let mut store = lock_unpoisoned(&ctx.store);
-        for (path, entry) in &removals {
-            let segments: Vec<&str> = entry.segments.iter().map(String::as_str).collect();
-            remove_path_store(&mut store, &segments, &entry.name, path);
-            // A removed dir takes its pending walk with it (the walk
-            // would only index what the removal just purged — or, after a
-            // rename, re-walk what the rename's own new-side walk covers).
-            walks.cancel_under(path);
-            hot_ops.push(HotOp::Remove {
-                segments: entry.segments.clone(),
-                name: entry.name.clone(),
-            });
-            applied += 1;
-        }
-        for (path, entry, rec) in upserts {
-            let segments: Vec<&str> = entry.segments.iter().map(String::as_str).collect();
-            let mut rec = rec;
-            match store.upsert_file(&segments, &mut rec) {
-                Ok(()) => {
-                    // A directory arrives as ONE event with no child
-                    // events: a populated create, or a rename/move whose
-                    // whole subtree silently rode along (the Remove side
-                    // above already purged the old location AND cancelled
-                    // any walk pending for it). The descendants are
-                    // indexed by the ASYNC walker (`WalkQueue`, 2026-11-05
-                    // latency fix) — never in-batch, so one big tree
-                    // cannot queue small ops behind its walk.
-                    if rec.is_dir {
-                        let mut dir_segments = entry.segments.clone();
-                        dir_segments.push(entry.name.clone());
-                        walks.submit(WalkJob {
-                            path: path.to_path_buf(),
-                            dir_segments,
-                            root_idx: entry.root_idx,
-                        });
-                    }
-                    hot_ops.push(HotOp::Upsert(rec));
-                    applied += 1;
+        let batch_result = store.watcher_tx(|conn, gen| {
+            for (path, entry) in &removals {
+                let segments: Vec<&str> = entry.segments.iter().map(String::as_str).collect();
+                if let Err(err) = crate::store::delete_file_by_path_on(conn, &segments, &entry.name)
+                {
+                    log::error!("synso: watcher delete of {path:?} failed: {err}");
                 }
-                Err(err) => log::error!("synso: watcher upsert of {path:?} failed: {err}"),
+                let mut subtree: Vec<&str> = segments.clone();
+                subtree.push(entry.name.as_str());
+                if let Err(err) = crate::store::delete_subtree_on(conn, &subtree) {
+                    log::error!("synso: watcher subtree delete of {path:?} failed: {err}");
+                }
+                // A removed dir takes its pending walk with it (the walk
+                // would only index what the removal just purged — or,
+                // after a rename, re-walk what the rename's own new-side
+                // walk covers).
+                walks.cancel_under(path);
+                hot_ops.push(HotOp::Remove {
+                    segments: entry.segments.clone(),
+                    name: entry.name.clone(),
+                });
+                applied += 1;
             }
+            for (path, entry, rec) in &upserts {
+                let segments: Vec<&str> = entry.segments.iter().map(String::as_str).collect();
+                let mut rec = rec.clone();
+                match crate::store::upsert_file_on(conn, gen, &segments, &mut rec) {
+                    Ok(()) => {
+                        // A directory arrives as ONE event with no child
+                        // events: a populated create, or a rename/move
+                        // whose whole subtree silently rode along (the
+                        // Remove side above already purged the old
+                        // location AND cancelled any walk pending for
+                        // it). The descendants are indexed by the ASYNC
+                        // walker (`WalkQueue`, 2026-11-05 latency fix) —
+                        // never in-batch, so one big tree cannot queue
+                        // small ops behind its walk.
+                        if rec.is_dir {
+                            let mut dir_segments = entry.segments.clone();
+                            dir_segments.push(entry.name.clone());
+                            walks.submit(WalkJob {
+                                path: path.to_path_buf(),
+                                dir_segments,
+                                root_idx: entry.root_idx,
+                            });
+                        }
+                        hot_ops.push(HotOp::Upsert(rec));
+                        applied += 1;
+                    }
+                    Err(err) => log::error!("synso: watcher upsert of {path:?} failed: {err}"),
+                }
+            }
+            Ok(())
+        });
+        if let Err(err) = batch_result {
+            log::error!("synso: watcher batch transaction failed: {err}");
         }
         // Renames already contribute removals through their from-side.
     }
