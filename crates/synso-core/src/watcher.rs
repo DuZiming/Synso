@@ -80,6 +80,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -106,6 +107,11 @@ pub(crate) const MAX_DEFER: Duration = Duration::from_secs(2);
 
 /// Wake-up granularity while no window is open (no pending ops): only a
 /// safety net — events and the stop signal wake the thread immediately.
+/// How long the walker yields to a set batch-priority flag before
+/// proceeding anyway (see [`Ctx::batch_wants_store`]): bounded so a flag
+/// stranded by a panicked batch self-heals instead of starving walks.
+const BATCH_PRIORITY_YIELD_CAP: Duration = Duration::from_secs(5);
+
 const SLOW_POLL: Duration = Duration::from_secs(600);
 
 /// Per-path final disposition after merging a whole quiet window of events.
@@ -142,6 +148,15 @@ struct Ctx {
     store: Arc<Mutex<Store>>,
     hot: Arc<RwLock<HotIndex>>,
     subscribers: Arc<Mutex<Vec<Sender<EngineEvent>>>>,
+    /// Batch-priority handshake (2026-11-05): the debounce thread sets
+    /// this BEFORE taking the store mutex for a batch's store half and
+    /// clears it when done; the walker yields (sleeps) while it is set,
+    /// so small batches never queue behind a stream of subtree walks —
+    /// they wait out at most the walk already in flight. The walker's
+    /// yield is deadline-bounded: a flag stuck by a panicked batch
+    /// self-heals after `BATCH_PRIORITY_YIELD_CAP` instead of starving
+    /// the walker forever.
+    batch_wants_store: Arc<AtomicBool>,
     /// v1.2 dimension-cache invalidation: called with the file ids each
     /// applied batch UPSERTED (their cached detail rows are stale by
     /// definition — the store may have nulled hashes on mtime/size
@@ -335,6 +350,7 @@ impl Watcher {
             store,
             hot,
             subscribers,
+            batch_wants_store: Arc::new(AtomicBool::new(false)),
             on_upserted_ids,
             matcher,
             roots,
@@ -556,61 +572,75 @@ fn apply_batch(ctx: &Ctx, walks: &WalkQueue, pending: &mut BTreeMap<PathBuf, Pen
         // wait on this pass's commits. Per-op failures stay per-op: each
         // is logged inside the closure and the batch continues, so a
         // partial batch still commits its successful rows like before.
-        let mut store = lock_unpoisoned(&ctx.store);
-        let batch_result = store.watcher_tx(|conn, gen| {
-            for (path, entry) in &removals {
-                let segments: Vec<&str> = entry.segments.iter().map(String::as_str).collect();
-                if let Err(err) = crate::store::delete_file_by_path_on(conn, &segments, &entry.name)
-                {
-                    log::error!("synso: watcher delete of {path:?} failed: {err}");
-                }
-                let mut subtree: Vec<&str> = segments.clone();
-                subtree.push(entry.name.as_str());
-                if let Err(err) = crate::store::delete_subtree_on(conn, &subtree) {
-                    log::error!("synso: watcher subtree delete of {path:?} failed: {err}");
-                }
-                // A removed dir takes its pending walk with it (the walk
-                // would only index what the removal just purged — or,
-                // after a rename, re-walk what the rename's own new-side
-                // walk covers).
-                walks.cancel_under(path);
-                hot_ops.push(HotOp::Remove {
-                    segments: entry.segments.clone(),
-                    name: entry.name.clone(),
-                });
-                applied += 1;
-            }
-            for (path, entry, rec) in &upserts {
-                let segments: Vec<&str> = entry.segments.iter().map(String::as_str).collect();
-                let mut rec = rec.clone();
-                match crate::store::upsert_file_on(conn, gen, &segments, &mut rec) {
-                    Ok(()) => {
-                        // A directory arrives as ONE event with no child
-                        // events: a populated create, or a rename/move
-                        // whose whole subtree silently rode along (the
-                        // Remove side above already purged the old
-                        // location AND cancelled any walk pending for
-                        // it). The descendants are indexed by the ASYNC
-                        // walker (`WalkQueue`, 2026-11-05 latency fix) —
-                        // never in-batch, so one big tree cannot queue
-                        // small ops behind its walk.
-                        if rec.is_dir {
-                            let mut dir_segments = entry.segments.clone();
-                            dir_segments.push(entry.name.clone());
-                            walks.submit(WalkJob {
-                                path: path.to_path_buf(),
-                                dir_segments,
-                                root_idx: entry.root_idx,
-                            });
-                        }
-                        hot_ops.push(HotOp::Upsert(rec));
-                        applied += 1;
+        // Batch-priority handshake: raise the flag, THEN take the store
+        // mutex — the walker (which holds the mutex for whole walks)
+        // yields while the flag is set, so this pass waits out at most
+        // the one walk already in flight, never a queue of them.
+        ctx.batch_wants_store.store(true, Ordering::Release);
+        let batch_result = {
+            let mut store = lock_unpoisoned(&ctx.store);
+            let result = store.watcher_tx(|conn, gen| {
+                for (path, entry) in &removals {
+                    let segments: Vec<&str> = entry.segments.iter().map(String::as_str).collect();
+                    if let Err(err) =
+                        crate::store::delete_file_by_path_on(conn, &segments, &entry.name)
+                    {
+                        log::error!("synso: watcher delete of {path:?} failed: {err}");
                     }
-                    Err(err) => log::error!("synso: watcher upsert of {path:?} failed: {err}"),
+                    let mut subtree: Vec<&str> = segments.clone();
+                    subtree.push(entry.name.as_str());
+                    if let Err(err) = crate::store::delete_subtree_on(conn, &subtree) {
+                        log::error!("synso: watcher subtree delete of {path:?} failed: {err}");
+                    }
+                    // A removed dir takes its pending walk with it (the walk
+                    // would only index what the removal just purged — or,
+                    // after a rename, re-walk what the rename's own new-side
+                    // walk covers).
+                    walks.cancel_under(path);
+                    hot_ops.push(HotOp::Remove {
+                        segments: entry.segments.clone(),
+                        name: entry.name.clone(),
+                    });
+                    applied += 1;
                 }
-            }
-            Ok(())
-        });
+                for (path, entry, rec) in &upserts {
+                    let segments: Vec<&str> = entry.segments.iter().map(String::as_str).collect();
+                    let mut rec = rec.clone();
+                    match crate::store::upsert_file_on(conn, gen, &segments, &mut rec) {
+                        Ok(()) => {
+                            // A directory arrives as ONE event with no child
+                            // events: a populated create, or a rename/move
+                            // whose whole subtree silently rode along (the
+                            // Remove side above already purged the old
+                            // location AND cancelled any walk pending for
+                            // it). The descendants are indexed by the ASYNC
+                            // walker (`WalkQueue`, 2026-11-05 latency fix) —
+                            // never in-batch, so one big tree cannot queue
+                            // small ops behind its walk.
+                            if rec.is_dir {
+                                let mut dir_segments = entry.segments.clone();
+                                dir_segments.push(entry.name.clone());
+                                walks.submit(WalkJob {
+                                    path: path.to_path_buf(),
+                                    dir_segments,
+                                    root_idx: entry.root_idx,
+                                });
+                            }
+                            hot_ops.push(HotOp::Upsert(rec));
+                            applied += 1;
+                        }
+                        Err(err) => log::error!("synso: watcher upsert of {path:?} failed: {err}"),
+                    }
+                }
+                Ok(())
+            });
+            result
+        };
+        // Store guard dropped with the block: clear the flag only after
+        // the mutex is released, so the walker (which re-checks before
+        // TAKING the lock) can never observe a cleared flag and then
+        // collide with this pass's still-held mutex.
+        ctx.batch_wants_store.store(false, Ordering::Release);
         if let Err(err) = batch_result {
             log::error!("synso: watcher batch transaction failed: {err}");
         }
@@ -668,6 +698,13 @@ fn apply_batch(ctx: &Ctx, walks: &WalkQueue, pending: &mut BTreeMap<PathBuf, Pen
 /// (re-)added, so a cancelled-but-delivered stale walk wastes effort at
 /// worst.
 fn walk_one(ctx: &Ctx, job: &WalkJob) {
+    // Batch-priority yield: a small batch raising its flag beats this
+    // walk to the store mutex. Bounded by BATCH_PRIORITY_YIELD_CAP so a
+    // flag stranded by a panicked batch cannot starve walks forever.
+    let yield_until = Instant::now() + BATCH_PRIORITY_YIELD_CAP;
+    while ctx.batch_wants_store.load(Ordering::Acquire) && Instant::now() < yield_until {
+        std::thread::sleep(Duration::from_millis(2));
+    }
     let mut walked: Vec<FileRecord> = Vec::new();
     {
         let mut store = lock_unpoisoned(&ctx.store);
