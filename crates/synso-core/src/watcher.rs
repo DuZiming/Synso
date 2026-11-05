@@ -34,16 +34,22 @@
 //!    stays the scan path;
 //! 3. [`EngineEvent::FsChanged`] broadcasts as a UI refresh hint.
 //!
-//! Directory arrivals walk: an upsert that resolves to a DIRECTORY gets
-//! its subtree indexed in-batch via [`scanner::scan_subtree`] — the OS
-//! reports only the directory entry itself (ReadDirectoryChangesW /
-//! inotify deliver no events for the children), so a populated create or
-//! a rename/move would otherwise lose every descendant until the next
-//! rescan. The walk runs under the store lock the batch already holds —
-//! the exact discipline a full scan uses for its whole walk, watcher
-//! batches queue meanwhile — and is bounded by the same exclusion matcher
-//! and reparse-point guard; every walked row is hot-indexed through the
-//! incremental upsert path.
+//! Directory arrivals walk — ASYNC (2026-11-05 latency fix): an upsert
+//! that resolves to a DIRECTORY gets its row in-batch, but its subtree
+//! walk is handed to a [`WalkQueue`] drained by a dedicated walker thread
+//! — the OS reports only the directory entry itself (ReadDirectoryChangesW
+//! / inotify deliver no events for the children), so a populated create
+//! or a rename/move would otherwise lose every descendant until the next
+//! rescan. The walk itself keeps the exact discipline it always had —
+//! one walk at a time under the store lock (a full scan's per-root
+//! discipline), exclusion matcher + reparse-point guard, walked rows
+//! hot-indexed through the incremental upsert path, then one FsChanged.
+//! Moving the walk off the batch path fixed the measured 97s new-file
+//! visibility lag: an in-batch walk of one big tree (a build's target/,
+//! an installer's output) used to queue every later small op behind it;
+//! now small ops apply at debounce speed (≤2s) regardless of walk
+//! backlog, and walks coalesce (re-arrivals collapse) and cancel (a
+//! removed dir drops its pending walk).
 //!
 //! Queue-during-scan: a running scan holds the store mutex for its whole
 //! walk, so the debounce thread simply BLOCKS on the mutex at batch-apply
@@ -72,7 +78,7 @@
 //! still applied, so the index reflects the last-seen disk state) and joins
 //! it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -128,6 +134,10 @@ struct PendingOp {
 /// v1.2 invalidation callback: file ids each applied batch UPSERTED.
 type UpsertHook = Arc<dyn Fn(&[FileId]) + Send + Sync>;
 
+/// Everything the debounce thread needs, captured once at start. `Clone`:
+/// the async walker thread (subtree walks, 2026-11-05) gets its own copy —
+/// every field is an `Arc`, a `Clone` globset, or a plain `Vec`.
+#[derive(Clone)]
 struct Ctx {
     store: Arc<Mutex<Store>>,
     hot: Arc<RwLock<HotIndex>>,
@@ -147,6 +157,74 @@ struct Ctx {
     /// Lowercased database path + journal sidecars: events for these are
     /// self-feedback from the store's own writes and are dropped.
     db_filter: Vec<String>,
+}
+
+/// One queued subtree walk: the arrived directory's path, its
+/// `dirs`-table chain (root segment first, the dir itself LAST — the
+/// spelling the in-batch walk used to pass to `scan_subtree`), and the
+/// watch root index the dir belongs to.
+struct WalkJob {
+    path: PathBuf,
+    dir_segments: Vec<String>,
+    root_idx: usize,
+}
+
+/// The off-the-batch-path walk queue (latency fix, 2026-11-05). Directory
+/// arrivals used to walk their whole subtree INSIDE the batch apply under
+/// the store lock — one big tree (a build's `target/`, an installer's
+/// output) then queued every later small op behind a minutes-long walk,
+/// and new-file visibility lagged by the whole backlog (measured 97s on a
+/// churning machine). The batch now only upserts the dir ROW and hands
+/// the walk to this queue; a dedicated walker thread drains it. Small
+/// file ops never wait behind a walk again (≤ debounce window + ms).
+///
+/// Coalescing: a path already pending keeps its one job (a create-walk
+/// cancelled by a later rename-walk of the same tree is the common case —
+/// `cancel_under` drops it on the rename's remove side). Cancellation is
+/// best-effort case-SENSITIVE (Windows paths differ in case only under
+/// exotic input); a stale walk reads disk truth, so the worst outcome is
+/// a wasted walk, never a wrong row.
+struct WalkQueue {
+    tx: Sender<WalkJob>,
+    /// Paths with a queued job; the claim-on-pop half of coalescing.
+    pending: Mutex<HashSet<PathBuf>>,
+}
+
+impl WalkQueue {
+    /// The queue and the receiver its walker thread drains.
+    fn new() -> (Arc<WalkQueue>, Receiver<WalkJob>) {
+        let (tx, rx) = unbounded();
+        let queue = Arc::new(WalkQueue {
+            tx,
+            pending: Mutex::new(HashSet::new()),
+        });
+        (queue, rx)
+    }
+
+    /// Enqueues `job` unless its path is already pending (coalesce).
+    /// Returns whether this call actually queued.
+    fn submit(&self, job: WalkJob) -> bool {
+        let mut pending = lock_unpoisoned(&self.pending);
+        if pending.insert(job.path.clone()) {
+            let _ = self.tx.send(job);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Pops `path` from the pending set. `false` = cancelled while queued;
+    /// the walker skips the delivered job instead of walking it.
+    fn claim(&self, path: &Path) -> bool {
+        lock_unpoisoned(&self.pending).remove(path)
+    }
+
+    /// Drops pending walks whose root is `removed` or lies beneath it
+    /// (the batch's removal pass calls this for every removed path).
+    fn cancel_under(&self, removed: &Path) {
+        let mut pending = lock_unpoisoned(&self.pending);
+        pending.retain(|p| !(p == removed || p.starts_with(removed)));
+    }
 }
 
 impl Ctx {
@@ -194,12 +272,24 @@ impl Ctx {
 pub struct Watcher {
     stop: Sender<()>,
     thread: Option<JoinHandle<()>>,
+    /// The walker thread's stop signal + handle (async subtree walks,
+    /// 2026-11-05). Stopped AFTER the debounce thread joins: the debounce
+    /// thread's final batch may still submit walks, and the walker's own
+    /// final drain must see them.
+    stop_walk: Sender<()>,
+    walker: Option<JoinHandle<()>>,
 }
 
 impl Drop for Watcher {
     fn drop(&mut self) {
+        // Order matters: debounce first (its final drain submits the last
+        // walk jobs), walker second (its final drain then applies them).
         let _ = self.stop.send(());
         if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+        let _ = self.stop_walk.send(());
+        if let Some(handle) = self.walker.take() {
             let _ = handle.join();
         }
     }
@@ -251,6 +341,13 @@ impl Watcher {
             root_segments,
             db_filter,
         };
+        let (walks, walk_rx) = WalkQueue::new();
+        let (stop_walk_tx, stop_walk_rx) = unbounded::<()>();
+        let walker_ctx = ctx.clone();
+        let walks_for_walker = Arc::clone(&walks);
+        let spawn_walker = std::thread::Builder::new()
+            .name("synso-walker".into())
+            .spawn(move || run_walker(&walker_ctx, &walks_for_walker, &walk_rx, &stop_walk_rx));
         let spawn = std::thread::Builder::new()
             .name("synso-watcher".into())
             .spawn(move || {
@@ -258,19 +355,35 @@ impl Watcher {
                 // here on purpose, so dropping this handle stops watching.
                 let _fs_watcher = fs_watcher;
                 let mut pending = BTreeMap::new();
-                run_loop(&ctx, &event_rx, &stop_rx, &mut pending);
+                run_loop(&ctx, &walks, &event_rx, &stop_rx, &mut pending);
                 // Final drain: stopping with a non-empty window still
                 // applies it, so the index reflects last-seen disk state.
-                apply_batch(&ctx, &mut pending);
+                // (Its walk submits are honored: the walker is stopped
+                // only after this thread joins — see [`Watcher`].)
+                apply_batch(&ctx, &walks, &mut pending);
             });
-        match spawn {
-            Ok(thread) => Ok(Watcher {
+        match (spawn, spawn_walker) {
+            (Ok(thread), Ok(walker)) => Ok(Watcher {
                 stop: stop_tx,
                 thread: Some(thread),
+                stop_walk: stop_walk_tx,
+                walker: Some(walker),
             }),
-            Err(err) => {
-                log::error!("synso: failed to spawn the watcher thread: {err}");
-                Err(SynsoError::Io(err))
+            (spawn, spawn_walker) => {
+                // One side failed to spawn: stop + join whatever did, so a
+                // half-started watcher never leaks a thread.
+                let _ = stop_tx.send(());
+                let _ = stop_walk_tx.send(());
+                if let Ok(handle) = spawn {
+                    let _ = handle.join();
+                }
+                if let Ok(handle) = spawn_walker {
+                    let _ = handle.join();
+                }
+                log::error!("synso: failed to spawn the watcher/walker threads");
+                Err(SynsoError::Io(std::io::Error::other(
+                    "watcher thread spawn failed",
+                )))
             }
         }
     }
@@ -298,6 +411,7 @@ impl EventHandler for EventForwarder {
 /// the module docs for the lock/queueing story.
 fn run_loop(
     ctx: &Ctx,
+    walks: &WalkQueue,
     event_rx: &Receiver<NotifyEvent>,
     stop_rx: &Receiver<()>,
     pending: &mut BTreeMap<PathBuf, PendingOp>,
@@ -311,7 +425,7 @@ fn run_loop(
             let capped = (Instant::now() - started) >= MAX_DEFER;
             if let Some(at) = deadline {
                 if Instant::now() >= at || capped {
-                    apply_batch(ctx, pending);
+                    apply_batch(ctx, walks, pending);
                     deadline = None;
                     batch_started = None;
                     continue;
@@ -407,7 +521,7 @@ fn event_ops(event: &NotifyEvent) -> Vec<(PathBuf, Op)> {
 /// concurrent scan either finishes first (events safely queue in the
 /// channel) or runs after this batch wholesale, and batches can never
 /// interleave with a scan reload.
-fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
+fn apply_batch(ctx: &Ctx, walks: &WalkQueue, pending: &mut BTreeMap<PathBuf, PendingOp>) {
     if pending.is_empty() {
         return;
     }
@@ -441,6 +555,10 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
         for (path, entry) in &removals {
             let segments: Vec<&str> = entry.segments.iter().map(String::as_str).collect();
             remove_path_store(&mut store, &segments, &entry.name, path);
+            // A removed dir takes its pending walk with it (the walk
+            // would only index what the removal just purged — or, after a
+            // rename, re-walk what the rename's own new-side walk covers).
+            walks.cancel_under(path);
             hot_ops.push(HotOp::Remove {
                 segments: entry.segments.clone(),
                 name: entry.name.clone(),
@@ -455,36 +573,19 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
                     // A directory arrives as ONE event with no child
                     // events: a populated create, or a rename/move whose
                     // whole subtree silently rode along (the Remove side
-                    // above already purged the old location). Walk the new
-                    // subtree in-batch — bounded by the exclusion matcher
-                    // and the reparse-point guard — and queue every walked
-                    // row for the hot replay.
+                    // above already purged the old location AND cancelled
+                    // any walk pending for it). The descendants are
+                    // indexed by the ASYNC walker (`WalkQueue`, 2026-11-05
+                    // latency fix) — never in-batch, so one big tree
+                    // cannot queue small ops behind its walk.
                     if rec.is_dir {
                         let mut dir_segments = entry.segments.clone();
                         dir_segments.push(entry.name.clone());
-                        let mut walked: Vec<FileRecord> = Vec::new();
-                        let mut store_row = |_store: &Store, walked_row: &FileRecord| {
-                            walked.push(walked_row.clone());
-                        };
-                        match scanner::scan_subtree(
-                            &mut store,
-                            path,
-                            &dir_segments,
-                            &ctx.roots[entry.root_idx],
-                            &ctx.matcher,
-                            &mut store_row,
-                        ) {
-                            Ok(sub) if sub.errors > 0 => {
-                                log::warn!(
-                                    "synso: watcher subtree walk of {path:?} skipped {sub:?}"
-                                )
-                            }
-                            Ok(_) => {}
-                            Err(err) => {
-                                log::error!("synso: watcher subtree walk of {path:?} failed: {err}")
-                            }
-                        }
-                        hot_ops.extend(walked.into_iter().map(HotOp::Upsert));
+                        walks.submit(WalkJob {
+                            path: path.to_path_buf(),
+                            dir_segments,
+                            root_idx: entry.root_idx,
+                        });
                     }
                     hot_ops.push(HotOp::Upsert(rec));
                     applied += 1;
@@ -532,6 +633,91 @@ fn apply_batch(ctx: &Ctx, pending: &mut BTreeMap<PathBuf, PendingOp>) {
             (ctx.on_upserted_ids)(&upserted);
         }
         broadcast(&ctx.subscribers, EngineEvent::FsChanged);
+    }
+}
+
+/// Walks ONE queued directory (the async half of the old in-batch walk,
+/// verbatim discipline): the whole subtree walk runs under the store lock
+/// — a full scan's per-root discipline, so watcher batches queue behind
+/// at most this one walk, never a growing pile — then the walked rows
+/// replay into the hot index under the canonical store→hot pair, the
+/// upserted ids invalidate their cached dimensions, and `FsChanged`
+/// broadcasts so the UI sees the descendants land. Disk truth at walk
+/// time is the arbiter: rows the walk does not see on disk are never
+/// (re-)added, so a cancelled-but-delivered stale walk wastes effort at
+/// worst.
+fn walk_one(ctx: &Ctx, job: &WalkJob) {
+    let mut walked: Vec<FileRecord> = Vec::new();
+    {
+        let mut store = lock_unpoisoned(&ctx.store);
+        let mut store_row = |_store: &Store, walked_row: &FileRecord| {
+            walked.push(walked_row.clone());
+        };
+        match scanner::scan_subtree(
+            &mut store,
+            &job.path,
+            &job.dir_segments,
+            &ctx.roots[job.root_idx],
+            &ctx.matcher,
+            &mut store_row,
+        ) {
+            Ok(sub) if sub.errors > 0 => {
+                log::warn!(
+                    "synso: watcher subtree walk of {:?} skipped {sub:?}",
+                    job.path
+                )
+            }
+            Ok(_) => {}
+            Err(err) => {
+                log::error!(
+                    "synso: watcher subtree walk of {:?} failed: {err}",
+                    job.path
+                )
+            }
+        }
+    }
+    let mut upserted: Vec<FileId> = Vec::with_capacity(walked.len());
+    {
+        let store = lock_unpoisoned(&ctx.store);
+        let mut hot = write_unpoisoned(&ctx.hot);
+        for rec in &walked {
+            if let Err(err) = hot.upsert_slot(&store, rec) {
+                log::error!("synso: watcher hot upsert of {rec:?} failed: {err}");
+            }
+            upserted.push(rec.id);
+        }
+        hot.maybe_compact_arena();
+    }
+    if !upserted.is_empty() {
+        (ctx.on_upserted_ids)(&upserted);
+        broadcast(&ctx.subscribers, EngineEvent::FsChanged);
+    }
+}
+
+/// The walker thread: drains the [`WalkQueue`] until stopped. On stop it
+/// drains what is already queued (bounded by the queue's current
+/// contents) so shutdown leaves the index at last-seen state — the same
+/// final-drain contract the debounce thread honors.
+fn run_walker(ctx: &Ctx, walks: &WalkQueue, jobs: &Receiver<WalkJob>, stop_rx: &Receiver<()>) {
+    loop {
+        crossbeam_channel::select! {
+            recv(jobs) -> msg => match msg {
+                Ok(job) => {
+                    if walks.claim(&job.path) {
+                        walk_one(ctx, &job);
+                    }
+                }
+                Err(_) => return, // queue dropped: nothing walkable remains
+            },
+            recv(stop_rx) -> _ => {
+                while let Ok(job) = jobs.try_recv() {
+                    if walks.claim(&job.path) {
+                        walk_one(ctx, &job);
+                    }
+                }
+                return;
+            },
+        }
     }
 }
 
@@ -1066,5 +1252,74 @@ mod tests {
 
         storming.store(false, std::sync::atomic::Ordering::SeqCst);
         storm_thread.join().unwrap();
+    }
+    // ---- async subtree walks (latency fix, 2026-11-05) ------------------
+
+    /// WalkQueue mechanics: coalescing (a path already pending keeps its
+    /// job), claim-on-pop (a cancelled job is skipped), and
+    /// cancel-under-path (a removed dir cancels its own pending walk and
+    /// every walk beneath it).
+
+    #[test]
+    fn walk_queue_coalesces_claims_and_cancels() {
+        let (queue, jobs) = super::WalkQueue::new();
+        let job = |p: &str| super::WalkJob {
+            path: PathBuf::from(p),
+            dir_segments: vec!["C:".to_string()],
+            root_idx: 0,
+        };
+        let b = r"C:\a\b";
+        let bc = r"C:\a\b\c";
+        assert!(queue.submit(job(b)), "first submit queues");
+        assert!(!queue.submit(job(b)), "re-submit coalesces");
+        assert!(queue.submit(job(bc)), "distinct path queues");
+        // Cancelling the PARENT cancels both the parent walk and the one
+        // beneath it; an unrelated walk survives.
+        assert!(queue.submit(job(r"C:\other")));
+        queue.cancel_under(&PathBuf::from(r"C:\a"));
+        assert!(!queue.claim(&PathBuf::from(b)), "cancelled");
+        assert!(!queue.claim(&PathBuf::from(bc)), "child cancelled");
+        assert!(
+            queue.claim(&PathBuf::from(r"C:\other")),
+            "unrelated survives"
+        );
+        // The channel still delivered all three jobs; cancelled ones are
+        // skipped by claim, never re-processed.
+        assert_eq!(jobs.len(), 3);
+    }
+    /// A renamed-in populated tree (zero child events — the walk is the
+    /// ONLY thing that can index the descendants) still converges with
+    /// walks running off the batch path. Regression guard for the async
+    /// walker: same guarantee the storm test asserts for its mvme tree.
+    #[test]
+    fn watcher_moved_tree_descendants_arrive_async() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = write_fixture(tmp.path());
+        let engine = open_engine(&db_path, &root, Vec::new());
+        scan_once(&engine);
+        engine.start_watcher().unwrap();
+
+        // Build the tree OUTSIDE the watch root, then rename it in: the
+        // OS reports only the directory rename — descendants ride along.
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(outside.join("deep")).unwrap();
+        fs::write(outside.join("keep.txt"), b"k").unwrap();
+        fs::write(outside.join("deep").join("buried.txt"), b"b").unwrap();
+        fs::rename(&outside, root.join("mvdone")).unwrap();
+
+        // The small batch makes the dir itself searchable fast; the async
+        // walk brings the descendants. Both must converge within budget.
+        poll_until(Duration::from_secs(10), || {
+            let dir = search_total(&engine, "mvdone");
+            let buried = search_total(&engine, "buried");
+            (dir == 1 && buried == 1).then_some(())
+        });
+        let hits = engine.search("buried", 0, 10).hits;
+        assert!(
+            hits[0].path.contains("mvdone"),
+            "descendant indexed under the new dir, got {:?}",
+            hits[0].path
+        );
     }
 }
