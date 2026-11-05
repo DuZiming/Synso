@@ -173,28 +173,7 @@ impl Store {
     /// before walking it so files deleted while the app was closed do not
     /// linger in the index.
     pub fn delete_subtree(&mut self, dir_path: &[&str]) -> Result<u64> {
-        let Some(dir_id) = find_dir(&self.conn, dir_path)? else {
-            return Ok(0);
-        };
-        // A recursive CTE collects the subtree ids inside SQLite, so each
-        // delete is a single statement not bound by any host-parameter
-        // limit; UNION (not UNION ALL) keeps a corrupted parent cycle from
-        // looping forever.
-        const SUBTREE: &str = "\
-             WITH RECURSIVE subtree(id) AS (\
-                 SELECT id FROM dirs WHERE id = ?1 \
-                 UNION \
-                 SELECT child.id FROM dirs AS child \
-                 JOIN subtree ON child.parent = subtree.id)";
-        let files = self.conn.execute(
-            &format!("{SUBTREE} DELETE FROM files WHERE dir IN (SELECT id FROM subtree)"),
-            params![dir_id],
-        )? as u64;
-        self.conn.execute(
-            &format!("{SUBTREE} DELETE FROM dirs WHERE id IN (SELECT id FROM subtree)"),
-            params![dir_id],
-        )?;
-        Ok(files)
+        delete_subtree_on(&self.conn, dir_path)
     }
 
     /// Deletes the `files` row located by its containing directory segments
@@ -208,14 +187,27 @@ impl Store {
     /// deleted (`Ok(0)` when the row is already gone, which is a normal
     /// outcome for create-then-delete inside one batch).
     pub fn delete_file_by_path(&mut self, dir_path: &[&str], name: &str) -> Result<u64> {
-        let Some(dir_id) = find_dir(&self.conn, dir_path)? else {
-            return Ok(0);
-        };
-        let deleted = self.conn.execute(
-            "DELETE FROM files WHERE dir = ?1 AND name = ?2",
-            params![dir_id, name],
-        )?;
-        Ok(deleted as u64)
+        delete_file_by_path_on(&self.conn, dir_path, name)
+    }
+
+    /// Runs a whole watcher batch's store half inside ONE transaction
+    /// (2026-11-05 latency fix): per-row autocommit made a churning batch
+    /// pay a WAL journal sync per row — the scanner's batch flush learned
+    /// this lesson in Task 20 (~10× throughput); the watcher was paying
+    /// it as SECONDS of new-file visibility latency per busy batch. `run`
+    /// receives the transaction (as a plain connection — every `_on` row
+    /// helper takes one) and the generation its upserts must stamp; per-op
+    /// errors stay per-op (the closure logs and continues), so a partial
+    /// batch still commits its successful rows, exactly like the old
+    /// per-row path.
+    pub(crate) fn watcher_tx(
+        &mut self,
+        run: impl FnOnce(&Connection, i64) -> Result<()>,
+    ) -> Result<()> {
+        let gen = self.scan_gen;
+        let tx = self.conn.transaction()?;
+        run(&tx, gen)?;
+        Ok(tx.commit()?)
     }
 
     /// The `dirs` rows from `id` up to (and including) its root ancestor,
@@ -585,6 +577,51 @@ fn resolve_dir(conn: &Connection, scan_gen: i64, segments: &[&str]) -> Result<Fi
 /// Like [`resolve_dir`] but never creates rows: resolves `segments` in
 /// `dirs` and returns the final dir id, or `None` as soon as a segment is
 /// missing. Empty segments are a caller error, mirroring `resolve_dir`.
+/// `Store::delete_subtree` for an explicit connection — the watcher's
+/// one-transaction batch path ([`Store::watcher_tx`]) calls this inside
+/// its tx; behavior (recursive-CTE subtree purge) is verbatim.
+pub(crate) fn delete_subtree_on(conn: &Connection, dir_path: &[&str]) -> Result<u64> {
+    let Some(dir_id) = find_dir(conn, dir_path)? else {
+        return Ok(0);
+    };
+    // A recursive CTE collects the subtree ids inside SQLite, so each
+    // delete is a single statement not bound by any host-parameter
+    // limit; UNION (not UNION ALL) keeps a corrupted parent cycle from
+    // looping forever.
+    const SUBTREE: &str = "\
+         WITH RECURSIVE subtree(id) AS (\
+             SELECT id FROM dirs WHERE id = ?1 \
+             UNION \
+             SELECT child.id FROM dirs AS child \
+             JOIN subtree ON child.parent = subtree.id)";
+    let files = conn.execute(
+        &format!("{SUBTREE} DELETE FROM files WHERE dir IN (SELECT id FROM subtree)"),
+        params![dir_id],
+    )? as u64;
+    conn.execute(
+        &format!("{SUBTREE} DELETE FROM dirs WHERE id IN (SELECT id FROM subtree)"),
+        params![dir_id],
+    )?;
+    Ok(files)
+}
+
+/// `Store::delete_file_by_path` for an explicit connection (see
+/// [`delete_subtree_on`]).
+pub(crate) fn delete_file_by_path_on(
+    conn: &Connection,
+    dir_path: &[&str],
+    name: &str,
+) -> Result<u64> {
+    let Some(dir_id) = find_dir(conn, dir_path)? else {
+        return Ok(0);
+    };
+    let deleted = conn.execute(
+        "DELETE FROM files WHERE dir = ?1 AND name = ?2",
+        params![dir_id, name],
+    )?;
+    Ok(deleted as u64)
+}
+
 fn find_dir(conn: &Connection, segments: &[&str]) -> Result<Option<FileId>> {
     if segments.is_empty() {
         return Err(SynsoError::BadQuery(
