@@ -240,6 +240,7 @@ pub(crate) fn scan_subtree(
     root: &Path,
     matcher: &GlobSet,
     stored: &mut dyn FnMut(&Store, &FileRecord),
+    row_cap: usize,
 ) -> Result<ScanStats> {
     let mut stats = ScanStats::default();
     // Nothing sane to walk under a reparse point (cycle risk); the entry
@@ -340,6 +341,16 @@ pub(crate) fn scan_subtree(
 
         if batch.len() >= PROGRESS_BATCH {
             flush_subtree_batch(store, &mut batch, stored)?;
+        }
+        // Walk-size cap (2026-11-05): a churning tree (a build's target/,
+        // %TEMP%, a browser cache) can hold six figures of rows — a
+        // watcher walk of it monopolizes the store lock for minutes. Stop
+        // at `row_cap`; the caller logs and defers the rest to the next
+        // rescan (and the tree's own child events index the active parts
+        // anyway). Exact-cap trees report "capped" spuriously — a log
+        // line, never a behavior difference.
+        if (stats.files + stats.dirs) as usize >= row_cap {
+            break;
         }
     }
 
@@ -596,6 +607,48 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
     use std::time::UNIX_EPOCH;
+
+    /// The watcher's walk-size cap stops a churning monster tree (%TEMP%
+    /// measured at 108k rows / 89s under the store lock) at `row_cap`
+    /// rows — the exact count, never more (2026-11-05).
+    #[test]
+    fn scan_subtree_stops_at_row_cap() {
+        let (tmp, _db, mut store) = test_store();
+        let root = tmp.path().join("tree");
+        fs::create_dir_all(&root).unwrap();
+        for i in 0..8 {
+            fs::write(root.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let matcher = build_matcher(&[]).unwrap();
+        let mut rows = 0usize;
+        let mut stored = |_store: &Store, _rec: &FileRecord| rows += 1;
+        let stats = scan_subtree(
+            &mut store,
+            &root,
+            &["tree".to_string()],
+            tmp.path(),
+            &matcher,
+            &mut stored,
+            3,
+        )
+        .unwrap();
+        assert_eq!(rows, 3, "the walk stops at the cap");
+        assert_eq!(stats.files, 3, "stats agree with what was stored");
+        // A cap at or above the tree size walks everything.
+        let mut all = 0usize;
+        let mut stored = |_store: &Store, _rec: &FileRecord| all += 1;
+        scan_subtree(
+            &mut store,
+            &root,
+            &["tree".to_string()],
+            tmp.path(),
+            &matcher,
+            &mut stored,
+            100,
+        )
+        .unwrap();
+        assert_eq!(all, 8, "no cap interference below the cap");
+    }
 
     /// Fresh store in its own tempdir: `(tempdir, db_path, store)`. Keep the
     /// tempdir alive for the whole test.
