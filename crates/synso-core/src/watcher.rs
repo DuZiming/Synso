@@ -112,6 +112,13 @@ pub(crate) const MAX_DEFER: Duration = Duration::from_secs(2);
 /// stranded by a panicked batch self-heals instead of starving walks.
 const BATCH_PRIORITY_YIELD_CAP: Duration = Duration::from_secs(5);
 
+/// Hard row cap for one watcher subtree walk (2026-11-05): churning trees
+/// (a build's `target/`, `%TEMP%`, browser caches — measured 108k rows /
+/// 89s under the store lock) must not monopolize the pipeline. A capped
+/// walk logs and defers the remainder to the next rescan; the tree's own
+/// child events index its active parts anyway.
+const WALK_ROW_CAP: usize = 2_000;
+
 const SLOW_POLL: Duration = Duration::from_secs(600);
 
 /// Per-path final disposition after merging a whole quiet window of events.
@@ -716,19 +723,21 @@ fn walk_one(ctx: &Ctx, walks: &WalkQueue, job: &WalkJob) {
         let mut store_row = |_store: &Store, walked_row: &FileRecord| {
             walked.push(walked_row.clone());
         };
-        match scanner::scan_subtree(
+        let walked_stats = scanner::scan_subtree(
             &mut store,
             &job.path,
             &job.dir_segments,
             &ctx.roots[job.root_idx],
             &ctx.matcher,
             &mut store_row,
-        ) {
-            Ok(sub) if sub.errors > 0 => {
+            WALK_ROW_CAP,
+        );
+        match &walked_stats {
+            Ok(sub) if (sub.files + sub.dirs) as usize >= WALK_ROW_CAP => {
                 log::warn!(
-                    "synso: watcher subtree walk of {:?} skipped {sub:?}",
+                    "synso: watcher subtree walk of {:?} capped at {WALK_ROW_CAP} rows — remainder defers to the next rescan",
                     job.path
-                )
+                );
             }
             Ok(_) => {}
             Err(err) => {
@@ -736,6 +745,16 @@ fn walk_one(ctx: &Ctx, walks: &WalkQueue, job: &WalkJob) {
                     "synso: watcher subtree walk of {:?} failed: {err}",
                     job.path
                 )
+            }
+        }
+        // `errors > 0` stays a per-walk warn like before (skipped dirs
+        // inside the walk), separate from the cap notice above.
+        if let Ok(sub) = &walked_stats {
+            if sub.errors > 0 {
+                log::warn!(
+                    "synso: watcher subtree walk of {:?} skipped {sub:?}",
+                    job.path
+                );
             }
         }
     }
