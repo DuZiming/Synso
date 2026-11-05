@@ -507,6 +507,10 @@ fn absorb(ctx: &Ctx, event: NotifyEvent, pending: &mut BTreeMap<PathBuf, Pending
     let mut queued = false;
     for (path, op) in event_ops(&event) {
         if let Some(entry) = ctx.make_pending(&path, op) {
+            // DEBUG, not INFO: per-event lines are storm-chatty. Safe to
+            // log at any level since 2026-11-05's self-feedback filter
+            // (the log files' own events never reach here).
+            log::debug!("synso: watcher event: {path:?} ({:?})", entry.op);
             pending.insert(path, entry);
             queued = true;
         }
