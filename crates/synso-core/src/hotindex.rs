@@ -15,8 +15,10 @@
 //! refs. Pinyin keys that equal the lowercased name (every pure-ASCII
 //! name — the overwhelming majority) alias the name's ref instead of
 //! storing a second copy, and the secondary `(parent, name)` indexes key
-//! on a 64-bit name hash (verified against the arena on read) rather
-//! than duplicating the name string. At 1.6M files this cut true process
+//! on name hashes instead of duplicating the name string (the dir tree
+//! on a 64-bit name hash, the file slot table on a 32-bit fingerprint of
+//! a parent+name combined hash — see [`NameSlotTable`]) — every read
+//! still verifies the arena bytes. At 1.6M files this cut true process
 //! RSS from ~976MB (millions of individual `String` allocations plus
 //! index-key copies) to a fraction of it; `interned_bytes` keeps
 //! reporting the LOGICAL content (alias bytes counted once) for the
@@ -45,16 +47,322 @@ struct StrRef {
     len: u32,
 }
 
-/// 64-bit hash of a name, used as the string-free key component of both
-/// secondary `(parent, name)` indexes. Collisions between two DIFFERENT
-/// names under the SAME parent would need a 64-bit birthday hit within a
-/// handful of siblings (≈2⁻⁶⁴ per pair); every read still VERIFIES the
-/// arena bytes, so a collision degrades that one lookup to "not found"
-/// until the next wholesale reload — it can never return a wrong entry.
+/// 64-bit hash of a name, used as the string-free key component of the
+/// DIR-tree secondary index (`dir_by_parent_name`; the file slot table
+/// fingerprints [`parent_name_hash`] instead — see [`NameSlotTable`]).
+/// Collisions between two DIFFERENT names under the SAME parent would
+/// need a 64-bit birthday hit within a handful of siblings (≈2⁻⁶⁴ per
+/// pair); every read still VERIFIES the arena bytes, so a collision
+/// degrades that one lookup to "not found" until the next wholesale
+/// reload — it can never return a wrong entry.
 fn name_hash(name: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     name.hash(&mut hasher);
     hasher.finish()
+}
+
+/// 64-bit COMBINED hash of `(parent, name)` — the key source of
+/// [`NameSlotTable`]'s fingerprint. The parent is hashed FIRST and the
+/// name second, so files that share a name (desktop.ini / README.md —
+/// easily tens of thousands of copies) but live under different parents
+/// hash apart; keying the table on `name_hash` alone would pour every
+/// same-name copy into one home bucket and one probe chain (builder-check
+/// 裁定 2's anti-clustering requirement). Same `DefaultHasher`
+/// construction as [`name_hash`], which itself stays the dir-tree
+/// index's key component.
+fn parent_name_hash(parent: FileId, name: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    parent.hash(&mut hasher);
+    name.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// [`NameSlotTable`]'s fingerprint for a `(parent, name)` key: the HIGH
+/// 32 bits of [`parent_name_hash`]. The home bucket derives from the
+/// stored fingerprint itself (`fp & mask` — the fingerprint's low bits
+/// are hash bits 32..32+k), so an entry carries everything relocation
+/// needs: "store the hash, derive the index".
+#[inline]
+fn parent_name_fp(parent: FileId, name: &str) -> u32 {
+    (parent_name_hash(parent, name) >> 32) as u32
+}
+
+/// Empty-bucket sentinel for [`NameSlotTable`]: `slot == u32::MAX` marks
+/// a free bucket. A real slot can never collide with it — slots are
+/// dense column positions, and the load guard keeps the entry count
+/// (hence slot indices, which never exceed it) far below the ~128GB of
+/// column memory a u32::MAX slot would imply.
+const EMPTY_SLOT: u32 = u32::MAX;
+
+/// Load ceiling for [`NameSlotTable`]: an insert that would push `len`
+/// past 72% of capacity grows first. After a ×2 growth the table sits at
+/// ≤36%, and linear-probe chains stay short at both points.
+const SLOT_TABLE_MAX_LOAD_PERCENT: usize = 72;
+
+/// Smallest capacity [`NameSlotTable`] ever grows to: keeps watcher-fed
+/// cold indexes from rehashing through 1→2→4 buckets, and keeps the
+/// mask arithmetic (`cap - 1`) away from zero.
+const SLOT_TABLE_MIN_CAPACITY: usize = 8;
+
+/// Linear-probing open-addressed map from a `(parent, name)` fingerprint
+/// to a slot — the memory-critical replacement for the std HashMap this
+/// index used to carry as `slot_by_parent_name` (v1.2: the HashMap's
+/// estimate was ≈60MB at 2.1M entries, 24B per live entry before load
+/// slack; 8-byte entries over a power-of-two capacity land at roughly
+/// half that — exact numbers in the v1.3 mem_probe backfill).
+///
+/// Entries are `(fingerprint, slot)` pairs — fingerprint = the high 32
+/// bits of [`parent_name_hash`], home bucket = the fingerprint's low
+/// bits (`fp & (capacity - 1)`) — so an entry is fully self-contained:
+/// backward-shift deletion and growth rehashing replay entries from
+/// their own bytes alone.
+///
+/// Identity contract (builder-check 裁定 1): the table NEVER decides
+/// identity on its own. Read paths ([`Self::get_matching`]) walk the
+/// fingerprint chain and hand each candidate slot to the HOST, which
+/// verifies against LIVE columns (`parents[slot] == parent && arena
+/// name bytes match`). Mutation paths ([`Self::remove_by_slot`] /
+/// [`Self::rebind`]) run AFTER the identity columns may already have
+/// been overwritten (update_slot writes the columns first; swap-remove
+/// runs after the swap-pop), so they locate an entry by (fingerprint,
+/// stored slot number) ONLY — a slot number is stable across the whole
+/// operation, and one slot exists in at most one entry.
+///
+/// No-panic / termination: every probe loop advances one bucket per
+/// iteration and stops at the first bucket holding [`EMPTY_SLOT`].
+/// [`Self::insert`] grows BEFORE an entry could cross the load ceiling,
+/// so `len ≤ floor(0.72 × capacity) < capacity` always holds — at least
+/// one empty bucket exists in the ring at every moment, and even a
+/// pathological table whose live entries ALL share one fingerprint
+/// (they can only coexist, never fill the ring) terminates within one
+/// lap. A zero-capacity table (the `Default` cold state, before the
+/// first insert grows it) is guarded by early returns before any mask
+/// arithmetic runs.
+#[derive(Debug, Default)]
+struct NameSlotTable {
+    /// `(fingerprint, slot)` per bucket; `slot == EMPTY_SLOT` ⇒ free.
+    entries: Vec<(u32, u32)>,
+    /// Live entries (buckets whose slot != [`EMPTY_SLOT`]).
+    len: usize,
+}
+
+impl NameSlotTable {
+    /// A table pre-sized for `expected` entries: capacity starts at the
+    /// power of two covering `expected × 1.4` (load lands at ≤ 1/1.4 ≈
+    /// 0.714) and doubles once more wherever that rounding lands under
+    /// the 72% ceiling for the whole batch (e.g. expected 6 → 8 buckets,
+    /// ceiling 5) — so the load path's batch of inserts never triggers a
+    /// rehash, whatever the row count. `expected == 0` (and `Default`)
+    /// stay allocation-free; the first insert grows to
+    /// [`SLOT_TABLE_MIN_CAPACITY`].
+    fn new(expected: usize) -> NameSlotTable {
+        let mut table = NameSlotTable::default();
+        if expected > 0 {
+            table.grow_to(expected * 7 / 5); // ×1.4, rounded up to a pow2
+            while (expected + 1) * 100
+                > table.entries.len() * SLOT_TABLE_MAX_LOAD_PERCENT
+            {
+                table.grow_to(table.entries.len() * 2);
+            }
+        }
+        table
+    }
+
+    /// Live bytes under the breakdown's口径: the entries vec's length
+    /// × 8 (the power-of-two capacity IS the live allocation here —
+    /// no separate load-factor slack like a std HashMap's).
+    fn mem_bytes(&self) -> u64 {
+        self.entries.len() as u64 * std::mem::size_of::<(u32, u32)>() as u64
+    }
+
+    /// The never-full invariant's only enforcement point: grow (double,
+    /// rehash) when the NEXT entry would cross
+    /// [`SLOT_TABLE_MAX_LOAD_PERCENT`], so every probe ring always holds
+    /// an empty bucket to stop at.
+    fn reserve_for_insert(&mut self) {
+        let cap = self.entries.len();
+        if (self.len + 1) * 100 > cap * SLOT_TABLE_MAX_LOAD_PERCENT {
+            self.grow_to(if cap == 0 {
+                SLOT_TABLE_MIN_CAPACITY
+            } else {
+                cap * 2
+            });
+        }
+    }
+
+    /// Rehashes into a fresh power-of-two capacity ≥ `min_capacity`
+    /// (never shrinks; at least [`SLOT_TABLE_MIN_CAPACITY`]). Entries
+    /// are self-contained (fingerprint → home bucket), so rehashing is
+    /// a plain re-placement sweep over the old vec — no host state, no
+    /// order dependence.
+    fn grow_to(&mut self, min_capacity: usize) {
+        let new_cap = min_capacity
+            .max(SLOT_TABLE_MIN_CAPACITY)
+            .next_power_of_two();
+        if new_cap <= self.entries.len() {
+            return;
+        }
+        let old = std::mem::replace(&mut self.entries, vec![(0, EMPTY_SLOT); new_cap]);
+        for &(fp, slot) in &old {
+            if slot != EMPTY_SLOT {
+                self.place(fp, slot);
+            }
+        }
+    }
+
+    /// Places `(fp, slot)` at the first empty bucket from fp's home —
+    /// the raw loop insert and rehash share. The caller MUST guarantee
+    /// an empty bucket exists ([`Self::reserve_for_insert`] before an
+    /// insert, fresh oversized capacity during a grow): that guarantee
+    /// is the loop's termination condition. A same-fp entry with a
+    /// DIFFERENT slot is a different key (a fingerprint collision
+    /// between distinct names) and simply coexists on the chain — read
+    /// paths tell them apart through the host's live-column check.
+    fn place(&mut self, fp: u32, slot: u32) {
+        let mask = self.entries.len() - 1;
+        let mut i = fp as usize & mask;
+        while self.entries[i].1 != EMPTY_SLOT {
+            i = (i + 1) & mask;
+        }
+        self.entries[i] = (fp, slot);
+    }
+
+    /// Inserts `(fp, slot)` under the load guard (the only path that
+    /// grows `len`). Real call sites never insert an exact `(fp, slot)`
+    /// pair twice — the store's `UNIQUE(dir, name)` keeps keys unique
+    /// and re-keying removes first — so duplicates cannot arise to
+    /// double-count `len`.
+    fn insert(&mut self, fp: u32, slot: u32) {
+        self.reserve_for_insert();
+        self.place(fp, slot);
+        self.len += 1;
+    }
+
+    /// Walks fp's probe chain and returns the first stored slot for
+    /// which `is_match` holds — the READ path of the identity contract:
+    /// the host closure runs the live-columns final check
+    /// (`parents[slot] == parent && arena name bytes match`), so
+    /// fingerprint collisions between distinct names are sorted apart
+    /// here and a wrong entry can never be returned. `None` at the
+    /// chain's end (first empty bucket). Terminates per the struct
+    /// docs: an empty bucket always exists in the ring.
+    fn get_matching(&self, fp: u32, is_match: impl Fn(u32) -> bool) -> Option<u32> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let mask = self.entries.len() - 1;
+        let mut i = fp as usize & mask;
+        loop {
+            let (entry_fp, entry_slot) = self.entries[i];
+            if entry_slot == EMPTY_SLOT {
+                return None; // fp's chain ended without a verified match
+            }
+            if entry_fp == fp && is_match(entry_slot) {
+                return Some(entry_slot);
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Removes the entry `(fp, slot)` — identity is EXACTLY that pair,
+    /// no host columns read (the MUTATION path of the identity contract:
+    /// callers run this after the identity columns may already hold
+    /// other data). The freed bucket is repaired by backward-shift
+    /// deletion: each later entry on the chain whose probe path crossed
+    /// the hole moves back into it, so no survivor ends up stranded
+    /// behind an empty bucket. Returns whether an entry was found.
+    fn remove_by_slot(&mut self, fp: u32, slot: u32) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let mask = self.entries.len() - 1;
+        let mut i = fp as usize & mask;
+        // Find the victim: the (fp, slot) pair on fp's chain.
+        loop {
+            let (entry_fp, entry_slot) = self.entries[i];
+            if entry_slot == EMPTY_SLOT {
+                return false; // fp's chain ended before the pair
+            }
+            if entry_fp == fp && entry_slot == slot {
+                break;
+            }
+            i = (i + 1) & mask;
+        }
+        self.entries[i] = (0, EMPTY_SLOT);
+        self.len -= 1;
+        // Backward shift: scan forward from the hole, pulling back every
+        // entry whose own probe path crossed it — the hole lies on the
+        // path iff the distance hole→entry is ≤ the entry's displacement
+        // from its home (equal means the hole IS its home). Entries that
+        // probe past the hole without crossing it stay put; moving those
+        // would break THEIR chains. The scan stops at the next empty
+        // bucket (the never-full invariant guarantees one).
+        let cap = self.entries.len();
+        let mut hole = i;
+        let mut j = i;
+        loop {
+            j = (j + 1) & mask;
+            let (entry_fp, entry_slot) = self.entries[j];
+            if entry_slot == EMPTY_SLOT {
+                break;
+            }
+            let home = entry_fp as usize & mask;
+            if (j + cap - hole) & mask <= (j + cap - home) & mask {
+                self.entries[hole] = (entry_fp, entry_slot);
+                self.entries[j] = (0, EMPTY_SLOT);
+                hole = j;
+            }
+        }
+        true
+    }
+
+    /// Rewrites the stored slot of the entry `(fp, old_slot)` to
+    /// `new_slot` IN PLACE — swap-remove's tail relocation: the entry
+    /// stays at its bucket, so no probe chain is disturbed at all, not
+    /// even a backward shift. Identity is the (fingerprint, slot) pair,
+    /// never host columns. A rebind that finds nothing (possible only
+    /// under corruption) degrades to an insert — mirroring
+    /// `HashMap::insert`'s tolerance so the mapping self-heals at the
+    /// next wholesale reload instead of leaking a permanent miss.
+    fn rebind(&mut self, fp: u32, old_slot: u32, new_slot: u32) {
+        if self.entries.is_empty() {
+            self.insert(fp, new_slot);
+            return;
+        }
+        let mask = self.entries.len() - 1;
+        let mut i = fp as usize & mask;
+        loop {
+            let (entry_fp, entry_slot) = self.entries[i];
+            if entry_slot == EMPTY_SLOT {
+                self.insert(fp, new_slot); // the tolerated fallback
+                return;
+            }
+            if entry_fp == fp && entry_slot == old_slot {
+                self.entries[i].1 = new_slot;
+                return;
+            }
+            i = (i + 1) & mask;
+        }
+    }
+
+    /// Longest displacement of any live entry from its home bucket —
+    /// i.e. the worst-case successful-search probe length. The
+    /// anti-clustering test reads it as its clustering guard.
+    #[cfg(test)]
+    fn max_probe_displacement(&self) -> usize {
+        if self.entries.is_empty() {
+            return 0;
+        }
+        let cap = self.entries.len();
+        let mask = cap - 1;
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.1 != EMPTY_SLOT)
+            .map(|(i, (fp, _))| (i + cap - (*fp as usize & mask)) & mask)
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 /// One interned `dirs` row: parent dir id (`None` for root segments) and
@@ -252,9 +560,13 @@ pub struct HotIndex {
     /// Vec answers in one cache line where the old HashMap spent 59MB on
     /// 2.1M entries. Guarded by [`narrow_id`] (u32 ids).
     slot_by_id: Vec<u32>,
-    /// Secondary index: (containing dir id, name hash) -> slot, EXACT-case
-    /// (see [`dir_by_parent_name`]), verified against the arena on read.
-    slot_by_parent_name: HashMap<(FileId, u64), usize>,
+    /// Secondary index: (containing dir id, name) → slot, EXACT-case,
+    /// arena-verified on read — the open-addressed [`NameSlotTable`]
+    /// (v1.3: replaced the std HashMap here, whose hash-map overhead on
+    /// a two-integer key estimated ≈60MB at 2.1M entries; see that
+    /// struct's docs for the identity contract its operations run
+    /// under).
+    slot_by_parent_name: NameSlotTable,
     /// THE byte arena: every string the index holds (lowercased names,
     /// original names, non-aliased pinyin keys, dir names) as one
     /// contiguous buffer — no per-string allocation, no allocator
@@ -490,7 +802,12 @@ impl HotIndex {
         for (id, ext) in store.all_extensions()? {
             index.exts.insert(id, ext);
         }
-        for rec in store.all_files()? {
+        let files = store.all_files()?;
+        // Pre-size the slot table from the exact row count (×1.4 → a
+        // power of two): the load batches its inserts, and a right-sized
+        // table absorbs them all without a single rehash.
+        index.slot_by_parent_name = NameSlotTable::new(files.len());
+        for rec in files {
             index.push(rec)?;
         }
         Ok(index)
@@ -548,7 +865,7 @@ impl HotIndex {
         }
         self.slot_by_id[id32 as usize] = (slot as u32) + 1;
         self.slot_by_parent_name
-            .insert((rec.parent, name_hash(&rec.name)), slot);
+            .insert(parent_name_fp(rec.parent, &rec.name), slot as u32);
         self.lower_refs.push(lower_ref);
         self.orig_refs.push(orig_ref);
         self.py_full_refs.push(py_full_ref);
@@ -645,9 +962,14 @@ impl HotIndex {
                 self.dir_count = self.dir_count.saturating_sub(1);
             }
         }
-        let old_key = (
+        // The slot-table entry is located by (fingerprint, slot) AFTER
+        // the columns below are overwritten (builder-check 裁定 1:
+        // mutation paths never read host columns), so the OLD key's
+        // hash is captured while the columns still hold the old
+        // spelling.
+        let old_h = parent_name_hash(
             self.parents[slot] as FileId,
-            name_hash(self.str_of(self.orig_refs[slot])),
+            self.str_of(self.orig_refs[slot]),
         );
         // Guards before mutation (review fix #5 — see push).
         let ext32 = narrow_ext(rec.ext_id)?;
@@ -661,11 +983,16 @@ impl HotIndex {
         self.mtimes[slot] = rec.mtime;
         self.ext_ids[slot] = ext32;
         self.parents[slot] = parent32;
-        let new_key = (rec.parent, name_hash(&rec.name));
-        if old_key != new_key {
-            self.slot_by_parent_name.remove(&old_key);
+        let new_h = parent_name_hash(rec.parent, &rec.name);
+        if old_h != new_h {
+            // Identity = (fingerprint, slot), never the overwritten
+            // columns; an unchanged key (equal hashes) keeps its entry
+            // untouched — it already maps this slot.
+            self.slot_by_parent_name
+                .remove_by_slot((old_h >> 32) as u32, slot as u32);
+            self.slot_by_parent_name
+                .insert((new_h >> 32) as u32, slot as u32);
         }
-        self.slot_by_parent_name.insert(new_key, slot);
         Ok(())
     }
 
@@ -769,11 +1096,12 @@ impl HotIndex {
     }
 
     /// Swap-removes the slot keyed by `(parent_id, name)` (exact name); see
-    /// [`HotIndex::remove_slot_at`] for the mechanics.
+    /// [`HotIndex::remove_slot_at`] for the mechanics. The lookup rides
+    /// the READ path of the identity contract: [`HotIndex::slot_in_dir`]
+    /// verifies parent and arena name against live columns (the old
+    /// HashMap get verified nothing past its 64-bit hash key).
     fn remove_slot(&mut self, parent_id: FileId, name: &str) -> Option<FileId> {
-        let &slot = self
-            .slot_by_parent_name
-            .get(&(parent_id, name_hash(name)))?;
+        let slot = self.slot_in_dir(parent_id, name)?;
         Some(self.remove_slot_at(slot))
     }
 
@@ -783,10 +1111,13 @@ impl HotIndex {
     fn remove_slot_at(&mut self, slot: usize) -> FileId {
         let removed_id = self.ids[slot] as FileId;
         let last = self.lower_refs.len() - 1;
-        let key = (
-            self.parents[slot] as FileId,
-            name_hash(self.str_of(self.orig_refs[slot])),
-        );
+        // Fingerprints captured while the identity columns are still
+        // intact: both slot-table mutations below run AFTER the
+        // swap-pop, when `parents`/`orig_refs` at these positions
+        // already hold other data (builder-check 裁定 1 — the table
+        // locates entries by (fingerprint, slot) alone).
+        let fp_victim =
+            parent_name_fp(self.parents[slot] as FileId, self.str_of(self.orig_refs[slot]));
 
         if self.is_dirs[slot] {
             self.dir_count = self.dir_count.saturating_sub(1);
@@ -797,13 +1128,15 @@ impl HotIndex {
             .interned_bytes
             .saturating_sub(self.logical_bytes[slot] as u64);
 
-        // Bookkeeping for the slot that moves into the hole (if any).
+        // Bookkeeping for the slot that moves into the hole (if any):
+        // its row id (slot_by_id repoint) and its key's fingerprint
+        // (slot-table rebind) — both read while the columns are intact.
         let moved = if slot != last {
             Some((
                 self.ids[last] as FileId,
-                (
+                parent_name_fp(
                     self.parents[last] as FileId,
-                    name_hash(self.str_of(self.orig_refs[last])),
+                    self.str_of(self.orig_refs[last]),
                 ),
             ))
         } else {
@@ -838,14 +1171,19 @@ impl HotIndex {
                 self.slot_by_id[id32 as usize] = 0;
             }
         }
-        self.slot_by_parent_name.remove(&key);
-        if let Some((moved_id, moved_key)) = moved {
+        self.slot_by_parent_name
+            .remove_by_slot(fp_victim, slot as u32);
+        if let Some((moved_id, fp_moved)) = moved {
             if let Ok(id32) = u32::try_from(moved_id) {
                 if (id32 as usize) < self.slot_by_id.len() {
                     self.slot_by_id[id32 as usize] = (slot as u32) + 1;
                 }
             }
-            self.slot_by_parent_name.insert(moved_key, slot);
+            // In-place slot-number rewrite (builder-check 裁定 1): the
+            // moved entry stays at its bucket — no probe chain is
+            // disturbed, not even a backward shift.
+            self.slot_by_parent_name
+                .rebind(fp_moved, last as u32, slot as u32);
         }
         removed_id
     }
@@ -923,13 +1261,19 @@ impl HotIndex {
 
     /// The slot stored under `(parent_dir, name)` (exact name), or
     /// `None`. The size aggregation's file-root resolution uses this.
+    /// READ path of the identity contract: the fingerprint chain narrows
+    /// the candidates, then LIVE columns give the final identity check
+    /// (parent id AND arena name bytes — the old HashMap lookup trusted
+    /// a bare 64-bit hash get, so this is strictly stricter at the same
+    /// result).
     pub(crate) fn slot_in_dir(&self, parent: FileId, name: &str) -> Option<usize> {
-        let &slot = self.slot_by_parent_name.get(&(parent, name_hash(name)))?;
-        if self.str_of(self.orig_refs[slot]) == name {
-            Some(slot)
-        } else {
-            None
-        }
+        let fp = parent_name_fp(parent, name);
+        self.slot_by_parent_name
+            .get_matching(fp, |slot| {
+                self.parents[slot as usize] as FileId == parent
+                    && self.str_of(self.orig_refs[slot as usize]) == name
+            })
+            .map(|slot| slot as usize)
     }
 
     /// The extension text interned for `ext_id` (from the `extensions`
@@ -1166,7 +1510,9 @@ impl HotIndex {
                 + std::mem::size_of::<i32>() // ext_ids (narrowed)
                 + std::mem::size_of::<bool>()) as u64; // is_dirs
         let slot_by_id_bytes = self.slot_by_id.len() as u64 * std::mem::size_of::<u32>() as u64;
-        let slot_by_parent_name_bytes = est_map(&self.slot_by_parent_name);
+        // The open-addressed table counts like the vecs it is: len × 8
+        // (the power-of-two capacity is the live allocation).
+        let slot_by_parent_name_bytes = self.slot_by_parent_name.mem_bytes();
         let dir_tree_bytes = est_map(&self.dirs);
         let dir_index_bytes = est_map(&self.dir_by_parent_name);
         let exts_bytes =
@@ -1626,8 +1972,11 @@ mod tests {
             let slot = hot.slot_of_id(id).expect("survivor resolves");
             assert_eq!(hot.name_original(slot), name);
             assert_eq!(hot.file_id(slot), id);
-            let key_slot = hot.slot_by_parent_name[&(hot.parent_dir(slot), name_hash(name))];
-            assert_eq!(key_slot, slot);
+            assert_eq!(
+                hot.slot_in_dir(hot.parent_dir(slot), name),
+                Some(slot),
+                "the (parent, name) table points at the survivor's slot"
+            );
         }
         assert!(hot.slot_of_id(ids[1]).is_none());
     }
@@ -1717,13 +2066,9 @@ mod tests {
         // original-case spelling, pinyin keys, and slot-by-id.
         for i in 0..50u8 {
             let name = format!("keep{i}");
-            let key = (
-                hot.dir_child(None, "docs").expect("docs still interned"),
-                name_hash(&name),
-            );
-            let &slot = hot
-                .slot_by_parent_name
-                .get(&key)
+            let docs = hot.dir_child(None, "docs").expect("docs still interned");
+            let slot = hot
+                .slot_in_dir(docs, &name)
                 .unwrap_or_else(|| panic!("{name} must resolve after compaction"));
             assert!(hot.name_original(slot).ends_with(&name));
             assert_eq!(hot.name_lower(slot), name);
@@ -1806,5 +2151,197 @@ mod tests {
         hot.upsert_slot(&store, &again).unwrap();
         let slot = hot.slot_of_id(again.id).expect("fresh upsert resolvable");
         assert_eq!(hot.file_id(slot), again.id);
+    }
+
+    /// [`NameSlotTable`]'s four-op contract in miniature (v1.3 Task 1): a
+    /// DELIBERATE collision cluster — four fingerprints sharing home
+    /// bucket 0 on an 8-bucket table — must be fully findable, and
+    /// deleting a MIDDLE cluster entry must backward-shift the chain's
+    /// tail so the entries behind the hole stay reachable (the classic
+    /// open-addressing deletion hazard).
+    #[test]
+    fn name_slot_table_roundtrip_and_shift() {
+        let mut t = NameSlotTable::new(0);
+        // fps 0/8/16/24 all mask to home bucket 0: one probe chain.
+        let cluster = [(0u32, 10u32), (8, 11), (16, 12), (24, 13)];
+        for (fp, slot) in cluster {
+            t.insert(fp, slot);
+        }
+        assert_eq!(t.len, 4);
+        for (fp, slot) in cluster {
+            assert_eq!(
+                t.get_matching(fp, |s| s == slot),
+                Some(slot),
+                "cluster entry (fp {fp}, slot {slot}) must be findable"
+            );
+        }
+        // Delete a middle cluster entry: entries past the hole relocate
+        // back, so no survivor ends up stranded behind an empty bucket.
+        assert!(t.remove_by_slot(8, 11));
+        assert_eq!(t.len, 3);
+        assert_eq!(t.get_matching(8, |s| s == 11), None, "deleted key is gone");
+        for (fp, slot) in [(0, 10), (16, 12), (24, 13)] {
+            assert_eq!(
+                t.get_matching(fp, |s| s == slot),
+                Some(slot),
+                "survivor (fp {fp}, slot {slot}) still reachable after the shift"
+            );
+        }
+        // Removing a pair that never existed is a benign false.
+        assert!(!t.remove_by_slot(8, 11));
+        assert_eq!(t.len, 3);
+    }
+
+    /// [`NameSlotTable::rebind`] rewrites the stored slot number IN PLACE
+    /// — swap-remove's tail relocation — without touching `len` or any
+    /// neighboring entry; a rebind of a pair that never existed degrades
+    /// to insert (the HashMap::insert tolerance) so the mapping
+    /// self-heals.
+    #[test]
+    fn name_slot_table_rebind_in_place() {
+        let mut t = NameSlotTable::new(0);
+        t.insert(100, 7);
+        t.insert(200, 8); // separate chain, must be untouched
+        t.rebind(100, 7, 42);
+        assert_eq!(t.get_matching(100, |s| s == 42), Some(42), "new slot resolves");
+        assert_eq!(t.get_matching(100, |s| s == 7), None, "old slot is gone");
+        assert_eq!(t.get_matching(200, |s| s == 8), Some(8), "neighbor untouched");
+        assert_eq!(t.len, 2, "rebind moves an entry, it does not add one");
+        t.rebind(300, 5, 9);
+        assert_eq!(t.get_matching(300, |s| s == 9), Some(9));
+        assert_eq!(t.len, 3);
+    }
+
+    /// Growth rehash (Review Focus 3): 100k synthetic fingerprints from an
+    /// 8-bucket start cross every doubling threshold; after the rehashes
+    /// every key must stay findable and no slot may be reachable twice.
+    #[test]
+    fn name_slot_table_grow_preserves_all() {
+        let mut t = NameSlotTable::new(0);
+        let n = 100_000u32;
+        for i in 0..n {
+            // Fibonacci-hash spread (an odd multiplier is a bijection on
+            // u32, so fps are distinct — a table unit test needs no real
+            // hasher).
+            t.insert(i.wrapping_mul(2_654_435_761), i);
+        }
+        assert!(
+            t.entries.len() >= 1 << 18,
+            "capacity crossed the doublings: {}",
+            t.entries.len()
+        );
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..n {
+            let slot = t
+                .get_matching(i.wrapping_mul(2_654_435_761), |s| s == i)
+                .unwrap_or_else(|| panic!("key {i} lost across growth"));
+            assert!(seen.insert(slot), "slot {slot} reachable twice — duplicate entry");
+        }
+        assert_eq!(t.len, n as usize);
+    }
+
+    /// Same-name anti-clustering guard (builder-check 裁定 2, Review
+    /// Focus 2): ≥5000 entries sharing ONE name under distinct parents,
+    /// built through the REAL `push`/`parent_name_hash` path (not the raw
+    /// table), must spread — the fingerprint mixes the parent in, so no
+    /// shared home bucket. Every key resolves to its own slot and the
+    /// longest probe displacement stays tiny (a name_hash-keyed table
+    /// would pour all 5000 into one ~5000-long chain).
+    #[test]
+    fn same_name_heavy_no_clustering() {
+        const N: usize = 5000;
+        let mut hot = HotIndex::cold();
+        for i in 0..N {
+            let mut r = rec("desktop.ini", false);
+            r.id = i as FileId + 1;
+            r.parent = i as FileId + 1; // every copy under its own parent
+            hot.push(r).unwrap();
+        }
+        for i in 0..N {
+            let parent = i as FileId + 1;
+            let slot = hot
+                .slot_in_dir(parent, "desktop.ini")
+                .unwrap_or_else(|| panic!("copy under parent {parent} must hit"));
+            assert_eq!(
+                slot, i,
+                "the copy under parent {parent} resolves to its own slot"
+            );
+        }
+        assert!(
+            hot.slot_by_parent_name.max_probe_displacement() < 64,
+            "same-name entries must not cluster: max probe displacement {}",
+            hot.slot_by_parent_name.max_probe_displacement()
+        );
+    }
+
+    /// The identity-contract integration (builder-check 裁定 1, Review
+    /// Focus 1): a real rename re-points the slot's entry via
+    /// (fingerprint, slot) AFTER the columns changed, and watcher
+    /// removals — middle slot (tail rebinds in place) and tail slot (no
+    /// rebind) — must leave the old key unresolvable, the survivors
+    /// resolvable, and exactly one table entry per live slot (no stale
+    /// leftovers; the HashMap-era code got that for free).
+    #[test]
+    fn rename_and_mid_removal_no_stale_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
+
+        let mut ids = Vec::new();
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"] {
+            let mut r = rec(name, false);
+            store.upsert_file(&["docs"], &mut r).unwrap();
+            ids.push(r.id);
+        }
+        let mut hot = HotIndex::load(&store).unwrap();
+        assert_eq!(hot.slot_by_parent_name.len, hot.slot_count());
+        let docs = hot.dir_child(None, "docs").expect("docs interned");
+
+        // Rename through the real watcher path: same row id re-upserted
+        // under a new name (SQLite rowid reuse after a delete reaches
+        // exactly this update_slot key-change branch). The entry is
+        // re-pointed by (fingerprint, slot) while the columns already
+        // hold the NEW spelling.
+        let mut renamed = rec("cc.txt", false);
+        renamed.id = ids[2];
+        renamed.parent = docs;
+        hot.upsert_slot(&store, &renamed).unwrap();
+        assert_eq!(hot.slot_in_dir(docs, "c.txt"), None, "the old spelling is gone");
+        let renamed_slot = hot.slot_in_dir(docs, "cc.txt").expect("new spelling resolves");
+        assert_eq!(hot.file_id(renamed_slot), ids[2]);
+        assert_eq!(hot.slot_by_parent_name.len, hot.slot_count());
+
+        // Middle removal (b.txt, slot 1 of 5): the tail e.txt's entry is
+        // rebind-moved to slot 1 in place.
+        assert_eq!(hot.remove_by_dir_name(&["docs"], "b.txt"), Some(ids[1]));
+        assert_eq!(hot.slot_in_dir(docs, "b.txt"), None);
+        for (name, id) in [
+            ("a.txt", ids[0]),
+            ("cc.txt", ids[2]),
+            ("d.txt", ids[3]),
+            ("e.txt", ids[4]),
+        ] {
+            let slot = hot
+                .slot_in_dir(docs, name)
+                .unwrap_or_else(|| panic!("{name} must resolve"));
+            assert_eq!(hot.file_id(slot), id);
+        }
+        assert_eq!(hot.slot_by_parent_name.len, hot.slot_count());
+
+        // One more middle removal (e.txt now lives in a moved slot), then
+        // a tail removal (cc.txt is the last slot — the no-rebind branch).
+        assert_eq!(hot.remove_by_dir_name(&["docs"], "e.txt"), Some(ids[4]));
+        assert_eq!(hot.remove_by_dir_name(&["docs"], "cc.txt"), Some(ids[2]));
+        for (name, id) in [("a.txt", ids[0]), ("d.txt", ids[3])] {
+            let slot = hot
+                .slot_in_dir(docs, name)
+                .unwrap_or_else(|| panic!("{name} must resolve"));
+            assert_eq!(hot.file_id(slot), id);
+        }
+        assert_eq!(hot.slot_count(), 2);
+        assert_eq!(
+            hot.slot_by_parent_name.len,
+            hot.slot_count(),
+            "no stale entries: one table entry per live slot"
+        );
     }
 }
