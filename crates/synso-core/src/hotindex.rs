@@ -40,12 +40,22 @@ use crate::model::{FileId, FileRecord};
 use crate::store::Store;
 use crate::{Result, SynsoError};
 
-/// A string's location in the shared byte arena.
+/// A string's location in the shared byte arena. `repr(C, packed)` keeps
+/// it at exactly 6 bytes: four refs live in per-slot columns and millions
+/// of slots compound the saving over the old `{u32, u32}` layout. Packed
+/// fields are read BY VALUE only (no `&field` — a misaligned reference
+/// would be UB); the derives all work by value on the `Copy` fields and
+/// every reader follows the same discipline.
+#[repr(C, packed)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 struct StrRef {
     start: u32,
-    len: u32,
+    len: u16,
 }
+
+/// The packed layout is load-bearing for the memory budget: a layout
+/// change must be deliberate, not a quiet relapse to 8 bytes.
+const _: () = assert!(std::mem::size_of::<StrRef>() == 6);
 
 /// 64-bit hash of a name, used as the string-free key component of the
 /// DIR-tree secondary index (`dir_by_parent_name`; the file slot table
@@ -615,19 +625,34 @@ pub struct HotIndex {
     /// Bytes held by the arenas: name lowercase + name original +
     /// non-aliased pinyin keys + dir names.
     interned_bytes: u64,
+    /// Entries (files rows, dir entries, dirs-table nodes) whose name
+    /// exceeded the 64 KiB a [`StrRef`] can name and were skipped instead
+    /// of interned. Pure defense — filesystem names stay orders of
+    /// magnitude below it, so a nonzero count means a foreign or corrupt
+    /// database; logged once per load/upsert, never per row.
+    skipped_oversized: u64,
     /// True once an initial full load completed.
     warm: bool,
 }
 
 impl HotIndex {
-    /// Appends `s` to the byte arena and returns its ref.
-    fn put(&mut self, s: &str) -> StrRef {
+    /// Appends `s` to the byte arena and returns its ref. `None` — with
+    /// the arena untouched — when `s` exceeds the 64 KiB a [`StrRef`] can
+    /// name: a pure-defense guard (filesystem names stay far below it),
+    /// tallied in [`HotIndex::skipped_oversized`] so callers skip the row
+    /// and the skip is reported once per batch, never per row.
+    fn put(&mut self, s: &str) -> Option<StrRef> {
+        let len = s.len();
+        if len > u16::MAX as usize {
+            self.skipped_oversized += 1;
+            return None;
+        }
         let start = self.bytes.len() as u32;
         self.bytes.extend_from_slice(s.as_bytes());
-        StrRef {
+        Some(StrRef {
             start,
-            len: s.len() as u32,
-        }
+            len: len as u16,
+        })
     }
 
     /// The arena slice a ref names (valid UTF-8 by construction — only
@@ -635,7 +660,7 @@ impl HotIndex {
     /// library's no-panic rule even against hypothetical corruption).
     #[inline]
     fn str_of(&self, r: StrRef) -> &str {
-        let end = (r.start + r.len) as usize;
+        let end = r.start as usize + r.len as usize;
         self.bytes
             .get(r.start as usize..end)
             .and_then(|slice| std::str::from_utf8(slice).ok())
@@ -764,7 +789,9 @@ impl HotIndex {
     /// Interns one synthetic `dirs` row (the shared shape of
     /// [`HotIndex::load`]'s dir loop).
     fn intern_dir(&mut self, id: FileId, parent: Option<FileId>, name: String) {
-        let name_ref = self.put(&name);
+        let name_ref = self
+            .put(&name)
+            .expect("synthetic names fit StrRef");
         self.interned_bytes += name.len() as u64;
         self.dir_by_parent_name
             .insert((parent, name_hash(&name)), id);
@@ -786,7 +813,9 @@ impl HotIndex {
             ..HotIndex::default()
         };
         for (id, parent, name) in store.all_dirs()? {
-            let name_ref = index.put(&name);
+            let Some(name_ref) = index.put(&name) else {
+                continue; // 64 KiB guard: the dir node is skipped, counted by put
+            };
             index.interned_bytes += name.len() as u64;
             index
                 .dir_by_parent_name
@@ -810,6 +839,14 @@ impl HotIndex {
         for rec in files {
             index.push(rec)?;
         }
+        // One summary line per load for the 64 KiB skips (push / the dir
+        // loop skip silently; the tally is the count).
+        if index.skipped_oversized > 0 {
+            log::warn!(
+                "synso: load skipped {} row(s) with names over 64 KiB (StrRef guard)",
+                index.skipped_oversized
+            );
+        }
         Ok(index)
     }
 
@@ -818,22 +855,40 @@ impl HotIndex {
     /// Pinyin keys equal to the lowercased name (every pure-ASCII name)
     /// alias the name's ref — no second copy in the arena.
     ///
+    /// A row whose name (or either pinyin key) exceeds the 64 KiB ref
+    /// guard is SKIPPED, not an error: tallied by `put` and reported once
+    /// per batch, this returns `Ok(())` without touching any column, so
+    /// the row is absent from the index until a reload that can hold it.
+    ///
     /// Errors only on the compact-column guards: a row id, dir id or
     /// extension id beyond its narrowed type means the database predates
     /// or bypassed our own upserts — refusing beats wrapping.
     fn push(&mut self, rec: FileRecord) -> Result<()> {
         let lower = rec.name.to_lowercase();
-        let lower_ref = self.put(&lower);
-        let orig_ref = self.put(&rec.name);
+        // 64 KiB guard: any None (counted by put) skips the whole row
+        // BEFORE any mutation — the same guards-before-mutation rule as
+        // the narrow_id checks below; a skip adds no logical bytes.
+        let Some(lower_ref) = self.put(&lower) else {
+            return Ok(());
+        };
+        let Some(orig_ref) = self.put(&rec.name) else {
+            return Ok(());
+        };
         let py_full_ref = if rec.py_full == lower {
             lower_ref
         } else {
-            self.put(&rec.py_full)
+            let Some(r) = self.put(&rec.py_full) else {
+                return Ok(());
+            };
+            r
         };
         let py_init_ref = if rec.py_init == lower {
             lower_ref
         } else {
-            self.put(&rec.py_init)
+            let Some(r) = self.put(&rec.py_init) else {
+                return Ok(());
+            };
+            r
         };
         let logical = (lower.len()
             + rec.name.len()
@@ -889,10 +944,13 @@ impl HotIndex {
     /// row's hot update (logged by the caller); the store itself stays
     /// authoritative and the next wholesale reload resyncs.
     pub(crate) fn upsert_slot(&mut self, store: &Store, rec: &FileRecord) -> Result<()> {
+        let skips_before = self.skipped_oversized;
         // Ancestor chain first, so the new/updated slot's paths resolve.
         for (id, parent, name) in store.dir_ancestors(rec.parent)? {
             if !self.dirs.contains_key(&id) {
-                let name_ref = self.put(&name);
+                let Some(name_ref) = self.put(&name) else {
+                    continue; // 64 KiB guard: the dir node is skipped, counted by put
+                };
                 self.interned_bytes += name.len() as u64;
                 self.dir_by_parent_name
                     .insert((parent, name_hash(&name)), id);
@@ -915,6 +973,14 @@ impl HotIndex {
         } else {
             self.push(rec.clone())?;
         }
+        // One summary line per call for the 64 KiB skips (push and the
+        // dir loop skip silently; the tally is the count).
+        if self.skipped_oversized > skips_before {
+            log::warn!(
+                "synso: upsert skipped {} row(s)/dir(s) with names over 64 KiB (StrRef guard)",
+                self.skipped_oversized - skips_before
+            );
+        }
         Ok(())
     }
 
@@ -922,19 +988,33 @@ impl HotIndex {
     /// counters, byte budget and secondary indexes coherent. New strings
     /// are APPENDED to the arena (the old bytes become unreachable until
     /// the next wholesale reload compacts them — bounded by rename churn).
+    ///
+    /// An incoming name (or either pinyin key) beyond the 64 KiB ref guard
+    /// skips the update entirely — counted by `put`, the slot keeps its
+    /// old spelling, and the next wholesale reload re-decides the row.
     fn update_slot(&mut self, slot: usize, rec: &FileRecord) -> Result<()> {
         let lower = rec.name.to_lowercase();
-        let lower_ref = self.put(&lower);
-        let orig_ref = self.put(&rec.name);
+        let Some(lower_ref) = self.put(&lower) else {
+            return Ok(());
+        };
+        let Some(orig_ref) = self.put(&rec.name) else {
+            return Ok(());
+        };
         let py_full_ref = if rec.py_full == lower {
             lower_ref
         } else {
-            self.put(&rec.py_full)
+            let Some(r) = self.put(&rec.py_full) else {
+                return Ok(());
+            };
+            r
         };
         let py_init_ref = if rec.py_init == lower {
             lower_ref
         } else {
-            self.put(&rec.py_init)
+            let Some(r) = self.put(&rec.py_init) else {
+                return Ok(());
+            };
+            r
         };
         let logical = (lower.len()
             + rec.name.len()
@@ -1445,7 +1525,9 @@ impl HotIndex {
             for r in refs.iter_mut() {
                 let nr = *seen.entry(*r).or_insert_with(|| {
                     let start = fresh.len() as u32;
-                    fresh.extend_from_slice(&bytes[r.start as usize..(r.start + r.len) as usize]);
+                    fresh.extend_from_slice(
+                        &bytes[r.start as usize..(r.start + r.len as u32) as usize],
+                    );
                     StrRef { start, len: r.len }
                 });
                 *r = nr;
@@ -1460,7 +1542,7 @@ impl HotIndex {
             let nr = *seen.entry(entry.name).or_insert_with(|| {
                 let start = fresh.len() as u32;
                 let r = entry.name;
-                fresh.extend_from_slice(&bytes[r.start as usize..(r.start + r.len) as usize]);
+                fresh.extend_from_slice(&bytes[r.start as usize..(r.start + r.len as u32) as usize]);
                 StrRef { start, len: r.len }
             });
             entry.name = nr;
@@ -2343,5 +2425,92 @@ mod tests {
             hot.slot_count(),
             "no stale entries: one table entry per live slot"
         );
+    }
+
+    // ------------- Task 2: StrRef 6B packing + fallible put ---------------
+
+    /// The packed ref IS the compression: four refs per slot over millions
+    /// of slots compound the 2-byte saving per ref. Guarded at compile time
+    /// right above the struct too; this keeps the guarantee visible in the
+    /// suite.
+    #[test]
+    fn strref_packed_size() {
+        assert_eq!(std::mem::size_of::<StrRef>(), 6);
+    }
+
+    /// `put` rejects anything a u16 length cannot name — without writing
+    /// arena bytes — and tallies the skip. The boundary value itself still
+    /// lands (and round-trips through `str_of`).
+    #[test]
+    fn strref_rejects_64k_name() {
+        let mut hot = HotIndex::cold();
+
+        let arena_before = hot.arena_len();
+        assert!(
+            hot.put(&"x".repeat(u16::MAX as usize + 1)).is_none(),
+            "a name past the u16 length is rejected"
+        );
+        assert_eq!(
+            hot.arena_len(),
+            arena_before,
+            "a rejected put writes no arena bytes"
+        );
+        assert_eq!(hot.skipped_oversized, 1, "the rejection is counted");
+
+        let r = hot
+            .put(&"x".repeat(u16::MAX as usize))
+            .expect("exactly u16::MAX bytes fit a StrRef");
+        assert_eq!(hot.str_of(r).len(), u16::MAX as usize);
+        assert_eq!(hot.skipped_oversized, 1, "the boundary value is not a skip");
+    }
+
+    /// A store row whose name exceeds the guard is skipped at load —
+    /// absent from the index, tallied, costing zero interned bytes — while
+    /// every other row loads untouched. The same guard covers dirs-table
+    /// nodes: the oversized dir node is skipped, and the file under it
+    /// still loads (its path reconstructs short — walk_chain stops at the
+    /// missing row, by design).
+    #[test]
+    fn load_skips_oversized_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
+
+        let mut alpha = rec("Alpha.TXT", false);
+        store.upsert_file(&["docs"], &mut alpha).unwrap();
+        let mut huge = rec(&"x".repeat(u16::MAX as usize + 1), false);
+        store.upsert_file(&["docs"], &mut huge).unwrap();
+        let mut memo = rec("memo.md", false);
+        store.upsert_file(&["docs", "inner"], &mut memo).unwrap();
+        let huge_dir = "d".repeat(u16::MAX as usize + 1);
+        let mut note = rec("note.md", false);
+        store.upsert_file(&["docs", huge_dir.as_str()], &mut note).unwrap();
+
+        let hot = HotIndex::load(&store).unwrap();
+
+        assert!(hot.is_warm());
+        assert_eq!(
+            hot.file_count(),
+            3,
+            "only the oversized file row is skipped"
+        );
+        assert_eq!(
+            hot.dir_tree_len(),
+            2,
+            "docs and inner interned; the oversized dir node is not"
+        );
+        assert_eq!(
+            hot.skipped_oversized,
+            2,
+            "one files row + one dirs row skipped"
+        );
+        // Survivors are exactly the normally named rows.
+        let mut names: Vec<&str> = (0..hot.slot_count())
+            .map(|slot| hot.name_original(slot))
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["Alpha.TXT", "memo.md", "note.md"]);
+        // And a skip costs zero interned bytes (load_counts_arenas_and_warm's
+        // formula, plus note.md's 7+7).
+        assert_eq!(hot.interned_bytes(), 4 + 5 + 9 + 9 + 7 + 7 + 7 + 7);
     }
 }
