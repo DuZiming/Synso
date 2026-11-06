@@ -1,53 +1,73 @@
-//! Dedup pipeline (Task 9): staged hashing that finds content-identical
-//! files without ever reading the whole disk blindly.
+//! Dedup pipeline: four staged gates ([`run_gates`]) that find
+//! content-identical files without ever reading the whole disk blindly.
 //!
-//! Stages (see [`run_pipeline`]):
-//! 1. **Grouping** — a size histogram straight from the store snapshot;
-//!    only sizes carried by `>= 2` non-directory rows with `size > 0`
-//!    become candidates. Zero-size files never enter a group (they would
-//!    make every empty file a dupe of every other).
-//! 2. **HashingFirst** — xxh64 of the first 4 KiB for candidates whose
+//! The gates, in order:
+//! 1. **Size gate** — in-memory: only sizes carried by `>= 2` candidates
+//!    survive (a file can only ever pair with an equal-size one; zero-
+//!    size files are not candidates at all — see the candidate load).
+//! 2. **First-4KiB probe** — xxh64 of the first 4 KiB for survivors whose
 //!    persisted `hash_first` is missing; files already carrying one reuse
-//!    it. Survivors regroup by `(size, hash_first)`; groups that shrink
-//!    below 2 members drop out.
-//! 3. **HashingFull** — streaming xxh64 of the whole file for surviving
-//!    members whose persisted `hash_full` is missing. Final groups key on
-//!    `(size, hash_full)` with `>= 2` members.
+//!    it without opening anything. Survivors regroup by `(size, head)`;
+//!    groups that shrink below 2 members drop out. A `size <= 4KiB` row's
+//!    probe read IS the whole file, so its full hash is terminal here.
+//! 3. **Sampling** — same-size same-head members get size-derived 64KB
+//!    read windows (`sample_window_offsets`; the keys are never
+//!    persisted); `(size, sample-key)` runs of >= 2 pay gate④'s full
+//!    read, singleton runs are killed. Members already carrying a full
+//!    hash (persisted or gate②-terminal) are CERTIFIED and never open;
+//!    a run holding one short-circuits its new members straight to gate④.
+//!    `size <= 64KB` members take one whole-read terminal full hash here.
+//! 4. **Full certification** — streaming xxh64 of the whole file for the
+//!    survivors still lacking one. Final groups key on `(size, full)`
+//!    with `>= 2` members.
+//!
+//! Candidates stream straight from the store into SoA columns
+//! ([`Candidates`] + [`Dirs`]): non-directory `size > 0` rows, recycle-bin
+//! subtrees (a `$Recycle.Bin` dir name in any casing) excluded up front.
 //!
 //! Skip rules: a Windows cloud placeholder (checked via
 //! [`crate::scanner::is_placeholder_attr`] on `GetFileAttributesW` output,
-//! BEFORE the file is opened), a Windows sharing violation (another handle
-//! owns the file — a [`OpenSkip::Locked`] skip, nothing read), and any
-//! other open/read failure mark the file skipped — it never enters a group
-//! and never panics the run. Counters for all three land in
-//! [`DedupOutcome`].
+//! BEFORE the file is opened — hashing never triggers a hydration
+//! download), a Windows sharing violation (another handle owns the file —
+//! an [`OpenSkip::Locked`] skip, nothing read, the next run retries), a
+//! candidate inside the mtime grace window ([`is_fresh`] — it may still
+//! be mid-write), and any other resolve/open/read failure. Every skip is
+//! counted in [`DedupOutcome::counters`] by reason; nothing ever panics
+//! the run.
 //!
 //! Concurrency contract with the engine: hashing happens entirely OUTSIDE
-//! the store lock; the lock is taken only for the initial snapshot and for
+//! the store lock; the lock is taken only for the candidate load and for
 //! short batched persists of freshly computed hashes
 //! ([`crate::store::Store::update_file_hashes`]), so scans and watcher
 //! batches queue for microseconds, not for the length of a hash pass.
 //!
-//! Incremental: persisted hashes are reused, so a second run over an
-//! unchanged index does zero I/O on already-hashed files. v1 trade-off,
-//! accepted and documented: a full rescan upserts rows with NULL hashes
-//! (the scanner knows nothing of hashing), which wipes what was persisted —
-//! the next dedup run rehashes. Between scans (and across engine restarts
-//! without a rescan) persistence works, which is what the dedup view's
-//! `dedup_start()` speed-up relies on.
+//! Incremental: persisted hashes are reused (gate② never opens a file
+//! carrying a `hash_first`; gate④ skips members whose full is already
+//! known), so a second run over an unchanged index does zero I/O on
+//! already-hashed files. Rescans keep that working: the generation-based
+//! rescan UPDATES unchanged rows in place (same mtime + size), so their
+//! persisted hashes survive by construction; only a file that actually
+//! changed drops its stale hash and is rehashed next run.
 //!
-//! The persist itself is guarded ([`HashUpdate`]): every update carries the
-//! snapshot's mtime + size and lands only while the row still matches both.
-//! That matters because the `files` table has no AUTOINCREMENT — a rescan
-//! running WHILE a dedup run is hashing purges and re-inserts rows with
-//! REUSED ids, and an unguarded batch would stamp the old files' hashes
-//! onto different new files, forging dupe groups the incremental path
-//! would never re-verify. A guard-mismatched batch is a no-op; the hashes
-//! are recomputed by the next run.
+//! The persist itself is guarded ([`HashUpdate`]): every update carries
+//! the row's mtime + size and lands only while the row still matches
+//! both. That matters because the `files` table has no AUTOINCREMENT — a
+//! rescan running WHILE a dedup run is hashing purges and re-inserts rows
+//! with REUSED ids, and an unguarded batch would stamp the old files'
+//! hashes onto different new files, forging dupe groups the incremental
+//! path would never re-verify. A guard-mismatched batch is a no-op; the
+//! hashes are recomputed by the next run.
 //!
-//! v1 deliberately does NOT throttle the hashing thread (no priority
-//! tweaks, no idle-time scheduling): `std::thread` at normal priority, the
-//! OS scheduler plus the staged skip rules keep the cost bounded.
+//! Cancel (engine's [`crate::engine::Engine::dedup_cancel`]): checked at
+//! every file boundary — and, in gate④, at every 64KB read step, so even
+//! a giant file aborts sub-second. A cancelled run persists every hash it
+//! already computed and reports `cancelled` with an EMPTY group list;
+//! the engine keeps serving the last completed run's groups.
+//!
+//! Gears (engine's `DedupGear`): the caller picks the gates' worker-pool
+//! size (`workers <= 1` runs inline, single-threaded). The pipeline
+//! itself never fiddles with thread priorities — the engine lowers its
+//! own dedup thread for the Gentle gear if it wants a quieter run.
 //!
 //! Testability seam: all disk access goes through [`FileReader`], so tests
 //! can fake placeholder attributes and locked files ([`RealFileReader`] is
@@ -135,11 +155,13 @@ pub(crate) struct StoredGroup {
 }
 
 /// Aggregate outcome of one pipeline run; the engine folds this into its
-/// [`DedupState`] and stores `groups`. Two writers share the struct:
-/// `run_pipeline` (the old path, until Task 7 deletes it) fills the
-/// legacy scalars, `run_gates` (the rewritten pipeline) fills `counters`
-/// and mirrors the scalars from it so engine.rs's single fold keeps
-/// working.
+/// [`DedupState`] and stores `groups`. All skip/kill accounting lives in
+/// [`DedupOutcome::counters`] (the engine folds the public skip counter
+/// from `errors + locked + placeholders` there — fresh/recycle stay
+/// internal); `hashed_first`/`hashed_full` count THIS run's hash
+/// computations; `cancelled` marks a run stopped by the cancel flag —
+/// every hash it computed is persisted, but the group list comes back
+/// EMPTY and the engine keeps serving the last completed run's groups.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DedupOutcome {
     pub groups: Vec<StoredGroup>,
@@ -147,28 +169,12 @@ pub(crate) struct DedupOutcome {
     pub hashed_first: u64,
     /// Full hashes computed by this run.
     pub hashed_full: u64,
-    /// Files skipped because they could not be resolved, opened or read.
-    /// Legacy mirror: `run_pipeline` writes it directly, `run_gates`
-    /// copies it from [`DedupOutcome::counters`].
-    pub errors: u64,
-    /// Files skipped because another handle denied our open (a Windows
-    /// sharing violation, [`OpenSkip::Locked`]): nothing was read, and
-    /// the next run simply retries. Same legacy-mirror story as
-    /// `errors` — the counters own the real number.
-    pub locked: u64,
-    /// Files skipped because Windows reports them as cloud placeholders
-    /// (never opened, so hashing never triggers a hydration download).
-    /// Same legacy-mirror story as `errors`.
-    pub placeholders: u64,
-    /// Every counter the four gates produced (Task 6; `run_pipeline`
-    /// leaves it zeroed). The skip reasons live here separated
-    /// (`locked`/`fresh`/`placeholders`/`recycle`) and each gate's kill
-    /// tally (`size_gate`/`head_gate`/`sample_gate`) rides along.
+    /// Every counter the four gates produced: each gate's kill tally
+    /// (`size_gate`/`head_gate`/`sample_gate`) plus the skip reasons
+    /// separated (`errors`/`locked`/`fresh`/`placeholders`/`recycle`).
     pub counters: OutcomeCounters,
-    /// True when `cancel` fired and the run stopped at a checkpoint
-    /// (Task 6): every hash computed before the hit is persisted, but
-    /// the group list comes back EMPTY — the engine keeps serving the
-    /// last completed run's groups. `run_pipeline` never sets it.
+    /// True when `cancel` fired and the run stopped at a checkpoint:
+    /// the group list is empty (see the struct doc).
     pub cancelled: bool,
 }
 
@@ -190,7 +196,6 @@ pub(crate) trait FileReader: Sync {
     /// seek-hopping window reads are NOT sequential and keep plain
     /// `open`. The default just calls [`FileReader::open`] — test fakes
     /// inherit it and never need the flag.
-    #[allow(dead_code)] // Task 7 wiring: the engine swap onto run_gates consumes it.
     fn open_sequential(&self, path: &Path) -> std::io::Result<std::fs::File> {
         self.open(path)
     }
@@ -229,7 +234,6 @@ impl FileReader for RealFileReader {
     /// deny-write share mode as `open` — the stability argument lives
     /// there — plus the sequential-scan hint, so the OS prefetcher
     /// reads ahead while gate④ streams its 64KB steps.
-    #[allow(dead_code)] // Task 7 wiring: the engine swap onto run_gates consumes it.
     fn open_sequential(&self, path: &Path) -> std::io::Result<std::fs::File> {
         let mut opts = OpenOptions::new();
         opts.read(true);
@@ -280,13 +284,11 @@ pub(crate) fn classify_open_err(err: &std::io::Error) -> OpenSkip {
 /// growing log) and must not be read this run. The grace applies only to
 /// candidates about to be OPENED — reusing a persisted hash is never
 /// gated on freshness; that policy lives in the gate code (Task 4).
-#[allow(dead_code)] // Task 4 wiring: gate_head checks the grace before it opens.
 pub(crate) const FRESH_SECS: i64 = 300;
 
 /// True while `mtime` (snapshot seconds) is inside the grace window that
 /// ends at `now` — `now` is injected by the caller, so tests control the
 /// clock.
-#[allow(dead_code)] // Task 4 wiring: gate_head checks the grace before it opens.
 pub(crate) fn is_fresh(mtime: i64, now: i64) -> bool {
     now - mtime < FRESH_SECS
 }
@@ -312,409 +314,6 @@ pub(crate) fn resolve_absolute_path(roots: &[String], index_path: &str) -> Optio
     Some(abs)
 }
 
-/// One snapshot row the pipeline works from.
-#[derive(Debug, Clone)]
-struct Entry {
-    id: FileId,
-    parent: FileId,
-    name: String,
-    size: u64,
-    /// Snapshot mtime — identity half of the persist guard: a batch is
-    /// written only while the row still carries this mtime AND `size`, so
-    /// a rescan's purge-and-reinsert (row ids are reused) cannot inherit
-    /// another file's hashes.
-    mtime: i64,
-    hash_first: Option<u64>,
-    hash_full: Option<u64>,
-}
-
-/// Store snapshot taken under one short lock: candidate rows plus the dir
-/// tree needed to rebuild index paths (hashing then proceeds lock-free).
-#[derive(Debug, Default)]
-struct Snapshot {
-    /// Non-directory rows with `size > 0` (the only dedup candidates).
-    files: Vec<Entry>,
-    /// `dirs` table as `(id -> (parent, name))`.
-    dirs: HashMap<FileId, (Option<FileId>, String)>,
-}
-
-impl Snapshot {
-    /// The entry's index-relative path (root segment, ..., name,
-    /// `MAIN_SEPARATOR`-joined), or `None` when its dir chain is broken.
-    /// Built on demand — only files that actually need hashing pay for it.
-    fn index_path(&self, entry: &Entry) -> Option<String> {
-        let mut segments = vec![entry.name.as_str()];
-        let mut budget = self.dirs.len() + 1; // a corrupt parent cycle cannot loop
-        let mut current = Some(entry.parent);
-        while let Some(id) = current {
-            if budget == 0 {
-                return None;
-            }
-            budget -= 1;
-            let (parent, name) = self.dirs.get(&id)?;
-            segments.push(name.as_str());
-            current = *parent;
-        }
-        segments.reverse();
-        Some(segments.join(MAIN_SEPARATOR_STR))
-    }
-}
-
-/// Loads the [`Snapshot`] under one short store lock. A store error yields
-/// an empty snapshot: the run then finishes trivially with no groups and is
-/// never fatal (the next run, after the store heals, finds everything).
-fn load_snapshot(store: &Mutex<Store>) -> Snapshot {
-    let guard = crate::engine::lock_unpoisoned(store);
-    let mut snapshot = Snapshot::default();
-    if let Ok(dirs) = guard.all_dirs() {
-        snapshot.dirs = dirs
-            .into_iter()
-            .map(|(id, parent, name)| (id, (parent, name)))
-            .collect();
-    }
-    if let Ok(files) = guard.all_files() {
-        snapshot.files = files
-            .into_iter()
-            .filter(|rec| !rec.is_dir && rec.size > 0)
-            .map(|rec| Entry {
-                id: rec.id,
-                parent: rec.parent,
-                name: rec.name,
-                size: rec.size,
-                mtime: rec.mtime,
-                hash_first: rec.hash_first,
-                hash_full: rec.hash_full,
-            })
-            .collect();
-    }
-    snapshot
-}
-
-/// Runs the whole staged pipeline against `store` (locked only for the
-/// snapshot and short persist batches), resolving files under `roots` and
-/// touching disk exclusively through `reader`. `progress` receives
-/// `(phase, done, total)` at every stage change and every
-/// [`PROGRESS_EVERY`] records within a stage; the engine forwards it as
-/// [`crate::engine::EngineEvent::DedupProgress`]. Never panics on bad
-/// files; every skip is counted in the returned [`DedupOutcome`].
-pub(crate) fn run_pipeline(
-    store: &Mutex<Store>,
-    roots: &[String],
-    reader: &dyn FileReader,
-    progress: &dyn Fn(DedupPhase, u64, u64),
-) -> DedupOutcome {
-    let mut outcome = DedupOutcome::default();
-    let snapshot = load_snapshot(store);
-    let total = snapshot.files.len() as u64;
-
-    // ---- Stage 1: Grouping — size histogram, sizes carried >= 2 times. ----
-    progress(DedupPhase::Grouping, 0, total);
-    let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
-    for (idx, entry) in snapshot.files.iter().enumerate() {
-        by_size.entry(entry.size).or_default().push(idx);
-    }
-    progress(DedupPhase::Grouping, total, total);
-    let mut candidates: Vec<usize> = by_size
-        .into_values()
-        .flat_map(|group| if group.len() >= 2 { group } else { Vec::new() })
-        .collect();
-    candidates.sort_unstable(); // deterministic progress/persist order
-
-    // ---- Stage 2: HashingFirst — first 4 KiB xxh64, persisted hashes reused. ----
-    progress(DedupPhase::HashingFirst, 0, candidates.len() as u64);
-    let mut first_hashes: Vec<Option<u64>> = vec![None; snapshot.files.len()];
-    let mut pending: Vec<HashUpdate> = Vec::new();
-    let mut done: u64 = 0;
-    for &idx in &candidates {
-        let hash = match snapshot.files[idx].hash_first {
-            Some(persisted) => persisted,
-            None => {
-                match hash_first_of(&snapshot, idx, roots, reader, &mut outcome, &mut pending) {
-                    Some(hash) => hash,
-                    None => {
-                        advance_stage_progress(
-                            progress,
-                            DedupPhase::HashingFirst,
-                            &mut done,
-                            candidates.len() as u64,
-                            &mut pending,
-                            store,
-                        );
-                        continue;
-                    }
-                }
-            }
-        };
-        first_hashes[idx] = Some(hash);
-        advance_stage_progress(
-            progress,
-            DedupPhase::HashingFirst,
-            &mut done,
-            candidates.len() as u64,
-            &mut pending,
-            store,
-        );
-    }
-    flush_persist(store, &mut pending);
-    progress(
-        DedupPhase::HashingFirst,
-        candidates.len() as u64,
-        candidates.len() as u64,
-    );
-
-    // Regroup by (size, hash_first); groups below 2 members drop out.
-    let mut by_first: HashMap<(u64, u64), Vec<usize>> = HashMap::new();
-    for &idx in &candidates {
-        if let Some(hash) = first_hashes[idx] {
-            by_first
-                .entry((snapshot.files[idx].size, hash))
-                .or_default()
-                .push(idx);
-        }
-    }
-    let survivors: Vec<Vec<usize>> = by_first
-        .into_values()
-        .filter(|group| group.len() >= 2)
-        .collect();
-
-    // ---- Stage 3: HashingFull — whole-file xxh64 for survivors lacking one. ----
-    let full_candidates: Vec<usize> = survivors
-        .iter()
-        .flat_map(|group| group.iter().copied())
-        .filter(|idx| snapshot.files[*idx].hash_full.is_none())
-        .collect();
-    progress(DedupPhase::HashingFull, 0, full_candidates.len() as u64);
-    let mut full_hashes: Vec<Option<u64>> = vec![None; snapshot.files.len()];
-    let mut done: u64 = 0;
-    for &idx in &full_candidates {
-        let hash = match snapshot.files[idx].hash_full {
-            Some(persisted) => persisted,
-            None => match hash_full_of(&snapshot, idx, roots, reader, &mut outcome, &mut pending) {
-                Some(hash) => hash,
-                None => {
-                    advance_stage_progress(
-                        progress,
-                        DedupPhase::HashingFull,
-                        &mut done,
-                        full_candidates.len() as u64,
-                        &mut pending,
-                        store,
-                    );
-                    continue;
-                }
-            },
-        };
-        full_hashes[idx] = Some(hash);
-        advance_stage_progress(
-            progress,
-            DedupPhase::HashingFull,
-            &mut done,
-            full_candidates.len() as u64,
-            &mut pending,
-            store,
-        );
-    }
-    flush_persist(store, &mut pending);
-    progress(
-        DedupPhase::HashingFull,
-        full_candidates.len() as u64,
-        full_candidates.len() as u64,
-    );
-
-    // ---- Final groups: (size, hash_full) with >= 2 members. A survivor
-    // whose full stage failed (both values `None`) drops out here. ----
-    let mut by_full: HashMap<(u64, u64), Vec<FileId>> = HashMap::new();
-    for group in &survivors {
-        for &idx in group.iter() {
-            let full = full_hashes[idx].or(snapshot.files[idx].hash_full);
-            if let Some(full) = full {
-                by_full
-                    .entry((snapshot.files[idx].size, full))
-                    .or_default()
-                    .push(snapshot.files[idx].id);
-            }
-        }
-    }
-    let mut groups: Vec<StoredGroup> = by_full
-        .into_iter()
-        .filter(|(_, members)| members.len() >= 2)
-        .map(|((size, hash), mut members)| {
-            members.sort_unstable();
-            StoredGroup {
-                hash,
-                size,
-                members,
-            }
-        })
-        .collect();
-    // Size descending for the stable paging contract; hash ascending as the
-    // deterministic tie-break.
-    groups.sort_unstable_by(|a, b| b.size.cmp(&a.size).then(a.hash.cmp(&b.hash)));
-    outcome.groups = groups;
-
-    let hashed = outcome.hashed_first + outcome.hashed_full;
-    progress(DedupPhase::Done, hashed, hashed);
-    outcome
-}
-
-/// Emits at most one progress tick per [`PROGRESS_EVERY`] records and
-/// persists computed hashes alongside: whenever a batch of
-/// [`PERSIST_BATCH`] has accumulated or a progress tick fires (short lock,
-/// one transaction per flush).
-fn advance_stage_progress(
-    progress: &dyn Fn(DedupPhase, u64, u64),
-    phase: DedupPhase,
-    done: &mut u64,
-    total: u64,
-    pending: &mut Vec<HashUpdate>,
-    store: &Mutex<Store>,
-) {
-    *done += 1;
-    if pending.len() >= PERSIST_BATCH {
-        flush_persist(store, pending);
-    }
-    if *done % PROGRESS_EVERY == 0 {
-        flush_persist(store, pending);
-        progress(phase, *done, total);
-    }
-}
-
-/// Hashes the first [`FIRST_CHUNK`] bytes of snapshot entry `idx`, recording
-/// the computed value in `pending` for batched persistence. `None` (with the
-/// skip counted) when the path cannot be resolved, the file is a Windows
-/// cloud placeholder (never opened), or it cannot be opened/read (a
-/// sharing violation is a [`OpenSkip::Locked`] skip, not an error).
-fn hash_first_of(
-    snapshot: &Snapshot,
-    idx: usize,
-    roots: &[String],
-    reader: &dyn FileReader,
-    outcome: &mut DedupOutcome,
-    pending: &mut Vec<HashUpdate>,
-) -> Option<u64> {
-    let entry = &snapshot.files[idx];
-    let path = open_candidate(snapshot, entry, roots, reader, outcome)?;
-    let mut file = open_or_skip(reader, &path, outcome)?;
-    let mut chunk = [0u8; FIRST_CHUNK];
-    let mut filled = 0;
-    while filled < chunk.len() {
-        match file.read(&mut chunk[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(_) => {
-                outcome.errors += 1;
-                return None;
-            }
-        }
-    }
-    let hash = xxh64(&chunk[..filled], 0);
-    outcome.hashed_first += 1;
-    pending.push(HashUpdate {
-        id: entry.id,
-        mtime: entry.mtime,
-        size: entry.size,
-        hash_first: Some(hash),
-        hash_full: None,
-    });
-    Some(hash)
-}
-
-/// Hashes the whole file at snapshot entry `idx` (streaming), recording the
-/// value in `pending` for batched persistence. `None` (with the skip
-/// counted) on any resolution/open/read failure.
-fn hash_full_of(
-    snapshot: &Snapshot,
-    idx: usize,
-    roots: &[String],
-    reader: &dyn FileReader,
-    outcome: &mut DedupOutcome,
-    pending: &mut Vec<HashUpdate>,
-) -> Option<u64> {
-    let entry = &snapshot.files[idx];
-    let path = open_candidate(snapshot, entry, roots, reader, outcome)?;
-    let mut file = open_or_skip(reader, &path, outcome)?;
-    let mut hasher = Xxh64::new(0);
-    let mut buffer = vec![0u8; READ_BUFFER];
-    loop {
-        match file.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(n) => hasher.update(&buffer[..n]),
-            Err(_) => {
-                outcome.errors += 1;
-                return None;
-            }
-        }
-    }
-    let hash = hasher.digest();
-    outcome.hashed_full += 1;
-    pending.push(HashUpdate {
-        id: entry.id,
-        mtime: entry.mtime,
-        size: entry.size,
-        hash_first: None,
-        hash_full: Some(hash),
-    });
-    Some(hash)
-}
-
-/// The pre-open gate shared by both hash stages: resolve the snapshot
-/// entry's index path to an absolute disk path, then check Windows
-/// placeholder attributes BEFORE opening. Returns the path, or `None` with
-/// the matching skip counter bumped (a path that cannot be resolved is an
-/// error — it can never be opened, which is what the counter counts).
-fn open_candidate(
-    snapshot: &Snapshot,
-    entry: &Entry,
-    roots: &[String],
-    reader: &dyn FileReader,
-    outcome: &mut DedupOutcome,
-) -> Option<PathBuf> {
-    let abs = match snapshot.index_path(entry) {
-        Some(index_path) => resolve_absolute_path(roots, &index_path),
-        None => None,
-    };
-    let Some(abs) = abs else {
-        outcome.errors += 1;
-        return None;
-    };
-    match reader.attributes(&abs) {
-        // Unstatable (vanished/unreadable): an error, not a placeholder.
-        None => {
-            outcome.errors += 1;
-            return None;
-        }
-        Some(attrs) => {
-            if crate::scanner::is_placeholder_attr(attrs) {
-                outcome.placeholders += 1;
-                return None;
-            }
-        }
-    }
-    Some(abs)
-}
-
-/// The open step both hash stages share: opens `path` via `reader`,
-/// counting a failure as the matching [`DedupOutcome`] skip — a Windows
-/// sharing violation is a [`OpenSkip::Locked`] skip, every other failure
-/// keeps the error semantics. `None` means "skipped": no file came back,
-/// so the caller has nothing to read.
-fn open_or_skip(
-    reader: &dyn FileReader,
-    path: &Path,
-    outcome: &mut DedupOutcome,
-) -> Option<std::fs::File> {
-    match reader.open(path) {
-        Ok(file) => Some(file),
-        Err(err) => {
-            match classify_open_err(&err) {
-                OpenSkip::Locked => outcome.locked += 1,
-                OpenSkip::Error => outcome.errors += 1,
-            }
-            None
-        }
-    }
-}
-
 /// Persists one batch of computed hashes under one short store lock (single
 /// transaction). Store errors are swallowed: hashes are a cache — a lost
 /// batch is recomputed by the next run, never fatal to this one. Every
@@ -733,9 +332,7 @@ fn flush_persist(store: &Mutex<Store>, pending: &mut Vec<HashUpdate>) {
 
 // ---------------------------------------------------------------------
 // Candidate streaming load (pipeline rewrite, Task 2): the SoA/arena
-// picture the rewritten pipeline works from. The old `Snapshot` /
-// `load_snapshot` pair above stays in place until the engine swap
-// deletes it.
+// picture the gates work from — the only snapshot the pipeline holds.
 
 /// Sentinel a candidate's hash column carries when the store row has no
 /// persisted hash yet (the streamed row's `Option` flattened).
@@ -759,7 +356,6 @@ const UNRESOLVED_PARENT: u32 = u32::MAX;
 /// `parents` hold `Dirs` SLOTS, not row ids, so the later path/group
 /// walks chase plain indices.
 #[derive(Debug, Default)]
-#[allow(dead_code)] // Task 4-6 wiring: the pipeline rewrite consumes it.
 pub(crate) struct Candidates {
     /// `files` row ids, u32-pressed (checked — past `u32::MAX` the load
     /// reports an explicit error, never truncates).
@@ -804,20 +400,16 @@ impl Candidates {
         self.names.extend_from_slice(name.as_bytes());
     }
 
-    /// Candidate `i`'s file name out of the arena.
-    // Task 4-6 wiring: the group -> Hit materialization reads names.
-    #[allow(dead_code)]
+    /// Candidate `i`'s file name out of the arena (the group ->
+    /// Hit materialization reads it).
     pub(crate) fn name(&self, i: usize) -> &str {
         arena_name(&self.names, &self.name_off, i)
     }
 
     /// The candidate's index-relative path (root segment, ..., name,
     /// `MAIN_SEPARATOR`-joined), or `None` when its dir chain is broken.
-    /// Same on-demand shape and cycle budget as the old
-    /// `Snapshot::index_path` — only candidates that actually need
-    /// hashing pay for it.
-    // Task 4-6 wiring: the hash stages resolve paths through this.
-    #[allow(dead_code)]
+    /// On-demand: only candidates that actually need hashing pay for it
+    /// (the hash stages resolve paths through this).
     pub(crate) fn index_path(&self, i: usize, dirs: &Dirs) -> Option<String> {
         let mut segments = vec![self.name(i)];
         let mut budget = dirs.parents.len() + 1; // a corrupt parent cycle cannot loop
@@ -851,7 +443,6 @@ impl Candidates {
 /// parent row always precedes its children (`resolve_dir` creates a
 /// dir's parent levels first).
 #[derive(Debug, Default)]
-#[allow(dead_code)] // Task 4-6 wiring: the pipeline rewrite consumes it.
 pub(crate) struct Dirs {
     /// Parent slot per row (`None` = root). `parents.len()` is the slot
     /// bound every other column shares.
@@ -879,9 +470,8 @@ impl Dirs {
         self.recycle.push(recycle);
     }
 
-    /// Dir `slot`'s name out of the arena.
-    // Task 4-6 wiring: the group -> Hit materialization reads names.
-    #[allow(dead_code)]
+    /// Dir `slot`'s name out of the arena (the group -> Hit
+    /// materialization reads it).
     pub(crate) fn name(&self, slot: usize) -> &str {
         arena_name(&self.names, &self.name_off, slot)
     }
@@ -900,13 +490,10 @@ fn arena_name<'a>(names: &'a [u8], name_off: &'a [u32], i: usize) -> &'a str {
 }
 
 /// Loads [`Candidates`] + [`Dirs`] under one short store lock (hashing
-/// then proceeds lock-free, like the old snapshot). Any store error —
-/// including a candidate id past `u32::MAX` — yields `None`: the run
-/// then finishes trivially with no groups and is never fatal (the next
-/// run, after the store heals, finds everything). That mirrors the old
-/// `load_snapshot`'s error semantics.
-// Task 4-6 wiring: the rewritten pipeline loads through this.
-#[allow(dead_code)]
+/// then proceeds lock-free). Any store error — including a candidate id
+/// past `u32::MAX` — yields `None`: the run then finishes trivially with
+/// no groups and is never fatal (the next run, after the store heals,
+/// finds everything).
 pub(crate) fn load_candidates(store: &Mutex<Store>) -> Option<(Candidates, Dirs)> {
     load_candidates_checked(store).ok()
 }
@@ -978,10 +565,9 @@ fn bad_u32_id(kind: &str, id: FileId) -> SynsoError {
 }
 
 // ---------------------------------------------------------------------
-// Gates ① and ② (pipeline rewrite, Task 4). The rewritten pipeline is a
-// chain of gates over the streamed [`Candidates`] snapshot; Task 6's
-// `run_gates` will assemble them and swap the engine off `run_pipeline`.
-// This section documents the contracts the later gates consume.
+// Gates ① and ② (pipeline rewrite, Task 4). The pipeline is a chain of
+// gates over the streamed [`Candidates`] snapshot; this section
+// documents the contracts the later gates consume.
 
 /// One gate's removal tally: `files` candidates left the grouping
 /// population at this gate and `bytes` is their snapshot-size total.
@@ -1023,7 +609,6 @@ impl OutcomeCounters {
     /// Folds `other` into `self`: every field is an additive run total,
     /// and `run_gates` sums the four gates' tallies into the run
     /// outcome.
-    #[allow(dead_code)] // Task 7 wiring: the engine swap onto run_gates consumes it.
     pub(crate) fn accumulate(&mut self, other: &OutcomeCounters) {
         self.size_gate.files += other.size_gate.files;
         self.size_gate.bytes += other.size_gate.bytes;
@@ -1066,7 +651,6 @@ impl OutcomeCounters {
 ///   progress call reports `done < total`.
 // No Debug derive: `pending` holds `HashUpdate`, which carries none.
 #[derive(Default)]
-#[allow(dead_code)] // Task 4-6 wiring: run_gates consumes it.
 pub(crate) struct HeadOutcome {
     pub(crate) head: Vec<u64>,
     pub(crate) full: Vec<u64>,
@@ -1082,7 +666,6 @@ pub(crate) struct HeadOutcome {
 /// this size. A chunk boundary is a persist flush + progress tick +
 /// cancel checkpoint; 64 Ki candidates keep the per-worker batches small
 /// while amortizing the boundary costs.
-#[allow(dead_code)] // Task 4-6 wiring: gate_head reads it.
 const CHUNK: usize = 65_536;
 
 /// Why a candidate left gate② without a hash — the tally helper's tag
@@ -1101,7 +684,6 @@ enum Skip {
 /// counters. Nothing is shared while a chunk runs — the store lock is
 /// taken only at the boundary flush.
 #[derive(Default)]
-#[allow(dead_code)] // Task 4-6 wiring: gate_head consumes it.
 struct GateWorker {
     /// `(chunk position, hash)` for candidates that got a first hash
     /// (computed now or reused).
@@ -1141,7 +723,6 @@ impl GateWorker {
 /// size is carried by >= 2 candidates (the only ones that can ever pair),
 /// in size order; singletons are counted into
 /// [`OutcomeCounters::size_gate`] with their byte tally and dropped.
-#[allow(dead_code)] // Task 4-6 wiring: run_gates calls it.
 pub(crate) fn gate_size(c: &Candidates, counters: &mut OutcomeCounters) -> Vec<u32> {
     let mut order: Vec<u32> = (0..c.sizes.len() as u32).collect();
     order.sort_unstable_by_key(|&slot| c.sizes[slot as usize]);
@@ -1178,14 +759,14 @@ pub(crate) fn gate_size(c: &Candidates, counters: &mut OutcomeCounters) -> Vec<u
 ///   inline, single-threaded (the tests' default: deterministic open
 ///   and pending order).
 /// * Progress: `(done, total)` where total is EVERY candidate handed in
-///   — skips and reuses advance `done` too, matching the old pipeline's
-///   UX. Ticks at least every [`PROGRESS_EVERY`] processed candidates
+///   — skips and reuses advance `done` too (the engine's progress UX
+///   shows movement even on a fully-persisted crowd). Ticks at least
+///   every [`PROGRESS_EVERY`] processed candidates
 ///   and once more at the end (or at the cancel point).
 /// * Cancel: checked at file boundaries (between opens); on cancel the
 ///   gate stops promptly, flushes the in-flight batch and reports
 ///   [`HeadOutcome::cancelled`]. Whether the run continues or aborts is
 ///   the caller's (`run_gates`') decision.
-#[allow(dead_code)] // Task 4-6 wiring: run_gates calls it.
 #[allow(clippy::too_many_arguments)] // the brief's pinned signature.
 pub(crate) fn gate_head(
     c: &Candidates,
@@ -1341,7 +922,7 @@ fn gate_head_chunk(
 ///    ([`NO_HASH`] = not persisted, i.e. steps 3-7 apply);
 /// 3. resolve (broken dir chain / unknown root segment → error);
 /// 4. placeholder attributes — consulted BEFORE the open (never
-///    touched; unstatable is an error, like the old pipeline);
+///    touched; unstatable is an error, not a placeholder);
 /// 5. mtime grace ([`is_fresh`]) — may still be mid-write;
 /// 6. open (a sharing violation is [`OpenSkip::Locked`], the rest an
 ///    error);
@@ -1400,7 +981,7 @@ fn gate_head_step(
     match reader.attributes(&path) {
         None => {
             // Unstatable (vanished/unreadable): an error, not a
-            // placeholder — the old pipeline's precedent.
+            // placeholder.
             worker.skipped(Skip::Error, size);
             return;
         }
@@ -1588,7 +1169,6 @@ pub(crate) fn sample_key(hashes: &[u64]) -> u64 {
 ///   files: unprocessed participants keep no result and the last
 ///   progress call reports `done < total`.
 #[derive(Default)]
-#[allow(dead_code)] // Task 6 wiring: run_gates consumes it.
 pub(crate) struct SampleOutcome {
     pub(crate) full_todo: Vec<u32>,
     /// Parallel to `full_todo`: the gate③-computed terminal fulls,
@@ -1670,7 +1250,6 @@ enum SampleKind {
 /// work (terminal-small + sampled; certified/short-circuited members
 /// are free and uncounted), ticked every [`PROGRESS_EVERY`] and once at
 /// the end (or at the cancel point).
-#[allow(dead_code)] // Task 6 wiring: run_gates calls it.
 #[allow(clippy::too_many_arguments)] // the brief's pinned signature.
 pub(crate) fn gate_sample(
     c: &Candidates,
@@ -2189,7 +1768,7 @@ fn sample_input(c: &Candidates, head: &HeadOutcome) -> Vec<u32> {
 // ---------------------------------------------------------------------
 // Gate ④ (pipeline rewrite, Task 6): full-hash certification of gate③'s
 // `full_todo`, and `run_gates` — the assembly chaining gates ①→②→③→④
-// into the complete pipeline the engine swaps onto (Task 7).
+// into the complete pipeline the engine's dedup cycle runs.
 
 /// gate④'s result — the gate②/③ result shape: the full hashes THIS gate
 /// computed (parallel to the `cand` slice it was handed), the gate's
@@ -2208,7 +1787,6 @@ fn sample_input(c: &Candidates, head: &HeadOutcome) -> Vec<u32> {
 ///   reuses are not counted).
 /// * `cancelled` — true when `cancel` fired and gate④ stopped.
 #[derive(Default)]
-#[allow(dead_code)] // Task 7 wiring: the engine swap onto run_gates consumes it.
 struct FullOutcome {
     full: Vec<u64>,
     counters: OutcomeCounters,
@@ -2223,7 +1801,6 @@ struct FullOutcome {
 /// field — a full-certification skip is a skip reason only, and the
 /// file simply stays out of the final grouping.
 #[derive(Default)]
-#[allow(dead_code)] // Task 7 wiring: the engine swap onto run_gates consumes it.
 struct FullWorker {
     /// `(chunk-local position, hash)` for files whose full read
     /// completed.
@@ -2294,7 +1871,7 @@ fn gate_full_step(
     match reader.attributes(&path) {
         None => {
             // Unstatable (vanished/unreadable): an error, not a
-            // placeholder — the old pipeline's precedent.
+            // placeholder.
             worker.skipped(Skip::Error);
             return;
         }
@@ -2501,7 +2078,6 @@ fn gate_full_chunked(
 /// in — members whose full is already known (the `known` slice,
 /// run_gates' merge of the persisted/gate②/gate③ values) advance `done`
 /// without I/O, so incremental runs report a full pass at zero opens.
-#[allow(dead_code)] // Task 7 wiring: the engine swap onto run_gates consumes it.
 #[allow(clippy::too_many_arguments)] // the gate's context, passed through.
 fn gate_full(
     c: &Candidates,
@@ -2540,11 +2116,10 @@ fn merge_full_worker(out: &mut FullOutcome, done: &mut u64, base: usize, worker:
     *done += worker.done;
 }
 
-/// Folds the run's hash counts into the outcome, mirrors the legacy
-/// scalar skips (engine.rs reads them until Task 7 swaps the engine),
-/// marks the run cancelled and reports [`DedupPhase::Cancelled`] as the
-/// FINAL progress report (no `Done`; groups stay empty — the engine
-/// keeps serving the last completed run's list).
+/// Folds the run's hash counts into the outcome, marks the run
+/// cancelled and reports [`DedupPhase::Cancelled`] as the FINAL progress
+/// report (no `Done`; groups stay empty — the engine keeps serving the
+/// last completed run's list).
 fn finish_cancelled(
     outcome: &mut DedupOutcome,
     hashed_first: u64,
@@ -2554,16 +2129,13 @@ fn finish_cancelled(
 ) {
     outcome.hashed_first = hashed_first;
     outcome.hashed_full = hashed_full;
-    outcome.errors = outcome.counters.errors;
-    outcome.locked = outcome.counters.locked;
-    outcome.placeholders = outcome.counters.placeholders;
     outcome.cancelled = true;
     progress(DedupPhase::Cancelled, last.0, last.1);
 }
 
-/// The rewritten pipeline (Task 6): gates ①→②→③→④ chained over the
-/// streamed [`Candidates`] snapshot — what Task 7 swaps the engine off
-/// [`run_pipeline`] onto. The store is locked only for the candidate
+/// The pipeline (Task 6, engine-wired since Task 7): gates ①→②→③→④
+/// chained over the streamed [`Candidates`] snapshot — what the engine's
+/// dedup cycle runs. The store is locked only for the candidate
 /// load and short persist batches (hashing never holds it); disk access
 /// goes through `reader`; `workers` sizes the gates' worker pools
 /// (`<= 1` runs inline); `now` injects the clock (the mtime grace);
@@ -2583,7 +2155,7 @@ fn finish_cancelled(
 /// * [`DedupPhase::Done`] — done = total = first + full hashes computed
 ///   THIS run (0 = fully incremental).
 ///
-/// FULL-MERGE SEMANTICS (for the Task 7 implementer): a candidate's
+/// FULL-MERGE SEMANTICS: a candidate's
 /// authoritative full hash for the final grouping is the FIRST hit of —
 /// gate④'s freshly computed value, then gate③'s terminal-small value
 /// (computed this run; found in the [`SampleOutcome::small_full`]
@@ -2596,8 +2168,7 @@ fn finish_cancelled(
 /// full exists (a recycle-bin row must never group). Known-full members
 /// are grouped by `(size, full)` contiguous runs >= 2 into
 /// [`StoredGroup`]s — members id-ascending, groups size-descending /
-/// hash-ascending, byte-for-byte the old pipeline's order (the Task 12
-/// 对拍 baseline).
+/// hash-ascending (the Task 12 对拍 baseline's stable paging order).
 ///
 /// Cancel: a hit at ANY checkpoint (gate④'s per-buffer-step checks
 /// included) ends the run right there — each gate flushes its own
@@ -2609,7 +2180,6 @@ fn finish_cancelled(
 /// Errors are never fatal: a candidate load failure (store error, a
 /// files-row id past `u32::MAX`) yields the trivial run — every phase
 /// reported at `(0, 0)`, empty groups, not cancelled.
-#[allow(dead_code)] // Task 7 wiring: the engine swap onto run_gates consumes it.
 #[allow(clippy::too_many_arguments)] // the plan's pinned signature.
 pub(crate) fn run_gates(
     store: &Mutex<Store>,
@@ -2622,8 +2192,8 @@ pub(crate) fn run_gates(
 ) -> DedupOutcome {
     let mut outcome = DedupOutcome::default();
     let Some((cands, dirs)) = load_candidates(store) else {
-        // Trivial run (mirrors the old load_snapshot semantics): the
-        // phase walk still happens, so subscribers see a complete cycle.
+        // Trivial run: the phase walk still happens, so subscribers see a
+        // complete cycle.
         progress(DedupPhase::Grouping, 0, 0);
         progress(DedupPhase::HashingFirst, 0, 0);
         progress(DedupPhase::Sampling, 0, 0);
@@ -2825,12 +2395,12 @@ pub(crate) fn run_gates(
         run = w;
     }
     // Size descending for the stable paging contract; hash ascending as
-    // the deterministic tie-break — the old pipeline's exact order.
+    // the deterministic tie-break (the Task 12 对拍 baseline's order).
     groups.sort_unstable_by(|a, b| b.size.cmp(&a.size).then(a.hash.cmp(&b.hash)));
     outcome.groups = groups;
 
-    // ---- Outcome: the four gates' counters summed, the legacy scalar
-    // mirrors folded from them (engine.rs reads those until Task 7). ----
+    // ---- Outcome: the four gates' counters summed, this run's hash
+    // counts folded in. ----
     let mut counters = size_counters;
     counters.accumulate(&head.counters);
     counters.accumulate(&sample.counters);
@@ -2838,9 +2408,6 @@ pub(crate) fn run_gates(
     outcome.counters = counters;
     outcome.hashed_first = head.hashed_first;
     outcome.hashed_full = sample.hashed_full_small + full.hashed_full;
-    outcome.errors = outcome.counters.errors;
-    outcome.locked = outcome.counters.locked;
-    outcome.placeholders = outcome.counters.placeholders;
 
     let hashed = outcome.hashed_first + outcome.hashed_full;
     progress(DedupPhase::Done, hashed, hashed);
@@ -2860,29 +2427,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(&tmp.path().join("index.db")).unwrap();
         (tmp, StdMutex::new(store))
-    }
-
-    /// Upserts `name` (size 5) under `["fixture"]` with no hashes.
-    fn upsert_fixture_row(store: &StdMutex<Store>, name: &str) -> FileId {
-        let mut rec = FileRecord {
-            id: 0,
-            parent: 0,
-            name: name.to_string(),
-            size: 5,
-            mtime: 1_700_000_000,
-            ctime: 1_700_000_001,
-            atime: 1_700_000_002,
-            ext_id: 0,
-            is_dir: false,
-            hash_first: None,
-            hash_full: None,
-            py_full: String::new(),
-            py_init: String::new(),
-        };
-        crate::engine::lock_unpoisoned(store)
-            .upsert_file(&["fixture"], &mut rec)
-            .unwrap();
-        rec.id
     }
 
     /// Fake reader: reports configured placeholder paths (and stat-missing
@@ -2928,11 +2472,8 @@ mod tests {
         }
     }
 
-    fn noop_progress(_: DedupPhase, _: u64, _: u64) {}
-
     // ------------------------------------------------------------------
     // Task 2: candidate streaming load (SoA + name arena + recycle bits).
-    // The old-pipeline tests above keep exercising `load_snapshot`.
 
     /// Upserts a fully specified row — size, `is_dir` and persisted hashes
     /// chosen by the test — under `dir_path`; returns
@@ -3077,7 +2618,8 @@ mod tests {
     /// A `files` row id beyond `u32::MAX` (only possible in a hand-edited
     /// database) is an explicit checked-conversion error, never a silent
     /// truncation — and the run-facing load degrades to `None` (the
-    /// trivial-run semantics of `load_snapshot`).
+    /// trivial-run semantics: a store-side failure means an empty run,
+    /// never a fatal one).
     #[test]
     fn candidates_reject_file_id_beyond_u32() {
         let (_tmp, store) = test_store();
@@ -3130,38 +2672,13 @@ mod tests {
         assert_eq!(resolve_absolute_path(&roots, ""), None);
     }
 
+    /// A cloud placeholder is never opened (no hydration download) and
+    /// never grouped; its identical sibling — alone after the skip —
+    /// hashes once and forms no group. Migrated from the old pipeline's
+    /// `dedup_placeholder_never_hashed` onto the gates path (Task 7):
+    /// the skip matrix lives in gate②, before any open.
     #[test]
-    fn snapshot_index_path_rebuilds_chain() {
-        let (_tmp, store) = test_store();
-        let mut nested = FileRecord {
-            id: 0,
-            parent: 0,
-            name: "memo.md".to_string(),
-            size: 3,
-            mtime: 0,
-            ctime: 0,
-            atime: 0,
-            ext_id: 0,
-            is_dir: false,
-            hash_first: None,
-            hash_full: None,
-            py_full: String::new(),
-            py_init: String::new(),
-        };
-        crate::engine::lock_unpoisoned(&store)
-            .upsert_file(&["fixture", "docs", "inner"], &mut nested)
-            .unwrap();
-        let snapshot = load_snapshot(&store);
-        assert_eq!(snapshot.files.len(), 1);
-        let path = snapshot.index_path(&snapshot.files[0]).unwrap();
-        assert_eq!(
-            path,
-            format!("fixture{MAIN_SEPARATOR}docs{MAIN_SEPARATOR}inner{MAIN_SEPARATOR}memo.md")
-        );
-    }
-
-    #[test]
-    fn dedup_placeholder_never_hashed() {
+    fn gates_placeholder_never_opened_or_grouped() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("fixture");
         fs::create_dir_all(&root).unwrap();
@@ -3169,22 +2686,24 @@ mod tests {
         fs::write(root.join("b.txt"), b"alpha").unwrap();
 
         let (_tstore, store) = test_store();
-        upsert_fixture_row(&store, "a.txt");
-        upsert_fixture_row(&store, "b.txt");
+        upsert_row_at(&store, &["fixture"], "a.txt", 5, NOW - 10_000, None, None);
+        upsert_row_at(&store, &["fixture"], "b.txt", 5, NOW - 10_000, None, None);
 
         let mut reader = FakeReader::new();
         reader.placeholders.push(root.join("a.txt"));
-        let roots = vec![root.to_string_lossy().into_owned()];
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
 
-        let outcome = run_pipeline(&store, &roots, &reader, &noop_progress);
+        let (outcome, _log) = gates_run(&store, &roots, &reader, &cancel);
 
-        // The placeholder was never opened (no hydration download); its
-        // identical sibling was hashed — and alone it forms no group.
+        // The placeholder was never opened; its identical sibling was
+        // hashed once — and alone it forms no group.
         let opened = reader.opened.lock().unwrap().clone();
         assert_eq!(opened, vec![root.join("b.txt")], "only b.txt is opened");
-        assert_eq!(outcome.placeholders, 1);
-        assert_eq!(outcome.errors, 0);
+        assert_eq!(outcome.counters.placeholders, 1);
+        assert_eq!(outcome.counters.errors, 0);
         assert_eq!(outcome.hashed_first, 1);
+        assert_eq!(outcome.hashed_full, 0);
         assert!(
             outcome.groups.is_empty(),
             "a skipped member cannot confirm a dupe group"
@@ -3280,6 +2799,7 @@ mod tests {
                 .map(|r| (r.hash_first, r.hash_full))
                 .unwrap()
         };
+        let yy = xxh64(b"YY", 0);
 
         // Flushing the stale batch must NOT touch the replaced row...
         assert_eq!(
@@ -3298,9 +2818,9 @@ mod tests {
         // ...and the next run must find NO pair between the two
         // different-content files: it re-reads both instead of trusting
         // anything stale.
-        let reader = RealFileReader;
-        let roots = vec![root.to_string_lossy().into_owned()];
-        let outcome = run_pipeline(&store, &roots, &reader, &noop_progress);
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+        let (outcome, _log) = gates_run(&store, &roots, &RealFileReader, &cancel);
         assert!(
             outcome.groups.is_empty(),
             "XX and YY differ, so no group may form (stale or fresh)"
@@ -3320,54 +2840,11 @@ mod tests {
                 .unwrap(),
             1
         );
-        assert_eq!(hashes_of(reused.id), (Some(xxh64(b"YY", 0)), None));
-    }
-
-    #[test]
-    fn dedup_counts_unresolvable_paths_as_errors() {
-        // Rows indexed under a root segment no configured root carries:
-        // neither can be resolved to disk, both are skipped as errors and
-        // nothing is ever opened.
-        let tmp = tempfile::tempdir().unwrap();
-        let (_tstore, store) = test_store();
-        upsert_fixture_row(&store, "a.txt");
-        upsert_fixture_row(&store, "b.txt");
-
-        let elsewhere = tmp.path().join("elsewhere");
-        fs::create_dir_all(&elsewhere).unwrap();
-        let roots = vec![elsewhere.to_string_lossy().into_owned()];
-        let reader = FakeReader::new();
-
-        let outcome = run_pipeline(&store, &roots, &reader, &noop_progress);
-
-        assert_eq!(outcome.errors, 2);
-        assert_eq!(outcome.placeholders, 0);
-        assert!(reader.opened.lock().unwrap().is_empty());
-        assert!(outcome.groups.is_empty());
-    }
-
-    #[test]
-    fn dedup_distinguishes_same_size_different_content() {
-        // Same size, first bytes differ: the first stage alone dissolves
-        // the pair and the full stage never reads either file.
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("fixture");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("a.txt"), b"alpha").unwrap();
-        fs::write(root.join("b.txt"), b"alphb").unwrap();
-
-        let (_tstore, store) = test_store();
-        upsert_fixture_row(&store, "a.txt");
-        upsert_fixture_row(&store, "b.txt");
-
-        let reader = FakeReader::new();
-        let roots = vec![root.to_string_lossy().into_owned()];
-        let outcome = run_pipeline(&store, &roots, &reader, &noop_progress);
-
-        assert_eq!(outcome.hashed_first, 2);
-        assert_eq!(outcome.hashed_full, 0, "full hashes never needed");
-        assert_eq!(reader.opened.lock().unwrap().len(), 2);
-        assert!(outcome.groups.is_empty());
+        assert_eq!(hashes_of(reused.id), (Some(yy), Some(yy)),
+            "the guard accepted the CURRENT row's first hash (not over-broad); \
+             the gates run had already persisted the terminal pair — a 2-byte \
+             file's probe read IS the whole file, so first and full land \
+             together");
     }
 
     // ------------------------------------------------------------------
@@ -3397,10 +2874,7 @@ mod tests {
             "access denied is an error, not a lock"
         );
         assert_eq!(
-            classify_open_err(&std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "not an os error"
-            )),
+            classify_open_err(&std::io::Error::other("not an os error")),
             OpenSkip::Error
         );
     }
@@ -3416,57 +2890,6 @@ mod tests {
         assert!(!is_fresh(now - 300, now));
         assert!(!is_fresh(now - 3_600, now), "long-settled files are read");
         assert!(is_fresh(now + 5, now), "clock skew stays in the window");
-    }
-
-    /// A real file held with NO sharing flags (the [`crate::engine`] tests'
-    /// precedent) must fail our deny-write open as a Locked skip — the
-    /// open-path helper returns no file (nothing is ever read), the skip
-    /// lands in `locked`, and the end-to-end run hashes only the unlocked
-    /// sibling. Releasing the handle makes the file openable again.
-    #[cfg(windows)]
-    #[test]
-    fn open_semantics_real_exclusive_lock_is_locked_skip() {
-        use std::os::windows::fs::OpenOptionsExt;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("fixture");
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("locked.txt"), b"shared secret").unwrap();
-        fs::write(root.join("free.txt"), b"shared secret").unwrap();
-
-        // Hold the file with NO sharing flags: any other open fails.
-        let held = fs::OpenOptions::new()
-            .read(true)
-            .share_mode(0)
-            .open(root.join("locked.txt"))
-            .unwrap();
-
-        // The open-path helper: no file comes back (so no content can be
-        // read), the failure is a Locked skip, not an error.
-        let reader = RealFileReader;
-        let mut outcome = DedupOutcome::default();
-        assert!(open_or_skip(&reader, &root.join("locked.txt"), &mut outcome).is_none());
-        assert_eq!(outcome.locked, 1);
-        assert_eq!(outcome.errors, 0);
-
-        // End-to-end through the pipeline (whose deny-write open hits the
-        // same exclusive holder): the locked member never enters a group,
-        // never reaches a hash, and is not counted as an error.
-        let (_tstore, store) = test_store();
-        upsert_fixture_row(&store, "locked.txt");
-        upsert_fixture_row(&store, "free.txt");
-        let roots = vec![root.to_string_lossy().into_owned()];
-        let outcome = run_pipeline(&store, &roots, &reader, &noop_progress);
-        assert_eq!(outcome.locked, 1, "the sharing violation is a Locked skip");
-        assert_eq!(outcome.errors, 0, "not an error");
-        assert_eq!(outcome.hashed_first, 1, "only free.txt was read");
-        assert!(outcome.groups.is_empty(), "one hash never pairs");
-
-        // Release the handle: the file opens like any other.
-        drop(held);
-        let mut after = DedupOutcome::default();
-        assert!(open_or_skip(&reader, &root.join("locked.txt"), &mut after).is_some());
-        assert_eq!(after.locked, 0);
     }
 
     // ------------------------------------------------------------------
@@ -3667,7 +3090,7 @@ mod tests {
     }
 
     /// A cloud placeholder is counted and never opened (no hydration
-    /// download), exactly like the old pipeline's pre-open check.
+    /// download) — the attribute check runs BEFORE the open.
     #[test]
     fn gate_head_counts_placeholders_before_open() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4942,16 +4365,12 @@ mod tests {
         let c = &outcome.counters;
         assert_eq!(c.size_gate.files + c.head_gate.files + c.sample_gate.files, 0);
         assert_eq!(c.errors + c.locked + c.fresh + c.placeholders + c.recycle, 0);
-        // The legacy scalar mirrors (engine.rs reads them until Task 7).
-        assert_eq!(outcome.errors, 0);
-        assert_eq!(outcome.locked, 0);
-        assert_eq!(outcome.placeholders, 0);
     }
 
     /// Same size, first 4KB differs: the `(size, head)` regroup
     /// dissolves the pair BEFORE gate③ — nothing sampled, nothing fully
     /// read, no group, and no gate kill counted (both members carry a
-    /// head; the kill is the regroup's, like the old pipeline's).
+    /// head; the kill is the regroup's own).
     #[test]
     fn gates_same_size_different_head_never_reaches_sampling() {
         let tmp = tempfile::tempdir().unwrap();

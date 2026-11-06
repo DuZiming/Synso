@@ -36,17 +36,22 @@
 //! serialize; events that arrive while a scan holds the mutex queue in the
 //! watcher's channel and apply right after — nothing is dropped.
 //!
-//! Dedup (Task 9): [`Engine::dedup_start`] runs the staged hashing
-//! pipeline (see [`crate::dedup`]) on its own thread — one run at a time,
-//! the slot claimed by CAS and released by the same drop-guard pattern as
-//! the scan slot. Hashing runs entirely OUTSIDE the store lock; only the
-//! snapshot read and short batched hash persists take it. One run is also
-//! auto-started 30 seconds after the first successful `ScanFinished` (the
-//! timer holds only a `Weak` to the dedup state, so dropping the engine
-//! cancels a pending kick-off instead of hashing behind the app's back).
+//! Dedup (Task 9, four-gate pipeline since the Task 7 swap):
+//! [`Engine::dedup_start`] runs the staged pipeline (see [`crate::dedup`])
+//! on its own thread — one run at a time, the slot claimed by CAS and
+//! released by the same drop-guard pattern as the scan slot. Hashing runs
+//! entirely OUTSIDE the store lock; only the candidate load and short
+//! batched hash persists take it. The run is cancellable
+//! ([`Engine::dedup_cancel`]): the pipeline stops at its next checkpoint,
+//! keeps what it computed, reports `Cancelled` — and the engine then keeps
+//! serving the last completed run's groups. The settings' `dedup_gear`
+//! ([`crate::settings::DedupGear`]) picks the gates' worker count, with a
+//! below-normal thread priority for the Gentle gear. Dedup is
+//! MANUAL-only (user requirement): scans never kick off hashing — the
+//! dedup view's 启动分析 button is the only trigger.
 //! [`Engine::resolve_absolute`] maps index-relative paths back to real
 //! disk paths — hashing needs them, and trash (Task 10) and reveal
-//! (Task 15) will reuse the same mapping.
+//! (Task 15) reuse the same mapping.
 //!
 //! Heat persistence (v1.4): the tier cache's heat map is snapshotted
 //! into the store's `heat` table every [`HEAT_PERSIST_INTERVAL`] by the
@@ -73,7 +78,7 @@ use crate::hotindex::HotIndex;
 use crate::model::{FileId, ParsedQuery};
 use crate::query::{self, SearchResult};
 use crate::scanner::{self, effective_roots, root_segment, ScanOptions};
-use crate::settings::{self, Settings};
+use crate::settings::{self, DedupGear, Settings};
 use crate::sizeagg::{self, SizeNode};
 use crate::store::Store;
 use crate::tiers::{self, TierCache};
@@ -81,6 +86,20 @@ use crate::trash;
 use crate::volumes::{match_volume, VolumeInfo};
 use crate::watcher::{self, Watcher};
 use crate::Result;
+
+/// The Gentle gear's thread hint (Task 7): the dedup thread itself runs
+/// below normal priority, so hashing stays out of everything else's way.
+/// Scope: this covers the orchestration thread (candidate load, gate①'s
+/// histogram, the merges/persists between gates). The gates' internal
+/// worker threads (dedup.rs's scope threads) do NOT inherit it — Windows
+/// priorities are per-thread and std spawns them at normal priority — an
+/// accepted limitation: the heavy streaming reads those workers do remain
+/// I/O-bound, and lowering them would need priority plumbing through
+/// every gate spawn.
+#[cfg(windows)]
+use windows::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+};
 
 /// What the engine scans and what it skips. Empty `volumes` means "all
 /// fixed local volumes" (`crate::volumes::fixed_volumes`); `exclusions`
@@ -94,11 +113,12 @@ pub struct EngineOptions {
 /// Phase of a dedup run (Task 9). The engine walks `Idle -> Grouping ->
 /// HashingFirst -> Sampling -> HashingFull -> Done` (intermediate stages
 /// are skipped when they have no work); `Grouping` reappears as the
-/// in-progress phase of every new run. `Sampling` (pipeline rewrite,
-/// Task 6) is gate③'s phase between the first probe and the full read;
-/// `Cancelled` is the final report of a cancelled run — Task 6's
-/// `run_gates` emits it as the last progress phase, Task 7 wires the
-/// state machine to land there instead of `Done`.
+/// in-progress phase of every new run. `Sampling` is gate③'s phase
+/// between the first probe and the full read. A cancelled run
+/// ([`Engine::dedup_cancel`]) ends at `Cancelled` instead of `Done` —
+/// its final progress report re-carries the last `(done, total)`, no
+/// `DedupFinished` follows, and the served groups stay the last completed
+/// run's.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 // JSON bridges (the app's IPC) spell phases snake_case — the same
@@ -114,8 +134,8 @@ pub enum DedupPhase {
     Sampling,
     HashingFull,
     Done,
-    /// A cancelled run's final state (Task 6 reports it; Task 7 wires
-    /// the engine state machine to it).
+    /// A cancelled run's final state: the run stopped at a checkpoint and
+    /// the last completed run's groups stay on duty.
     Cancelled,
 }
 
@@ -145,7 +165,11 @@ pub enum EngineEvent {
     /// Dedup pipeline progress (Task 9): `done`/`total` count the records
     /// of the current stage, emitted at every stage change and every 500
     /// records within one. The final event carries `phase: Done` with
-    /// `done == total ==` the hash computations the run performed.
+    /// `done == total ==` the hash computations the run performed — or,
+    /// for a cancelled run ([`Engine::dedup_cancel`]), ONE final event
+    /// with `phase: Cancelled` re-carrying the last `(done, total)`
+    /// (no `DedupFinished` follows; the served groups stay the previous
+    /// run's).
     DedupProgress {
         phase: DedupPhase,
         done: u64,
@@ -237,6 +261,12 @@ pub struct Engine {
 struct DedupShared {
     /// One dedup run at a time: CAS claim, released by a drop guard.
     running: AtomicBool,
+    /// Set by [`Engine::dedup_cancel`] while a run is going; the gates
+    /// check it at file boundaries (gate④ also at every 64KB read step)
+    /// and the run stops at the next checkpoint, reporting `Cancelled`
+    /// with an empty group list. Cleared by [`launch_dedup`] before each
+    /// spawn, so a cancelled predecessor cannot pre-arm its successor.
+    cancel: AtomicBool,
     /// The state machine behind `dedup_state()` plus the last completed
     /// run's groups.
     book: Mutex<DedupBookkeeping>,
@@ -278,6 +308,7 @@ impl Engine {
         let subscribers: Arc<Mutex<Vec<Sender<EngineEvent>>>> = Arc::new(Mutex::new(Vec::new()));
         let dedup = Arc::new(DedupShared {
             running: AtomicBool::new(false),
+            cancel: AtomicBool::new(false),
             book: Mutex::new(DedupBookkeeping {
                 state: DedupState::default(),
                 groups: Arc::new(Vec::new()),
@@ -746,23 +777,44 @@ impl Engine {
     // ---------------- Task 9: dedup state machine ------------------------
 
     /// Starts a dedup run on a background thread; a no-op while one is
-    /// already running. The pipeline (see `crate::dedup`) groups by size,
-    /// hashes first 4 KiB for same-size survivors, then whole files —
-    /// persisted hashes are reused, so repeat runs are incremental.
+    /// already running. The pipeline (see `crate::dedup`) is the four-gate
+    /// chain — size, first-4KiB probe, sampling, full certification — over
+    /// the streamed candidate snapshot; persisted hashes are reused, so
+    /// repeat runs are incremental. The settings' `dedup_gear` picks the
+    /// gates' worker count (and the Gentle gear's thread priority).
     /// `Idle -> Grouping` happens synchronously here; subscribers receive
     /// [`EngineEvent::DedupProgress`] / [`EngineEvent::DedupFinished`] and
-    /// pollers read [`Engine::dedup_state`]. The engine also auto-starts
-    /// one run 30s after the first successful scan finishes.
+    /// pollers read [`Engine::dedup_state`]. A run can be stopped with
+    /// [`Engine::dedup_cancel`].
     pub fn dedup_start(&self) {
-        launch_dedup(&self.dedup);
+        launch_dedup(&self.dedup, self.settings().dedup_gear);
+    }
+
+    /// Asks the running dedup run to stop at its next checkpoint (the
+    /// gates check at file boundaries; gate④ additionally at every 64KB
+    /// read step, so even a giant file aborts sub-second). The run keeps
+    /// every hash it already computed, reports `Cancelled` as its final
+    /// progress phase, and broadcasts NO `DedupFinished` — the engine
+    /// keeps serving the last completed run's groups. Idempotent, and a
+    /// no-op when no run is going: a cancel pressed while idle must not
+    /// pre-arm the NEXT run ([`launch_dedup`] additionally clears the
+    /// flag before each spawn, so the two guards agree).
+    pub fn dedup_cancel(&self) {
+        if !self.dedup.running.load(Ordering::Acquire) {
+            return;
+        }
+        self.dedup.cancel.store(true, Ordering::Release);
     }
 
     /// Snapshot of the dedup state machine. While a run is going,
     /// `done`/`total` mirror the latest progress event; at
     /// [`DedupPhase::Done`] they equal the hash computations this run
-    /// performed (0 = fully incremental). `groups` is the last COMPLETED
-    /// run's group count; `errors` counts files skipped unreadable or as
-    /// cloud placeholders.
+    /// performed (0 = fully incremental); at [`DedupPhase::Cancelled`]
+    /// they re-carry the last in-run report. `groups` is the last
+    /// COMPLETED run's group count (a cancelled run keeps the previous
+    /// one); `errors` counts files skipped because they could not be
+    /// read, were locked by another handle, or are cloud placeholders —
+    /// all "marked skipped, not grouped" per the design.
     pub fn dedup_state(&self) -> DedupState {
         lock_unpoisoned(&self.dedup.book).state
     }
@@ -1136,9 +1188,17 @@ fn scan_cycle(
 
 /// Claims the dedup slot, resets the state machine to `Grouping` (the
 /// `Idle -> Grouping` transition `dedup_start` promises — synchronously,
-/// so pollers never miss it) and spawns the worker thread. A no-op when a
-/// run is already going. Returns whether a run was started.
-fn launch_dedup(dedup: &Arc<DedupShared>) -> bool {
+/// so pollers never miss it) and spawns the worker thread at the gear's
+/// worker count. A no-op when a run is already going. Returns whether a
+/// run was started.
+fn launch_dedup(dedup: &Arc<DedupShared>, gear: DedupGear) -> bool {
+    // Clear any stale cancel BEFORE the claim: a cancelled predecessor
+    // leaves the flag set, and it must not pre-arm its successor.
+    // `dedup_cancel` is a no-op while idle, so nothing can set the flag
+    // between this store and a successful claim — a cancel arriving after
+    // the claim is honored by the new run, one arriving before it is
+    // (correctly) dropped.
+    dedup.cancel.store(false, Ordering::Release);
     if dedup
         .running
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1155,9 +1215,11 @@ fn launch_dedup(dedup: &Arc<DedupShared>) -> bool {
         // `groups` keeps the previous run's list: dedup_groups goes on
         // serving it until the new run finishes.
     }
+    let workers = gear.workers();
+    let gentle = gear == DedupGear::Gentle;
     let spawn = thread::Builder::new().name("synso-dedup".into()).spawn({
         let dedup = Arc::clone(dedup);
-        move || dedup_cycle(dedup)
+        move || dedup_cycle(dedup, workers, gentle)
     });
     match spawn {
         Ok(_) => true,
@@ -1170,16 +1232,35 @@ fn launch_dedup(dedup: &Arc<DedupShared>) -> bool {
     }
 }
 
-/// One dedup cycle on its own thread: run the staged pipeline against the
-/// store (hashing happens outside the lock — only the snapshot read and
-/// short persist batches take it), fold the outcome into the state
-/// machine, then broadcast the final progress and `DedupFinished`. The
-/// slot is released by [`SlotGuard`] on every exit path, panic included.
-/// The cycle is eprintln-free by design: every skip is counted in
-/// [`DedupState::errors`] instead, and store failures merely degrade the
-/// run — they never panic it.
-fn dedup_cycle(dedup: Arc<DedupShared>) {
+/// One dedup cycle on its own thread: run the four-gate pipeline against
+/// the store (hashing happens outside the lock — only the candidate load
+/// and short persist batches take it), fold the outcome into the state
+/// machine, then broadcast the final progress and — for a completed run —
+/// `DedupFinished`. The slot is released by [`SlotGuard`] on every exit
+/// path, panic included. The cycle is eprintln-free by design: every skip
+/// is counted in [`DedupState::errors`] instead, and store failures merely
+/// degrade the run — they never panic it.
+///
+/// `workers` is the gates' worker-pool size ([`DedupGear::workers`]);
+/// `gentle` drops THIS thread below normal priority on Windows — see the
+/// import note for why the gates' internal workers stay normal-priority
+/// (accepted limitation).
+fn dedup_cycle(dedup: Arc<DedupShared>, workers: usize, gentle: bool) {
     let _slot = SlotGuard(&dedup.running);
+    // Gentle gear: below-normal priority for the whole run on this thread
+    // (best-effort — a failure would only mean normal priority; there is
+    // nothing to report). One unsafe call: Win32 thread priority.
+    #[cfg(windows)]
+    if gentle {
+        // SAFETY: GetCurrentThread returns the (always valid) pseudo
+        // handle of the calling thread; SetThreadPriority only touches
+        // that thread's scheduler priority.
+        unsafe {
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = gentle; // no thread-priority knobs off Windows (mac port)
     let subscribers = Arc::clone(&dedup.subscribers);
     let progress = |phase: DedupPhase, done: u64, total: u64| {
         {
@@ -1188,17 +1269,76 @@ fn dedup_cycle(dedup: Arc<DedupShared>) {
             book.state.done = done;
             book.state.total = total;
         }
-        broadcast(
-            &subscribers,
-            EngineEvent::DedupProgress { phase, done, total },
-        );
+        // A cancelled run's FINAL report is broadcast by the cycle itself,
+        // AFTER it folds the book (see the cancel branch) — exactly one
+        // event, and only once the state it describes is fully written.
+        if phase != DedupPhase::Cancelled {
+            broadcast(
+                &subscribers,
+                EngineEvent::DedupProgress { phase, done, total },
+            );
+        }
     };
     let reader = dedup::RealFileReader;
     // One snapshot of the live root mapping for this run (the scope can
-    // change mid-run; the next run picks it up).
+    // change mid-run; the next run picks it up). `now` seeds the mtime
+    // grace window.
     let roots = read_unpoisoned(&dedup.roots).clone();
-    let outcome = dedup::run_pipeline(&dedup.store, &roots, &reader, &progress);
+    let outcome = dedup::run_gates(
+        &dedup.store,
+        &roots,
+        &reader,
+        workers,
+        &dedup.cancel,
+        unix_now(),
+        &progress,
+    );
+    let c = &outcome.counters;
+    // ONE summary line per run (the spec's per-gate accounting), on both
+    // exits — completion and cancellation.
+    let tally = format!(
+        "size_gate {}f/{}B head_gate {}f/{}B sample_gate {}f/{}B skips errors {} locked {} fresh {} placeholders {} recycle {} hashed first {} full {}",
+        c.size_gate.files,
+        c.size_gate.bytes,
+        c.head_gate.files,
+        c.head_gate.bytes,
+        c.sample_gate.files,
+        c.sample_gate.bytes,
+        c.errors,
+        c.locked,
+        c.fresh,
+        c.placeholders,
+        c.recycle,
+        outcome.hashed_first,
+        outcome.hashed_full,
+    );
+    if outcome.cancelled {
+        log::info!("synso: dedup run cancelled: {tally}");
+        // Fold the book FIRST (only the partial skip count is new: the
+        // closure already wrote the Cancelled phase and the last in-run
+        // counters; `groups` is restored to the still-served list's count
+        // — the launch reset zeroed it, and DedupState.groups is
+        // documented as the last COMPLETED run's group count, which a
+        // cancel does not displace), THEN broadcast the run's ONE final
+        // DedupProgress{Cancelled, done, total} — after the state it
+        // describes is fully written, so a subscriber reacting to it sees
+        // the settled book. NO DedupFinished follows: the UI must not
+        // reload groups on cancel.
+        let final_report = {
+            let mut book = lock_unpoisoned(&dedup.book);
+            book.state.errors = c.errors + c.locked + c.placeholders;
+            book.state.groups = book.groups.len() as u64;
+            EngineEvent::DedupProgress {
+                phase: book.state.phase,
+                done: book.state.done,
+                total: book.state.total,
+            }
+        };
+        broadcast(&subscribers, final_report);
+        return;
+    }
     let groups = outcome.groups.len() as u64;
+    log::info!("synso: dedup run finished: {groups} group(s); {tally}");
     let hashed = outcome.hashed_first + outcome.hashed_full;
     {
         let mut book = lock_unpoisoned(&dedup.book);
@@ -1209,9 +1349,9 @@ fn dedup_cycle(dedup: Arc<DedupShared>) {
             groups,
             // All skip kinds share the public counter (the design's
             // "marked skipped, not grouped" — unreadable, locked by
-            // another handle, or a cloud placeholder); the pipeline
-            // outcome keeps them apart for tests.
-            errors: outcome.errors + outcome.locked + outcome.placeholders,
+            // another handle, or a cloud placeholder); the outcome
+            // counters keep them apart (fresh/recycle stay internal).
+            errors: c.errors + c.locked + c.placeholders,
         };
         book.groups = Arc::new(outcome.groups);
     }
@@ -1447,12 +1587,30 @@ mod tests {
             "\"hashing_full\""
         );
         assert_eq!(
+            serde_json::to_string(&DedupPhase::Sampling).unwrap(),
+            "\"sampling\"",
+            "gate③'s phase (Task 6) spells snake_case like the rest"
+        );
+        assert_eq!(
+            serde_json::to_string(&DedupPhase::Cancelled).unwrap(),
+            "\"cancelled\"",
+            "a cancelled run's final phase (Task 7) spells snake_case"
+        );
+        assert_eq!(
             serde_json::to_string(&DedupPhase::Done).unwrap(),
             "\"done\""
         );
         assert_eq!(
             serde_json::from_str::<DedupPhase>("\"hashing_first\"").unwrap(),
             DedupPhase::HashingFirst
+        );
+        assert_eq!(
+            serde_json::from_str::<DedupPhase>("\"sampling\"").unwrap(),
+            DedupPhase::Sampling
+        );
+        assert_eq!(
+            serde_json::from_str::<DedupPhase>("\"cancelled\"").unwrap(),
+            DedupPhase::Cancelled
         );
     }
 
@@ -1614,6 +1772,19 @@ mod tests {
         fs::write(root.join("docs").join("notes.txt"), b"0123456789").unwrap();
         fs::write(root.join("docs").join("final.pdf"), b"x").unwrap();
         root
+    }
+
+    /// Backdates a fixture file's mtime far into the past. The four-gate
+    /// pipeline skips candidates about to be OPENED whose snapshot mtime
+    /// is inside the grace window (`crate::dedup::FRESH_SECS`, 300s — a
+    /// file may still be mid-write), so freshly written dedup fixtures
+    /// must be settled or every run skips them without reading. Content
+    /// is untouched; rescans re-read the settled mtime, so persisted
+    /// hashes survive the upsert conflict path as in production.
+    fn backdate(path: &Path) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+            .unwrap();
     }
 
     fn open_engine(db: &Path, root: &Path) -> Engine {
@@ -1914,6 +2085,10 @@ mod tests {
         fs::write(root.join("dup_a.txt"), b"alpha bravo").unwrap();
         fs::write(root.join("sub").join("dup_b.txt"), b"alpha bravo").unwrap();
         fs::write(root.join("other.txt"), b"alpha bravO").unwrap(); // same size, last byte differs
+        for f in ["dup_a.txt", "other.txt"] {
+            backdate(&root.join(f));
+        }
+        backdate(&root.join("sub").join("dup_b.txt"));
 
         let engine = open_engine(&db_path, &root);
         let rx = engine.subscribe();
@@ -1962,6 +2137,7 @@ mod tests {
         fs::write(root.join("empty_a.txt"), b"").unwrap();
         fs::write(root.join("empty_b.txt"), b"").unwrap();
         fs::write(root.join("real.txt"), b"r").unwrap();
+        backdate(&root.join("real.txt"));
 
         let engine = open_engine(&db_path, &root);
         let rx = engine.subscribe();
@@ -1988,6 +2164,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("locked.txt"), b"shared secret").unwrap();
         fs::write(root.join("free.txt"), b"shared secret").unwrap();
+        backdate(&root.join("locked.txt"));
+        backdate(&root.join("free.txt"));
 
         // Hold the file with NO sharing flags: any other open fails.
         let held = fs::OpenOptions::new()
@@ -2029,6 +2207,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("keep1.txt"), b"persist me!!").unwrap();
         fs::write(root.join("keep2.txt"), b"persist me!!").unwrap();
+        backdate(&root.join("keep1.txt"));
+        backdate(&root.join("keep2.txt"));
 
         let engine = open_engine(&db_path, &root);
         let rx = engine.subscribe();
@@ -2091,6 +2271,137 @@ mod tests {
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
     }
 
+    /// A cancel pressed while idle is a no-op: nothing panics, the state
+    /// stays Idle, and the NEXT run is not pre-armed cancelled — it runs
+    /// to `Done` normally.
+    #[test]
+    fn dedup_cancel_while_idle_is_a_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"twin").unwrap();
+        fs::write(root.join("b.txt"), b"twin").unwrap();
+        backdate(&root.join("a.txt"));
+        backdate(&root.join("b.txt"));
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        engine.dedup_cancel();
+        engine.dedup_cancel(); // idempotent
+        assert_eq!(
+            engine.dedup_state().phase,
+            DedupPhase::Idle,
+            "an idle cancel leaves the state machine alone"
+        );
+
+        // The next run completes normally — the idle cancel pre-armed
+        // nothing.
+        engine.dedup_start();
+        let (groups, _progress) = wait_dedup_finished(&rx);
+        assert_eq!(groups, 1);
+        assert_eq!(engine.dedup_state().phase, DedupPhase::Done);
+    }
+
+    /// THE cancel contract, end to end: a run cancelled mid-flight ends at
+    /// `Cancelled` with exactly ONE final `Cancelled` progress report,
+    /// never broadcasts `DedupFinished`, and the engine keeps serving the
+    /// last completed run's groups.
+    #[test]
+    fn dedup_cancel_mid_run_reports_cancelled_and_keeps_groups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"twin").unwrap();
+        fs::write(root.join("b.txt"), b"twin").unwrap();
+        backdate(&root.join("a.txt"));
+        backdate(&root.join("b.txt"));
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        // Run 1: small and fast — it must COMPLETE, so "previous groups"
+        // is non-empty for run 2 to keep.
+        engine.dedup_start();
+        let (groups, _progress) = wait_dedup_finished(&rx);
+        assert_eq!(groups, 1);
+        assert_eq!(engine.dedup_groups(0, 10).len(), 1);
+
+        // Run 2 gets real work: 300 identical unhashed 80KB copies join the
+        // index via a rescan (the unchanged twins keep their hashes — the
+        // new files are the only work). ~50MB of hashing lies between the
+        // run's FIRST progress report and its end, so a cancel armed on
+        // that report lands mid-run with orders of magnitude of margin.
+        // (The copies are backdated: fresh candidates are skipped without
+        // being opened, which would leave the run nothing to do.)
+        fs::create_dir_all(root.join("big")).unwrap();
+        let big = vec![b'e'; 80 * 1024];
+        for i in 0..300 {
+            let path = root.join("big").join(format!("copy{i:03}.bin"));
+            fs::write(&path, &big).unwrap();
+            backdate(&path);
+        }
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        engine.dedup_start();
+        let mut reports = 0usize;
+        loop {
+            let event = rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the cancelled run still broadcasts its final report");
+            match event {
+                EngineEvent::DedupProgress { phase, done, total } => {
+                    reports += 1;
+                    if phase == DedupPhase::Cancelled {
+                        // The final report re-carries the last in-run
+                        // counters — the run had started real work.
+                        assert!(
+                            done <= total,
+                            "cancelled report carries sane counters: {done}/{total}"
+                        );
+                        break; // the cycle broadcasts nothing after this
+                    }
+                    // Any in-run report: arm the cancel (idempotent).
+                    engine.dedup_cancel();
+                }
+                EngineEvent::DedupFinished { groups } => panic!(
+                    "a cancelled run must NOT broadcast DedupFinished (got groups={groups})"
+                ),
+                other => panic!("unexpected event during dedup cancel: {other:?}"),
+            }
+        }
+        assert!(reports >= 2, "cancel armed on an in-run report, saw {reports}");
+
+        // The state machine landed on Cancelled — not Done — and the last
+        // completed run's groups stay on duty (no reload happened).
+        let state = engine.dedup_state();
+        assert_eq!(state.phase, DedupPhase::Cancelled);
+        assert_eq!(
+            state.groups, 1,
+            "a cancelled run keeps the previous run's group count"
+        );
+        assert_eq!(
+            engine.dedup_groups(0, 10).len(),
+            1,
+            "dedup_groups still serves the previous run's group"
+        );
+
+        // The stream went quiet: the Cancelled report is the cycle's last
+        // broadcast (the run has already ended by the time the state says
+        // Cancelled — the report itself wrote it).
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "no event may follow the Cancelled report (no DedupFinished)"
+        );
+    }
+
     /// User requirement: "mtime unchanged → never recompute" across
     /// RESCANS too — the upsert's conflict path preserves persisted hashes
     /// for unchanged files (the purge+reinsert of a rescan used to wipe
@@ -2103,6 +2414,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("same1.bin"), b"hash cache me").unwrap();
         fs::write(root.join("same2.bin"), b"hash cache me").unwrap();
+        backdate(&root.join("same1.bin"));
+        backdate(&root.join("same2.bin"));
 
         let engine = open_engine(&db_path, &root);
         let rx = engine.subscribe();
@@ -2148,6 +2461,7 @@ mod tests {
         let root = tmp.path().join("fixture");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("mutant.bin"), b"old content").unwrap();
+        backdate(&root.join("mutant.bin")); // settled: the first run really hashes it
 
         let engine = open_engine(&db_path, &root);
         let rx = engine.subscribe();
