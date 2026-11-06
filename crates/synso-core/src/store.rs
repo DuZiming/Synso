@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension, Row, Statement};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, Statement};
 
 use crate::model::{FileId, FileRecord};
 use crate::pinyin::pinyin_keys;
@@ -188,6 +188,86 @@ impl Store {
     /// outcome for create-then-delete inside one batch).
     pub fn delete_file_by_path(&mut self, dir_path: &[&str], name: &str) -> Result<u64> {
         delete_file_by_path_on(&self.conn, dir_path, name)
+    }
+
+    /// Deletes every indexed row inside a recycle-bin subtree: all `dirs`
+    /// rows named `$Recycle.Bin` (case-insensitively, at any depth —
+    /// Windows volumes spell the folder variously) plus their whole
+    /// descendant subtrees, together with every `files` row under them.
+    /// Returns the number of `files` rows deleted (directory entries are
+    /// `files` rows too, like `delete_subtree`'s count); `Ok(0)` when the
+    /// index carries no recycle-bin rows. ONE transaction: the purge
+    /// commits atomically or not at all.
+    ///
+    /// `Engine::open` runs this once, under the store lock and before the
+    /// hot-index load spawns (guarded by the `recycle_purge_done` meta
+    /// key), so purged rows never surface in searches.
+    ///
+    /// Subtree collection is in-memory: one id-ordered read of `dirs`
+    /// (~370k rows at the target machine's index size — a parent→children
+    /// map over it is cheap) keeps the case-insensitive name test in
+    /// Rust, where it is exactly the rule the dedup candidate loader
+    /// applies. The deletes run in id chunks so even a pathological
+    /// subtree stays under SQLite's host-parameter limit; a visited set
+    /// keeps a corrupt parent cycle from looping.
+    pub fn purge_recycle_bin_rows(&mut self) -> Result<usize> {
+        // Same literal, same case-insensitive compare as dedup.rs's
+        // candidate gate (`RECYCLE_BIN_DIR` there — private to that
+        // module); `$` stays literal.
+        const RECYCLE_BIN_DIR: &str = "$Recycle.Bin";
+        // Safe against SQLite builds with the legacy 999 host-parameter
+        // cap; the real subtrees are a handful of SID dirs.
+        const CHUNK: usize = 500;
+
+        let tx = self.conn.transaction()?;
+        let dirs: Vec<(FileId, Option<FileId>, String)> = {
+            let mut stmt = tx.prepare("SELECT id, parent, name FROM dirs ORDER BY id")?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        // parent -> children over the single read; the purge roots are
+        // the name matches, at any depth.
+        let mut children: std::collections::HashMap<Option<FileId>, Vec<FileId>> =
+            std::collections::HashMap::new();
+        for (id, parent, _) in &dirs {
+            children.entry(*parent).or_default().push(*id);
+        }
+        let mut stack: Vec<FileId> = dirs
+            .iter()
+            .filter(|(_, _, name)| name.eq_ignore_ascii_case(RECYCLE_BIN_DIR))
+            .map(|(id, _, _)| *id)
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let mut subtree: Vec<FileId> = Vec::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            subtree.push(id);
+            if let Some(kids) = children.get(&Some(id)) {
+                stack.extend_from_slice(kids);
+            }
+        }
+        // Files first, then the dirs rows — the same order
+        // `delete_subtree_on` uses — in chunked parameterized statements,
+        // all inside the one transaction.
+        let mut files_deleted = 0usize;
+        for chunk in subtree.chunks(CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            files_deleted += tx.execute(
+                &format!("DELETE FROM files WHERE dir IN ({placeholders})"),
+                params_from_iter(chunk.iter()),
+            )?;
+        }
+        for chunk in subtree.chunks(CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            tx.execute(
+                &format!("DELETE FROM dirs WHERE id IN ({placeholders})"),
+                params_from_iter(chunk.iter()),
+            )?;
+        }
+        tx.commit()?;
+        Ok(files_deleted)
     }
 
     /// Runs a whole watcher batch's store half inside ONE transaction
@@ -1001,6 +1081,73 @@ mod tests {
             store.delete_subtree(&[]),
             Err(SynsoError::BadQuery(_))
         ));
+    }
+
+    /// Task 9: the one-time startup purge — every `dirs` row named
+    /// `$Recycle.Bin` (in any casing, at any depth) loses its whole
+    /// subtree: the `files` rows under it AND the `dirs` rows themselves,
+    /// in one transaction. Same-ish names (`Recycle.Bin2`) and ordinary
+    /// trees stay untouched. Idempotent: a second call finds nothing and
+    /// reports 0.
+    #[test]
+    fn purge_recycle_bin_rows_removes_subtrees_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = Store::open(&tmp.path().join("index.db")).unwrap();
+
+        for (dir_path, name) in [
+            (vec!["$Recycle.Bin", "S-1-5"], "r1.bin"),
+            (vec!["$Recycle.Bin", "S-1-5", "deep"], "r2.bin"),
+            (vec!["$RECYCLE.BIN", "S-1-5-21"], "r3.bin"),
+            (vec!["$recycle.bin"], "r4.bin"),
+            (vec!["Recycle.Bin2"], "keep1.txt"),
+            (vec!["docs"], "keep2.txt"),
+        ] {
+            let mut record = rec(name, 1);
+            store.upsert_file(&dir_path, &mut record).unwrap();
+        }
+
+        let deleted = store.purge_recycle_bin_rows().unwrap();
+        assert_eq!(
+            deleted, 4,
+            "r1-r4: every recycle-bin files row, nothing else"
+        );
+
+        let file_names: Vec<String> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT name FROM files ORDER BY name")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            file_names,
+            vec!["keep1.txt".to_string(), "keep2.txt".to_string()],
+            "only non-recycle files survive"
+        );
+
+        let dir_names: Vec<String> = {
+            let mut stmt = store
+                .conn
+                .prepare("SELECT name FROM dirs ORDER BY name")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            dir_names,
+            vec!["Recycle.Bin2".to_string(), "docs".to_string()],
+            "the recycle roots, their SID children and deeper levels are gone"
+        );
+
+        // A purged index has nothing left: the second call is a clean 0.
+        assert_eq!(store.purge_recycle_bin_rows().unwrap(), 0);
+        // ...and the survivors still survive it.
+        assert_eq!(store.all_files().unwrap().len(), 2);
     }
 
     #[test]
