@@ -300,6 +300,17 @@ impl Engine {
         // scans are what hold it for seconds later), so this read costs
         // milliseconds — and every later `settings()` is lock-free.
         let initial_settings = settings::load(&lock_unpoisoned(&store));
+        // Task 9: one-time purge of already-indexed recycle-bin rows,
+        // under the store lock and BEFORE the hot-index load spawns below,
+        // so purged rows never materialize in searches. Failure keeps the
+        // `recycle_purge_done` marker unset — the next launch retries
+        // (the purge is idempotent); meanwhile the matcher's hard rule
+        // and the dedup candidate gate keep recycle-bin content out of
+        // new results.
+        {
+            let mut store = lock_unpoisoned(&store);
+            purge_recycle_bin_once(&mut store);
+        }
         let hot = Arc::new(RwLock::new(HotIndex::cold()));
         let scan_opts = ScanOptions {
             roots: opts.volumes,
@@ -1451,6 +1462,44 @@ fn reload_hot_index_locked(store: &Store, hot: &Arc<RwLock<HotIndex>>) {
     }
 }
 
+// ---------------- Task 9: one-time recycle-bin index purge ----------------
+
+/// The `meta` key guarding the startup purge: stamped ONLY after
+/// [`Store::purge_recycle_bin_rows`] succeeded, so a failed purge (marker
+/// absent) retries on the next launch. A `meta` key, not a schema
+/// migration — the store's schema stays untouched.
+const RECYCLE_PURGE_DONE_KEY: &str = "recycle_purge_done";
+
+/// Task 9's once-per-database purge: on a store without the
+/// [`RECYCLE_PURGE_DONE_KEY`] marker, delete every already-indexed
+/// recycle-bin row and stamp the marker. Every failure logs and returns
+/// normally — open must not fail over housekeeping; the marker is
+/// written only on success, so the next launch retries, and a purged
+/// index re-running into `Ok(0)` is harmless. Runs under the store lock
+/// during `open`, before the hot-index load spawns.
+fn purge_recycle_bin_once(store: &mut Store) {
+    match store.get_meta(RECYCLE_PURGE_DONE_KEY) {
+        Ok(Some(_)) => {}
+        Ok(None) => match store.purge_recycle_bin_rows() {
+            Ok(count) => {
+                if let Err(err) = store.set_meta(RECYCLE_PURGE_DONE_KEY, "1") {
+                    log::warn!(
+                        "synso: recycle-bin purge done but the marker write failed \
+                         (it re-runs harmlessly next launch): {err}"
+                    );
+                }
+                log::info!("synso: recycle-bin purge removed {count} indexed rows");
+            }
+            Err(err) => {
+                log::warn!("synso: recycle-bin purge failed; will retry next launch: {err}")
+            }
+        },
+        Err(err) => {
+            log::warn!("synso: recycle purge marker read failed; skipping this launch: {err}")
+        }
+    }
+}
+
 // ---------------- v1.4: heat persistence --------------------------------
 
 /// How many heat rows one snapshot write carries: the score-descending
@@ -1958,6 +2007,89 @@ mod tests {
         );
         assert_eq!(stats.dirs, 2);
         assert!(stats.interned_bytes > 0);
+    }
+
+    /// Task 9: `Engine::open` runs the one-time recycle-bin purge BEFORE
+    /// the hot-index load spawns — purged rows never materialize in the
+    /// hot index — and stamps the `recycle_purge_done` meta key so the
+    /// work never repeats. A recycle-bin row that appears after the
+    /// marker survives a second open untouched: the guard holds (the
+    /// matcher hard rule keeps NEW rows out of the index; this marker is
+    /// only about the historical one).
+    #[test]
+    fn recycle_purge_runs_once_before_hot_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = write_fixture(tmp.path());
+
+        let seed = |store: &mut Store, dir_path: &[&str], name: &str, size: u64| {
+            let mut record = crate::model::FileRecord {
+                id: 0,
+                parent: 0,
+                name: name.to_string(),
+                size,
+                mtime: 1_700_000_000,
+                ctime: 1_700_000_000,
+                atime: 1_700_000_000,
+                ext_id: 0,
+                is_dir: false,
+                hash_first: None,
+                hash_full: None,
+                py_full: String::new(),
+                py_init: String::new(),
+            };
+            store.upsert_file(dir_path, &mut record).unwrap();
+        };
+
+        // A historical index that still carries recycle-bin rows (seeded
+        // directly — the production source is a pre-Task-9 scan).
+        {
+            let mut store = Store::open(&db_path).unwrap();
+            seed(&mut store, &["$Recycle.Bin", "S-1-5"], "r1.bin", 7);
+            seed(&mut store, &["docs"], "keep.txt", 1);
+        }
+
+        let engine = open_engine(&db_path, &root);
+        wait_warm(&engine);
+        let stats = engine.stats();
+        assert_eq!(
+            stats.files, 1,
+            "only keep.txt surfaces: the purge ran before the hot load"
+        );
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let marker: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'recycle_purge_done'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(marker, "1", "the once-marker is stamped");
+            let left: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM files WHERE name = 'r1.bin'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(left, 0, "the store row is deleted, not just hidden");
+        }
+        drop(engine);
+
+        // A recycle-bin row landing after the marker must survive the
+        // second open: no re-run.
+        {
+            let mut store = Store::open(&db_path).unwrap();
+            seed(&mut store, &["$Recycle.Bin", "S-2"], "sneaky.bin", 9);
+        }
+        let engine = open_engine(&db_path, &root);
+        wait_warm(&engine);
+        assert_eq!(
+            engine.stats().files,
+            2,
+            "the marker is present, so the second open does not re-purge"
+        );
     }
 
     #[test]
