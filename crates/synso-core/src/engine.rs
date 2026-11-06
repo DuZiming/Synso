@@ -1198,10 +1198,11 @@ fn dedup_cycle(dedup: Arc<DedupShared>) {
             done: hashed,
             total: hashed,
             groups,
-            // Both skip kinds share the public counter (the design's
-            // "marked skipped, not grouped"); the pipeline outcome keeps
-            // them apart for tests.
-            errors: outcome.errors + outcome.placeholders,
+            // All skip kinds share the public counter (the design's
+            // "marked skipped, not grouped" — unreadable, locked by
+            // another handle, or a cloud placeholder); the pipeline
+            // outcome keeps them apart for tests.
+            errors: outcome.errors + outcome.locked + outcome.placeholders,
         };
         book.groups = Arc::new(outcome.groups);
     }
