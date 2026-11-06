@@ -59,7 +59,8 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf, MAIN_SEPARATOR_STR};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Mutex};
 
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
@@ -155,8 +156,9 @@ pub(crate) struct DedupOutcome {
 }
 
 /// The disk-touching side of dedup, injected so tests can fake placeholder
-/// attributes and locked files without OneDrive or handle tricks.
-pub(crate) trait FileReader {
+/// attributes and locked files without OneDrive or handle tricks. `Sync`
+/// because gate② shares one reader across its worker threads.
+pub(crate) trait FileReader: Sync {
     /// Raw Windows attribute bits of `path` (`None` when it cannot be
     /// statted). Consulted BEFORE any open, so placeholder files are never
     /// touched.
@@ -892,8 +894,10 @@ fn load_candidates_checked(store: &Mutex<Store>) -> Result<(Candidates, Dirs)> {
                 dirs.by_id.get(&parent_id).copied()
             }
         };
-        let recycle =
-            name == RECYCLE_BIN_DIR || parent_slot.is_some_and(|s| dirs.recycle[s as usize]);
+        // Case-INSENSITIVE compare (Ruling 7): Windows volumes may create
+        // the dir as `$RECYCLE.BIN` in any casing; `$` stays literal.
+        let recycle = name.eq_ignore_ascii_case(RECYCLE_BIN_DIR)
+            || parent_slot.is_some_and(|s| dirs.recycle[s as usize]);
         dirs.push(id, parent_slot, &name, recycle);
     }
 
@@ -925,6 +929,475 @@ fn bad_u32_id(kind: &str, id: FileId) -> SynsoError {
     SynsoError::BadQuery(format!(
         "{kind} id {id} exceeds u32::MAX — the SoA world cannot address it"
     ))
+}
+
+// ---------------------------------------------------------------------
+// Gates ① and ② (pipeline rewrite, Task 4). The rewritten pipeline is a
+// chain of gates over the streamed [`Candidates`] snapshot; Task 6's
+// `run_gates` will assemble them and swap the engine off `run_pipeline`.
+// This section documents the contracts the later gates consume.
+
+/// One gate's removal tally: `files` candidates left the grouping
+/// population at this gate and `bytes` is their snapshot-size total.
+#[derive(Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)] // Task 4-6 wiring: run_gates folds these into the outcome.
+pub(crate) struct GateKills {
+    pub(crate) files: u64,
+    pub(crate) bytes: u64,
+}
+
+/// Every counter the gates produce. `size_gate`/`head_gate`/`sample_gate`
+/// count what each gate REMOVED (files + bytes); the rest are gate②'s
+/// skip-reason matrix, kept separate for the engine's outcome folding
+/// and diagnostics.
+#[derive(Debug, Default, PartialEq, Eq)]
+#[allow(dead_code)] // Task 4-6 wiring: run_gates folds these into the outcome.
+pub(crate) struct OutcomeCounters {
+    /// gate① kills: singleton sizes (no candidate can ever pair).
+    pub(crate) size_gate: GateKills,
+    /// gate② kills: every candidate that left without a `head` hash —
+    /// `files` equals `recycle + fresh + placeholders + locked + errors`.
+    pub(crate) head_gate: GateKills,
+    /// gate③'s tally (Task 5 fills it; zero until then).
+    pub(crate) sample_gate: GateKills,
+    /// Open/read/resolution failures ([`OpenSkip::Error`] kind).
+    pub(crate) errors: u64,
+    /// Sharing-violation skips ([`OpenSkip::Locked`]): nothing was read,
+    /// the next run retries.
+    pub(crate) locked: u64,
+    /// mtime-grace skips ([`is_fresh`]): the file may still be mid-write.
+    pub(crate) fresh: u64,
+    /// Cloud-placeholder skips: never opened, so hashing never triggers
+    /// a hydration download.
+    pub(crate) placeholders: u64,
+    /// Recycle-bin subtree exclusions — checked for EVERY candidate up
+    /// front, persisted-hash ones included.
+    pub(crate) recycle: u64,
+}
+
+/// gate②'s result. THE PARALLEL CONTRACT (Ruling 1): `head`, `full` and
+/// `cand` are one triplet — `head[k]`/`full[k]` belong to candidate slot
+/// `cand[k]` in gate②'s DIRECTORY ORDER (sorted once by (parent dir
+/// slot, files-row id) at the gate's entry). The input slice is
+/// immutable, so the sorted arrangement travels back in `cand` — later
+/// gates MUST consume `head`/`full` only through it (`cand.len()` equals
+/// the input length).
+///
+/// * `head[k]` — first-4KiB xxh64 known after gate②, [`NO_HASH`] when
+///   not obtained (skipped candidate). Persisted values pass through
+///   verbatim; freshly computed ones also land in `pending`.
+/// * `full[k]` — whole-file hash known after gate②, [`NO_HASH`] when
+///   unknown. Set for TERMINAL candidates: size <= 4KiB rows (the 4KiB
+///   probe read IS the whole file — `full == head`, persisted as a
+///   double-`Some` [`HashUpdate`], no matter whether the hash was
+///   computed now or reused) and candidates carrying a persisted
+///   `hash_full`.
+/// * `pending` — computed [`HashUpdate`]s not yet persisted. Chunk
+///   boundaries flush whenever a [`PERSIST_BATCH`] has accumulated
+///   (short lock, hashing never holds it); the residue travels back so
+///   the caller persists once after the later gates. A CANCELLED gate
+///   has already flushed everything before returning.
+/// * `cancelled` — true when `cancel` fired and gate② stopped between
+///   files: unprocessed candidates keep [`NO_HASH`] and the last
+///   progress call reports `done < total`.
+// No Debug derive: `pending` holds `HashUpdate`, which carries none.
+#[derive(Default)]
+#[allow(dead_code)] // Task 4-6 wiring: run_gates consumes it.
+pub(crate) struct HeadOutcome {
+    pub(crate) head: Vec<u64>,
+    pub(crate) full: Vec<u64>,
+    pub(crate) counters: OutcomeCounters,
+    /// First-4KiB hashes computed by this gate (reuses not counted).
+    pub(crate) hashed_first: u64,
+    pub(crate) pending: Vec<HashUpdate>,
+    pub(crate) cancelled: bool,
+    pub(crate) cand: Vec<u32>,
+}
+
+/// Candidates per chunk: gate② streams in directory-order batches of
+/// this size. A chunk boundary is a persist flush + progress tick +
+/// cancel checkpoint; 64 Ki candidates keep the per-worker batches small
+/// while amortizing the boundary costs.
+#[allow(dead_code)] // Task 4-6 wiring: gate_head reads it.
+const CHUNK: usize = 65_536;
+
+/// Why a candidate left gate② without a hash — the tally helper's tag
+/// (the reason counters themselves live on [`OutcomeCounters`]).
+#[derive(Debug, Clone, Copy)]
+enum Skip {
+    Error,
+    Locked,
+    Fresh,
+    Placeholder,
+    Recycle,
+}
+
+/// One worker's PRIVATE chunk state: results indexed by chunk position
+/// (disjoint across workers), computed hashes queued for persistence,
+/// counters. Nothing is shared while a chunk runs — the store lock is
+/// taken only at the boundary flush.
+#[derive(Default)]
+#[allow(dead_code)] // Task 4-6 wiring: gate_head consumes it.
+struct GateWorker {
+    /// `(chunk position, hash)` for candidates that got a first hash
+    /// (computed now or reused).
+    head_hits: Vec<(usize, u64)>,
+    /// `(chunk position, hash)` for TERMINAL candidates.
+    full_hits: Vec<(usize, u64)>,
+    pending: Vec<HashUpdate>,
+    hashed_first: u64,
+    kills_files: u64,
+    kills_bytes: u64,
+    errors: u64,
+    locked: u64,
+    fresh: u64,
+    placeholders: u64,
+    recycle: u64,
+    done: u64,
+}
+
+impl GateWorker {
+    /// Records one skipped candidate: the reason counter, the gate-kill
+    /// tally (its size leaves the grouping population) and `done`.
+    fn skipped(&mut self, skip: Skip, size: u64) {
+        match skip {
+            Skip::Error => self.errors += 1,
+            Skip::Locked => self.locked += 1,
+            Skip::Fresh => self.fresh += 1,
+            Skip::Placeholder => self.placeholders += 1,
+            Skip::Recycle => self.recycle += 1,
+        }
+        self.kills_files += 1;
+        self.kills_bytes += size;
+        self.done += 1;
+    }
+}
+
+/// gate① — the size gate. Returns the candidate slots whose snapshot
+/// size is carried by >= 2 candidates (the only ones that can ever pair),
+/// in size order; singletons are counted into
+/// [`OutcomeCounters::size_gate`] with their byte tally and dropped.
+#[allow(dead_code)] // Task 4-6 wiring: run_gates calls it.
+pub(crate) fn gate_size(c: &Candidates, counters: &mut OutcomeCounters) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..c.sizes.len() as u32).collect();
+    order.sort_unstable_by_key(|&slot| c.sizes[slot as usize]);
+    let mut kept = Vec::new();
+    let mut run = 0usize;
+    for w in 1..=order.len() {
+        if w < order.len() && c.sizes[order[w] as usize] == c.sizes[order[run] as usize] {
+            continue;
+        }
+        if w - run >= 2 {
+            kept.extend_from_slice(&order[run..w]);
+        } else {
+            counters.size_gate.files += 1;
+            counters.size_gate.bytes += c.sizes[order[run] as usize];
+        }
+        run = w;
+    }
+    kept
+}
+
+/// gate② — the first-4KiB probe. Walks `cand` (candidate slots, the
+/// output of [`gate_size`]) in DIRECTORY ORDER in [`CHUNK`]-sized
+/// chunks, obtaining a first-4KiB hash per candidate per the skip
+/// matrix on [`gate_head_step`], and returns the parallel triplet
+/// (`head`/`full`/`cand`, Ruling 1 — see [`HeadOutcome`]).
+///
+/// * Reuse: a persisted `hash_first` ([`NO_HASH`] = absent) is reused
+///   without opening the file and without the mtime grace window —
+///   already-hashed files do zero I/O, fresh mtimes notwithstanding.
+/// * Workers: one atomic cursor hands out chunk positions; every worker
+///   hashes with PRIVATE state only and the store lock is taken at
+///   chunk boundaries (and on cancel) to flush accumulated
+///   [`PERSIST_BATCH`] batches via `flush_persist`. `workers <= 1` runs
+///   inline, single-threaded (the tests' default: deterministic open
+///   and pending order).
+/// * Progress: `(done, total)` where total is EVERY candidate handed in
+///   — skips and reuses advance `done` too, matching the old pipeline's
+///   UX. Ticks at least every [`PROGRESS_EVERY`] processed candidates
+///   and once more at the end (or at the cancel point).
+/// * Cancel: checked at file boundaries (between opens); on cancel the
+///   gate stops promptly, flushes the in-flight batch and reports
+///   [`HeadOutcome::cancelled`]. Whether the run continues or aborts is
+///   the caller's (`run_gates`') decision.
+#[allow(dead_code)] // Task 4-6 wiring: run_gates calls it.
+#[allow(clippy::too_many_arguments)] // the brief's pinned signature.
+pub(crate) fn gate_head(
+    c: &Candidates,
+    dirs: &Dirs,
+    cand: &[u32],
+    roots: &[String],
+    reader: &dyn FileReader,
+    workers: usize,
+    cancel: &AtomicBool,
+    now: i64,
+    progress: &dyn Fn(u64, u64),
+    store: &Mutex<Store>,
+) -> HeadOutcome {
+    let mut order = cand.to_vec();
+    // Directory order, ONCE at the gate's entry: (parent dir slot, row
+    // id) is a total order (ids are unique). `head`/`full` stay parallel
+    // to THIS order and it travels back in `HeadOutcome::cand`.
+    order.sort_unstable_by_key(|&slot| (c.parents[slot as usize], c.ids[slot as usize]));
+
+    let total = order.len() as u64;
+    let mut out = HeadOutcome {
+        head: vec![NO_HASH; order.len()],
+        full: vec![NO_HASH; order.len()],
+        counters: OutcomeCounters::default(),
+        hashed_first: 0,
+        pending: Vec::new(),
+        cancelled: false,
+        cand: Vec::new(),
+    };
+    let mut done: u64 = 0;
+    let mut tick: u64 = 0;
+
+    let mut pos = 0usize;
+    while pos < order.len() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let end = (pos + CHUNK).min(order.len());
+        let chunk = &order[pos..end];
+        let next = AtomicUsize::new(0);
+        // A `move` closure captures this reference by value (the
+        // cursor itself must stay shared, not moved into one worker).
+        let cursor: &AtomicUsize = &next;
+
+        let (tx, rx) = mpsc::channel::<GateWorker>();
+        if workers <= 1 {
+            let mut worker = GateWorker::default();
+            gate_head_chunk(&mut worker, chunk, c, dirs, roots, reader, cancel, now, &next);
+            let _ = tx.send(worker);
+        } else {
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    let tx = tx.clone();
+                    scope.spawn(move || {
+                        let mut worker = GateWorker::default();
+                        gate_head_chunk(
+                            &mut worker, chunk, c, dirs, roots, reader, cancel, now, cursor,
+                        );
+                        let _ = tx.send(worker);
+                    });
+                }
+            });
+        }
+        drop(tx); // scope has joined; the channel drains and closes
+        while let Ok(worker) = rx.recv() {
+            merge_worker(&mut out, &mut done, worker);
+        }
+
+        // Chunk boundary: batched persist (one short lock per flush)
+        // and progress ticks.
+        if out.pending.len() >= PERSIST_BATCH {
+            flush_persist(store, &mut out.pending);
+        }
+        let crossed = done / PROGRESS_EVERY;
+        if crossed > tick {
+            flush_persist(store, &mut out.pending);
+            progress(done, total);
+            tick = crossed;
+        }
+        pos = end;
+    }
+
+    // Cancel may have fired mid-chunk or between chunks — workers stop
+    // at file boundaries either way: flag it and flush the in-flight
+    // batch so nothing dangles. A clean end leaves the last (sub-batch)
+    // residue in `pending` for the caller to persist after the later
+    // gates.
+    if cancel.load(Ordering::Relaxed) {
+        out.cancelled = true;
+        flush_persist(store, &mut out.pending);
+    }
+    progress(done, total);
+    out.cand = order;
+    out
+}
+
+/// The worker loop over one chunk: an atomic cursor hands out chunk
+/// positions (each candidate is processed exactly once); cancel is
+/// checked at every file boundary, so a cancelled run stops promptly.
+#[allow(clippy::too_many_arguments)] // the gate's context, passed through.
+fn gate_head_chunk(
+    worker: &mut GateWorker,
+    chunk: &[u32],
+    c: &Candidates,
+    dirs: &Dirs,
+    roots: &[String],
+    reader: &dyn FileReader,
+    cancel: &AtomicBool,
+    now: i64,
+    next: &AtomicUsize,
+) {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let k = next.fetch_add(1, Ordering::Relaxed);
+        if k >= chunk.len() {
+            return;
+        }
+        gate_head_step(worker, k, chunk[k] as usize, c, dirs, roots, reader, now);
+    }
+}
+
+/// The per-candidate skip matrix, in the pinned order:
+/// 1. recycle bin — EVERY candidate, persisted-hash ones included: a
+///    recycle-bin file is not a candidate at all;
+/// 2. persisted `hash_first` — reused verbatim, no open, no grace
+///    ([`NO_HASH`] = not persisted, i.e. steps 3-7 apply);
+/// 3. resolve (broken dir chain / unknown root segment → error);
+/// 4. placeholder attributes — consulted BEFORE the open (never
+///    touched; unstatable is an error, like the old pipeline);
+/// 5. mtime grace ([`is_fresh`]) — may still be mid-write;
+/// 6. open (a sharing violation is [`OpenSkip::Locked`], the rest an
+///    error);
+/// 7. read the first 4KiB (a read failure is an error).
+///
+/// A computed hash on a size <= 4KiB row is TERMINAL: the probe read IS
+/// the whole file, so one double-`Some` [`HashUpdate`] persists both
+/// hashes and `full` is recorded for the later gates. Every processed
+/// candidate advances `done` — skips and reuses included.
+#[allow(clippy::too_many_arguments)]
+fn gate_head_step(
+    worker: &mut GateWorker,
+    k: usize,
+    slot: usize,
+    c: &Candidates,
+    dirs: &Dirs,
+    roots: &[String],
+    reader: &dyn FileReader,
+    now: i64,
+) {
+    let size = c.sizes[slot];
+
+    // 1. Recycle bin — up front, every candidate.
+    let parent_slot = c.parents[slot] as usize;
+    if parent_slot < dirs.recycle.len() && dirs.recycle[parent_slot] {
+        worker.skipped(Skip::Recycle, size);
+        return;
+    }
+
+    // 2. Persisted hash_first: reuse (no open, no grace).
+    let persisted = c.hash_first[slot];
+    if persisted != NO_HASH {
+        worker.head_hits.push((k, persisted));
+        // Terminal bookkeeping: a <= 4KiB row's persisted first hash
+        // covers the whole file; otherwise a persisted full hash passes
+        // through as-is.
+        if size <= FIRST_CHUNK as u64 {
+            worker.full_hits.push((k, persisted));
+        } else if c.hash_full[slot] != NO_HASH {
+            worker.full_hits.push((k, c.hash_full[slot]));
+        }
+        worker.done += 1;
+        return;
+    }
+
+    // 3. Resolve the absolute disk path.
+    let Some(path) = c
+        .index_path(slot, dirs)
+        .and_then(|index_path| resolve_absolute_path(roots, &index_path))
+    else {
+        worker.skipped(Skip::Error, size);
+        return;
+    };
+
+    // 4. Cloud placeholder — before the open (never touched).
+    match reader.attributes(&path) {
+        None => {
+            // Unstatable (vanished/unreadable): an error, not a
+            // placeholder — the old pipeline's precedent.
+            worker.skipped(Skip::Error, size);
+            return;
+        }
+        Some(attrs) if crate::scanner::is_placeholder_attr(attrs) => {
+            worker.skipped(Skip::Placeholder, size);
+            return;
+        }
+        Some(_) => {}
+    }
+
+    // 5. mtime grace — may still be mid-write.
+    if is_fresh(c.mtimes[slot], now) {
+        worker.skipped(Skip::Fresh, size);
+        return;
+    }
+
+    // 6. Open (deny-write on Windows).
+    let mut file = match reader.open(&path) {
+        Ok(file) => file,
+        Err(err) => {
+            match classify_open_err(&err) {
+                OpenSkip::Locked => worker.skipped(Skip::Locked, size),
+                OpenSkip::Error => worker.skipped(Skip::Error, size),
+            }
+            return;
+        }
+    };
+
+    // 7. First 4KiB — a short read hashes what came back (the mtime +
+    //    size persist guard covers a file that changed under us).
+    let mut chunk_buf = [0u8; FIRST_CHUNK];
+    let mut filled = 0;
+    let mut failed = false;
+    while filled < chunk_buf.len() {
+        match file.read(&mut chunk_buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    if failed {
+        worker.skipped(Skip::Error, size);
+        return;
+    }
+    let hash = xxh64(&chunk_buf[..filled], 0);
+    worker.hashed_first += 1;
+    worker.head_hits.push((k, hash));
+    let terminal = size <= FIRST_CHUNK as u64;
+    worker.pending.push(HashUpdate {
+        id: FileId::from(c.ids[slot]),
+        mtime: c.mtimes[slot],
+        size,
+        hash_first: Some(hash),
+        // Terminal: the probe read IS the whole file.
+        hash_full: terminal.then_some(hash),
+    });
+    if terminal {
+        worker.full_hits.push((k, hash));
+    }
+    worker.done += 1;
+}
+
+/// Folds one worker's chunk results into the shared outcome: hits
+/// scatter into the parallel arrays (chunk positions are disjoint
+/// across workers), pending joins the batch, counters accumulate.
+fn merge_worker(out: &mut HeadOutcome, done: &mut u64, worker: GateWorker) {
+    for (k, hash) in worker.head_hits {
+        out.head[k] = hash;
+    }
+    for (k, hash) in worker.full_hits {
+        out.full[k] = hash;
+    }
+    out.pending.extend(worker.pending);
+    out.hashed_first += worker.hashed_first;
+    let counters = &mut out.counters;
+    counters.head_gate.files += worker.kills_files;
+    counters.head_gate.bytes += worker.kills_bytes;
+    counters.errors += worker.errors;
+    counters.locked += worker.locked;
+    counters.fresh += worker.fresh;
+    counters.placeholders += worker.placeholders;
+    counters.recycle += worker.recycle;
+    *done += worker.done;
 }
 
 #[cfg(test)]
@@ -966,10 +1439,12 @@ mod tests {
     }
 
     /// Fake reader: reports configured placeholder paths (and stat-missing
-    /// paths) through `attributes`, logs every `open` call.
+    /// paths) through `attributes`, fails configured paths' `open` with a
+    /// sharing violation, logs every `open` call.
     struct FakeReader {
         placeholders: Vec<PathBuf>,
         missing: Vec<PathBuf>,
+        locked: Vec<PathBuf>,
         opened: StdMutex<Vec<PathBuf>>,
     }
 
@@ -978,6 +1453,7 @@ mod tests {
             FakeReader {
                 placeholders: Vec::new(),
                 missing: Vec::new(),
+                locked: Vec::new(),
                 opened: StdMutex::new(Vec::new()),
             }
         }
@@ -995,6 +1471,11 @@ mod tests {
         }
 
         fn open(&self, path: &Path) -> std::io::Result<std::fs::File> {
+            if self.locked.iter().any(|p| p == path) {
+                // ERROR_SHARING_VIOLATION: `classify_open_err` files it
+                // under OpenSkip::Locked (on Windows; an error elsewhere).
+                return Err(std::io::Error::from_raw_os_error(32));
+            }
             self.opened.lock().unwrap().push(path.to_path_buf());
             std::fs::File::open(path)
         }
@@ -1539,5 +2020,691 @@ mod tests {
         let mut after = DedupOutcome::default();
         assert!(open_or_skip(&reader, &root.join("locked.txt"), &mut after).is_some());
         assert_eq!(after.locked, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Task 4: gate① (size) + gate② (first-4KiB probe: directory-order
+    // chunking, worker pool, terminal small files, hash reuse).
+
+    /// The gate tests' clock: every fixture measures against this `now`.
+    const NOW: i64 = 1_800_000_000;
+
+    /// `upsert_row` with a chosen mtime — the gate tests' clock control.
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_row_at(
+        store: &StdMutex<Store>,
+        dir_path: &[&str],
+        name: &str,
+        size: u64,
+        mtime: i64,
+        hash_first: Option<u64>,
+        hash_full: Option<u64>,
+    ) -> (FileId, FileId) {
+        let mut rec = FileRecord {
+            id: 0,
+            parent: 0,
+            name: name.to_string(),
+            size,
+            mtime,
+            ctime: mtime,
+            atime: mtime,
+            ext_id: 0,
+            is_dir: false,
+            hash_first,
+            hash_full,
+            py_full: String::new(),
+            py_init: String::new(),
+        };
+        crate::engine::lock_unpoisoned(store)
+            .upsert_file(dir_path, &mut rec)
+            .unwrap();
+        (rec.id, rec.parent)
+    }
+
+    /// Loads the SoA snapshot for a gate fixture (fixtures always load).
+    fn load_cands(store: &StdMutex<Store>) -> (Candidates, Dirs) {
+        load_candidates(store).expect("fixture store must load")
+    }
+
+    /// Every candidate slot in load order — the gate fixtures' `cand`.
+    fn all_slots(c: &Candidates) -> Vec<u32> {
+        (0..c.ids.len() as u32).collect()
+    }
+
+    /// The disk roots a gate fixture resolves against.
+    fn gate_roots(root: &Path) -> Vec<String> {
+        vec![root.to_string_lossy().into_owned()]
+    }
+
+    /// The position of a files-row id in the gate's directory-ordered
+    /// `cand` — `head`/`full` are parallel to that order.
+    fn pos_of(out: &HeadOutcome, cands: &Candidates, id: FileId) -> usize {
+        out.cand
+            .iter()
+            .position(|&s| cands.ids[s as usize] == id as u32)
+            .unwrap()
+    }
+
+    /// A progress collector for gate tests.
+    fn progress_log() -> std::rc::Rc<StdMutex<Vec<(u64, u64)>>> {
+        std::rc::Rc::new(StdMutex::new(Vec::new()))
+    }
+
+    /// gate① keeps every size carried by >= 2 candidates (both members)
+    /// and kills the singleton with its byte tally.
+    #[test]
+    fn gate_size_keeps_shared_sizes_and_counts_kills() {
+        let (_tmp, store) = test_store();
+        let (a, _) = upsert_row(&store, &["fixture"], "a.bin", 5, false, None, None);
+        let (b, _) = upsert_row(&store, &["fixture"], "b.bin", 5, false, None, None);
+        let _lone = upsert_row(&store, &["fixture"], "lone.bin", 7, false, None, None);
+        let (cands, _dirs) = load_cands(&store);
+
+        let mut counters = OutcomeCounters::default();
+        let kept = gate_size(&cands, &mut counters);
+
+        assert_eq!(kept.len(), 2, "the shared size keeps both members");
+        let mut kept_ids: Vec<u32> = kept.iter().map(|&i| cands.ids[i as usize]).collect();
+        kept_ids.sort_unstable();
+        assert_eq!(kept_ids, vec![a as u32, b as u32]);
+        assert_eq!(counters.size_gate.files, 1, "the singleton is killed");
+        assert_eq!(counters.size_gate.bytes, 7, "the singleton's bytes are tallied");
+        assert_eq!(counters.head_gate.files, 0, "gate① touched only its own tally");
+    }
+
+    /// A persisted hash_first is reused WITHOUT opening the file and
+    /// WITHOUT the mtime grace window (reuse exemption); the sibling
+    /// without one is opened and hashed; progress totals count the
+    /// reused candidate too.
+    #[test]
+    fn gate_head_reuses_persisted_hash_without_open_or_grace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        let big = vec![b'x'; 8192];
+        fs::write(root.join("b.bin"), &big).unwrap();
+
+        let (_tstore, store) = test_store();
+        // a.bin: persisted first hash AND an mtime inside the grace
+        // window — reuse must ignore both.
+        let (a, _) = upsert_row_at(&store, &["fixture"], "a.bin", 4, NOW - 10, Some(0xABCD), None);
+        let (b, _) = upsert_row_at(&store, &["fixture"], "b.bin", 8192, NOW - 10_000, None, None);
+        let (cands, dirs) = load_cands(&store);
+
+        let reader = FakeReader::new();
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+        let log = progress_log();
+        let sink = std::rc::Rc::clone(&log);
+        let progress = move |done: u64, total: u64| {
+            sink.lock().unwrap().push((done, total));
+        };
+        let out = gate_head(
+            &cands,
+            &dirs,
+            &all_slots(&cands),
+            &roots,
+            &reader,
+            1,
+            &cancel,
+            NOW,
+            &progress,
+            &store,
+        );
+
+        let opened = reader.opened.lock().unwrap().clone();
+        assert_eq!(opened, vec![root.join("b.bin")], "a.bin is never opened");
+        assert_eq!(out.counters.fresh, 0, "the grace window does not apply to reuse");
+        assert_eq!(out.hashed_first, 1, "only b.bin was computed");
+        let pa = pos_of(&out, &cands, a);
+        let pb = pos_of(&out, &cands, b);
+        assert_eq!(out.head[pa], 0xABCD, "the persisted hash is reused verbatim");
+        let b_hash = xxh64(&big[..4096], 0);
+        assert_eq!(out.head[pb], b_hash);
+        // a.bin is <= 4KiB: its persisted first hash IS its whole-file
+        // hash — terminal without any I/O.
+        assert_eq!(out.full[pa], 0xABCD);
+        assert_eq!(out.full[pb], NO_HASH, "a >4KiB file is not terminal");
+        // pending carries only the computed update — nothing is
+        // re-persisted for a reused hash.
+        assert_eq!(out.pending.len(), 1);
+        assert_eq!(out.pending[0].id, b);
+        assert_eq!(out.pending[0].hash_first, Some(b_hash));
+        assert_eq!(out.pending[0].hash_full, None);
+        assert_eq!(out.counters.head_gate.files, 0, "nothing was skipped");
+        let calls = log.lock().unwrap().clone();
+        assert_eq!(
+            calls.last(),
+            Some(&(2, 2)),
+            "the total counts every candidate, reused included"
+        );
+    }
+
+    /// No persisted hash + mtime inside the grace window: counted
+    /// `fresh`, never opened, no hash obtained.
+    #[test]
+    fn gate_head_counts_fresh_without_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+
+        let (_tstore, store) = test_store();
+        let (f, _) = upsert_row_at(&store, &["fixture"], "f.bin", 5, NOW - 100, None, None);
+        let (cands, dirs) = load_cands(&store);
+
+        let reader = FakeReader::new();
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+        let out = gate_head(
+            &cands,
+            &dirs,
+            &all_slots(&cands),
+            &roots,
+            &reader,
+            1,
+            &cancel,
+            NOW,
+            &|_, _| {},
+            &store,
+        );
+
+        assert_eq!(out.counters.fresh, 1);
+        assert!(reader.opened.lock().unwrap().is_empty(), "never opened");
+        let pf = pos_of(&out, &cands, f);
+        assert_eq!(out.head[pf], NO_HASH);
+        assert_eq!(out.full[pf], NO_HASH);
+        assert!(out.pending.is_empty());
+        assert_eq!(out.hashed_first, 0);
+        assert_eq!(out.counters.head_gate.files, 1, "a fresh skip leaves the grouping population");
+        assert_eq!(out.counters.head_gate.bytes, 5);
+    }
+
+    /// A cloud placeholder is counted and never opened (no hydration
+    /// download), exactly like the old pipeline's pre-open check.
+    #[test]
+    fn gate_head_counts_placeholders_before_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("p.bin"), b"would hydrate").unwrap();
+
+        let (_tstore, store) = test_store();
+        let (p, _) = upsert_row_at(&store, &["fixture"], "p.bin", 13, NOW - 10_000, None, None);
+        let (cands, dirs) = load_cands(&store);
+
+        let mut reader = FakeReader::new();
+        reader.placeholders.push(root.join("p.bin"));
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+        let out = gate_head(
+            &cands,
+            &dirs,
+            &all_slots(&cands),
+            &roots,
+            &reader,
+            1,
+            &cancel,
+            NOW,
+            &|_, _| {},
+            &store,
+        );
+
+        assert_eq!(out.counters.placeholders, 1);
+        assert!(reader.opened.lock().unwrap().is_empty(), "never opened");
+        assert_eq!(out.head[pos_of(&out, &cands, p)], NO_HASH);
+        assert_eq!(out.counters.head_gate.files, 1);
+    }
+
+    /// A recycle-bin candidate is not a candidate at all: the up-front
+    /// check runs BEFORE hash reuse, so even a persisted hash cannot
+    /// save it, and nothing is ever opened.
+    #[test]
+    fn gate_head_counts_recycle_candidates_before_reuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("kept.bin"), b"kept bytes").unwrap();
+
+        let (_tstore, store) = test_store();
+        let (r, _) = upsert_row_at(
+            &store,
+            &["$Recycle.Bin"],
+            "recycled.bin",
+            5,
+            NOW - 10_000,
+            Some(0xBEEF),
+            None,
+        );
+        let (k, _) = upsert_row_at(&store, &["fixture"], "kept.bin", 10, NOW - 10_000, None, None);
+        let (cands, dirs) = load_cands(&store);
+
+        let reader = FakeReader::new();
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+        let out = gate_head(
+            &cands,
+            &dirs,
+            &all_slots(&cands),
+            &roots,
+            &reader,
+            1,
+            &cancel,
+            NOW,
+            &|_, _| {},
+            &store,
+        );
+
+        assert_eq!(out.counters.recycle, 1);
+        assert_eq!(
+            *reader.opened.lock().unwrap(),
+            vec![root.join("kept.bin")],
+            "only the ordinary candidate is opened"
+        );
+        let pr = pos_of(&out, &cands, r);
+        assert_eq!(out.head[pr], NO_HASH, "the persisted hash does not save it");
+        assert_eq!(out.full[pr], NO_HASH);
+        assert_eq!(out.head[pos_of(&out, &cands, k)], xxh64(b"kept bytes", 0));
+        assert_eq!(out.counters.head_gate.files, 1, "only the recycle kill");
+    }
+
+    /// Candidates whose path cannot be resolved (no configured root
+    /// carries the segment) are errors; nothing is opened.
+    #[test]
+    fn gate_head_counts_unresolvable_paths_as_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+
+        let (_tstore, store) = test_store();
+        let (a, _) = upsert_row_at(&store, &["fixture"], "a.bin", 5, NOW - 10_000, None, None);
+        let (b, _) = upsert_row_at(&store, &["fixture"], "b.bin", 5, NOW - 10_000, None, None);
+        let (cands, dirs) = load_cands(&store);
+
+        let reader = FakeReader::new();
+        let roots = gate_roots(&elsewhere);
+        let cancel = AtomicBool::new(false);
+        let out = gate_head(
+            &cands,
+            &dirs,
+            &all_slots(&cands),
+            &roots,
+            &reader,
+            1,
+            &cancel,
+            NOW,
+            &|_, _| {},
+            &store,
+        );
+
+        assert_eq!(out.counters.errors, 2);
+        assert!(reader.opened.lock().unwrap().is_empty());
+        assert_eq!(out.head[pos_of(&out, &cands, a)], NO_HASH);
+        assert_eq!(out.head[pos_of(&out, &cands, b)], NO_HASH);
+        assert_eq!(out.counters.head_gate.files, 2);
+        assert_eq!(out.counters.head_gate.bytes, 10);
+    }
+
+    /// A sharing-violation open failure is a Locked skip (not an error):
+    /// nothing is read, the next run retries.
+    #[cfg(windows)]
+    #[test]
+    fn gate_head_counts_locked_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("l.bin"), b"locked bytes").unwrap();
+
+        let (_tstore, store) = test_store();
+        let (l, _) = upsert_row_at(&store, &["fixture"], "l.bin", 12, NOW - 10_000, None, None);
+        let (cands, dirs) = load_cands(&store);
+
+        let mut reader = FakeReader::new();
+        reader.locked.push(root.join("l.bin"));
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+        let out = gate_head(
+            &cands,
+            &dirs,
+            &all_slots(&cands),
+            &roots,
+            &reader,
+            1,
+            &cancel,
+            NOW,
+            &|_, _| {},
+            &store,
+        );
+
+        assert_eq!(out.counters.locked, 1);
+        assert_eq!(out.counters.errors, 0, "a lock is not an error");
+        assert_eq!(out.head[pos_of(&out, &cands, l)], NO_HASH);
+        assert_eq!(out.counters.head_gate.files, 1);
+    }
+
+    /// size <= 4KiB files are TERMINAL: one probe read yields both
+    /// hashes — each pending HashUpdate carries hash_first == hash_full
+    /// (double Some) and the side arrays mark head == full.
+    #[test]
+    fn gate_head_terminal_small_files_persist_double_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.bin"), b"0123456789abcdef").unwrap();
+        fs::write(root.join("b.bin"), b"fedcba9876543210").unwrap();
+
+        let (_tstore, store) = test_store();
+        let (a, _) = upsert_row_at(&store, &["fixture"], "a.bin", 16, NOW - 1_000, None, None);
+        let (b, _) = upsert_row_at(&store, &["fixture"], "b.bin", 16, NOW - 1_000, None, None);
+        let (cands, dirs) = load_cands(&store);
+
+        let reader = FakeReader::new();
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+        let out = gate_head(
+            &cands,
+            &dirs,
+            &all_slots(&cands),
+            &roots,
+            &reader,
+            1,
+            &cancel,
+            NOW,
+            &|_, _| {},
+            &store,
+        );
+
+        assert_eq!(reader.opened.lock().unwrap().len(), 2);
+        assert_eq!(out.hashed_first, 2);
+        assert_eq!(out.pending.len(), 2);
+        // Directory order: same dir, id-ascending (a was upserted first).
+        assert_eq!(out.pending[0].id, a);
+        assert_eq!(out.pending[1].id, b);
+        let a_hash = xxh64(b"0123456789abcdef", 0);
+        let b_hash = xxh64(b"fedcba9876543210", 0);
+        assert_eq!(out.pending[0].hash_first, Some(a_hash));
+        assert_eq!(out.pending[0].hash_full, Some(a_hash), "terminal: one read yields both");
+        assert_eq!(out.pending[1].hash_first, Some(b_hash));
+        assert_eq!(out.pending[1].hash_full, Some(b_hash));
+        // The side arrays agree with the updates.
+        let pa = pos_of(&out, &cands, a);
+        let pb = pos_of(&out, &cands, b);
+        assert_eq!(out.head[pa], a_hash);
+        assert_eq!(out.full[pa], a_hash, "terminal files are marked in `full`");
+        assert_eq!(out.head[pb], b_hash);
+        assert_eq!(out.full[pb], b_hash);
+        assert_eq!(out.counters.head_gate.files, 0);
+    }
+
+    /// A >4KiB file is not terminal: head is the first-4KiB hash, the
+    /// side array leaves `full` unknown and the pending update carries
+    /// hash_full = None (the full gate reads it later).
+    #[test]
+    fn gate_head_large_files_leave_full_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        let big = vec![b'q'; 8192];
+        fs::write(root.join("big.bin"), &big).unwrap();
+
+        let (_tstore, store) = test_store();
+        let (g, _) = upsert_row_at(&store, &["fixture"], "big.bin", 8192, NOW - 1_000, None, None);
+        let (cands, dirs) = load_cands(&store);
+
+        let reader = FakeReader::new();
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+        let out = gate_head(
+            &cands,
+            &dirs,
+            &all_slots(&cands),
+            &roots,
+            &reader,
+            1,
+            &cancel,
+            NOW,
+            &|_, _| {},
+            &store,
+        );
+
+        let hash = xxh64(&big[..4096], 0);
+        assert_eq!(out.head[pos_of(&out, &cands, g)], hash);
+        assert_eq!(out.full[pos_of(&out, &cands, g)], NO_HASH);
+        assert_eq!(out.pending.len(), 1);
+        assert_eq!(out.pending[0].hash_first, Some(hash));
+        assert_eq!(out.pending[0].hash_full, None);
+    }
+
+    /// The gate's output is directory-ordered: `out.cand` is sorted by
+    /// (parent dir slot, files-row id), is a permutation of the input,
+    /// and head/full stay parallel to it.
+    #[test]
+    fn gate_head_orders_candidates_by_parent_then_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(root.join("d1")).unwrap();
+        fs::create_dir_all(root.join("d2")).unwrap();
+        fs::write(root.join("d1").join("a.bin"), b"aaa").unwrap();
+        fs::write(root.join("d1").join("c.bin"), b"ccc").unwrap();
+        fs::write(root.join("d2").join("b.bin"), b"bbb").unwrap();
+
+        let (_tstore, store) = test_store();
+        // Insertion order must not follow directory order for the
+        // contract to matter: d2's file first, then d1's.
+        upsert_row_at(&store, &["fixture", "d2"], "b.bin", 3, NOW - 1_000, None, None);
+        upsert_row_at(&store, &["fixture", "d1"], "a.bin", 3, NOW - 1_000, None, None);
+        upsert_row_at(&store, &["fixture", "d1"], "c.bin", 3, NOW - 1_000, None, None);
+        let (cands, dirs) = load_cands(&store);
+        let input = all_slots(&cands);
+
+        let reader = FakeReader::new();
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+        let out = gate_head(
+            &cands,
+            &dirs,
+            &input,
+            &roots,
+            &reader,
+            1,
+            &cancel,
+            NOW,
+            &|_, _| {},
+            &store,
+        );
+
+        assert_eq!(out.head.len(), out.cand.len());
+        assert_eq!(out.full.len(), out.cand.len());
+        let key = |&slot: &u32| (cands.parents[slot as usize], cands.ids[slot as usize]);
+        let keys: Vec<_> = out.cand.iter().map(key).collect();
+        assert!(
+            keys.windows(2).all(|w| w[0] <= w[1]),
+            "out.cand is (parent slot, id)-ascending: {keys:?}"
+        );
+        let mut sorted_out = out.cand.clone();
+        sorted_out.sort_unstable();
+        let mut sorted_in = input.clone();
+        sorted_in.sort_unstable();
+        assert_eq!(sorted_out, sorted_in, "a permutation of the input slots");
+    }
+
+    /// workers = 2 and workers = 1 agree: same head/full arrays, same
+    /// counters, same pending batch (order aside), same open set, same
+    /// hashes.
+    #[test]
+    fn gate_head_worker_counts_agree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(root.join("d1")).unwrap();
+        fs::create_dir_all(root.join("d2")).unwrap();
+        let twin = b"0123456789abcdef";
+        fs::write(root.join("d1").join("t.bin"), twin).unwrap();
+        fs::write(root.join("d2").join("t.bin"), twin).unwrap();
+        let big = vec![b'q'; 8192];
+        fs::write(root.join("big.bin"), &big).unwrap();
+
+        let (_tstore, store) = test_store();
+        upsert_row_at(&store, &["fixture", "d1"], "t.bin", 16, NOW - 1_000, None, None);
+        upsert_row_at(&store, &["fixture", "d2"], "t.bin", 16, NOW - 1_000, None, None);
+        upsert_row_at(&store, &["fixture"], "big.bin", 8192, NOW - 1_000, None, None);
+        // A fresh file: skipped identically under both worker counts.
+        upsert_row_at(&store, &["fixture"], "hot.bin", 7, NOW - 10, None, None);
+        let (cands, dirs) = load_cands(&store);
+        let roots = gate_roots(&root);
+
+        let run = |workers: usize| {
+            let reader = FakeReader::new();
+            let cancel = AtomicBool::new(false);
+            let out = gate_head(
+                &cands,
+                &dirs,
+                &all_slots(&cands),
+                &roots,
+                &reader,
+                workers,
+                &cancel,
+                NOW,
+                &|_, _| {},
+                &store,
+            );
+            let mut opened = reader.opened.lock().unwrap().clone();
+            opened.sort();
+            (out, opened)
+        };
+
+        let (one, opened1) = run(1);
+        let (two, opened2) = run(2);
+
+        assert_eq!(one.head, two.head, "same hashes in the same order");
+        assert_eq!(one.full, two.full);
+        assert_eq!(one.cand, two.cand);
+        assert_eq!(one.counters, two.counters);
+        assert_eq!(one.hashed_first, two.hashed_first);
+        assert_eq!(one.cancelled, two.cancelled);
+        assert_eq!(opened1, opened2, "the same files were opened");
+        let mut p1: Vec<_> = one
+            .pending
+            .iter()
+            .map(|u| (u.id, u.hash_first, u.hash_full))
+            .collect();
+        p1.sort_by_key(|t| t.0);
+        let mut p2: Vec<_> = two
+            .pending
+            .iter()
+            .map(|u| (u.id, u.hash_first, u.hash_full))
+            .collect();
+        p2.sort_by_key(|t| t.0);
+        assert_eq!(p1, p2, "the same computed updates");
+        // And the fixture itself behaved: 3 computed, 1 fresh skip.
+        assert_eq!(one.hashed_first, 3);
+        assert_eq!(one.counters.fresh, 1);
+        assert_eq!(one.counters.head_gate.files, 1);
+    }
+
+    /// Cancel stops gate② between files: the file in flight finishes,
+    /// later candidates are refused at the boundary, the in-flight batch
+    /// is persisted (flush first) and `cancelled` is reported.
+    #[test]
+    fn gate_head_cancel_stops_between_files_and_flushes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.bin"), b"0123456789abcdef").unwrap();
+        fs::write(root.join("b.bin"), b"fedcba9876543210").unwrap();
+
+        let (_tstore, store) = test_store();
+        let (a, _) = upsert_row_at(&store, &["fixture"], "a.bin", 16, NOW - 1_000, None, None);
+        let (b, _) = upsert_row_at(&store, &["fixture"], "b.bin", 16, NOW - 1_000, None, None);
+        let (cands, dirs) = load_cands(&store);
+
+        /// Sets `cancel` as soon as an open succeeds — the run stops at
+        /// the next file boundary.
+        struct CancelAfterOpen<'a> {
+            inner: FakeReader,
+            cancel: &'a AtomicBool,
+        }
+        impl FileReader for CancelAfterOpen<'_> {
+            fn attributes(&self, path: &Path) -> Option<u32> {
+                self.inner.attributes(path)
+            }
+            fn open(&self, path: &Path) -> std::io::Result<std::fs::File> {
+                let file = self.inner.open(path)?;
+                self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(file)
+            }
+        }
+
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+        let reader = CancelAfterOpen {
+            inner: FakeReader::new(),
+            cancel: &cancel,
+        };
+        let log = progress_log();
+        let sink = std::rc::Rc::clone(&log);
+        let progress = move |done: u64, total: u64| {
+            sink.lock().unwrap().push((done, total));
+        };
+        let out = gate_head(
+            &cands,
+            &dirs,
+            &all_slots(&cands),
+            &roots,
+            &reader,
+            1,
+            &cancel,
+            NOW,
+            &progress,
+            &store,
+        );
+
+        let opened = reader.inner.opened.lock().unwrap().clone();
+        assert_eq!(opened, vec![root.join("a.bin")], "only the first file in dir order");
+        assert!(out.cancelled, "the cancel is reported");
+        let pa = pos_of(&out, &cands, a);
+        let pb = pos_of(&out, &cands, b);
+        let a_hash = xxh64(b"0123456789abcdef", 0);
+        assert_eq!(out.head[pa], a_hash, "the in-flight file finished");
+        assert_eq!(out.full[pa], a_hash, "it was small: terminal");
+        assert_eq!(out.head[pb], NO_HASH, "the next file was refused");
+        assert!(out.pending.is_empty(), "the cancel flushed the batch first");
+        let calls = log.lock().unwrap().clone();
+        assert_eq!(calls.last(), Some(&(1, 2)), "done stops at the processed count");
+        // And the flush really landed: a.bin's row carries both hashes.
+        let rows = crate::engine::lock_unpoisoned(&store).all_files().unwrap();
+        let row_a = rows.iter().find(|r| r.id == a).unwrap();
+        assert_eq!(row_a.hash_first, Some(a_hash));
+        assert_eq!(row_a.hash_full, Some(a_hash));
+        let row_b = rows.iter().find(|r| r.id == b).unwrap();
+        assert_eq!(row_b.hash_first, None, "the cancelled candidate persisted nothing");
+    }
+
+    /// Ruling 7: the loader's recycle-name compare is case-insensitive —
+    /// Windows volumes may create the dir as `$RECYCLE.BIN`. The `$`
+    /// prefix stays part of the rule.
+    #[test]
+    fn candidates_recycle_bin_name_match_is_case_insensitive() {
+        let (_tmp, store) = test_store();
+        upsert_row(&store, &["$recycle.bin", "x"], "t.bin", 5, false, None, None);
+        upsert_row(&store, &["$RECYCLE.BIN", "y"], "t.bin", 5, false, None, None);
+        upsert_row(&store, &["Recycle.Bin"], "t.bin", 5, false, None, None);
+        let (cands, dirs) = load_cands(&store);
+
+        let rows = crate::engine::lock_unpoisoned(&store).all_dirs().unwrap();
+        let slot_of_name = |name: &str| {
+            dirs.by_id[&rows.iter().find(|(_, _, n)| n == name).unwrap().0] as usize
+        };
+        assert!(dirs.recycle[slot_of_name("$recycle.bin")], "lowercase matches");
+        assert!(dirs.recycle[slot_of_name("$RECYCLE.BIN")], "uppercase matches");
+        assert!(
+            !dirs.recycle[slot_of_name("Recycle.Bin")],
+            "the $ prefix is part of the rule"
+        );
+        // The candidates under the differently-cased recycle roots sit
+        // in recycle dirs — gate② will exclude them; the $-less tree's
+        // candidate does not.
+        for slot in 0..2 {
+            assert!(dirs.recycle[cands.parents[slot] as usize]);
+        }
+        assert!(!dirs.recycle[cands.parents[2] as usize]);
     }
 }
