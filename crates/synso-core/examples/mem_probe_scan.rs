@@ -45,7 +45,46 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Same stall guard for the selftest's tiny fixture scan.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Minimal stderr logger (`LEVEL HH:MM:SS message`): the engine's
+/// `log::info!` lines — the dedup run's ONE per-gate tally line on
+/// completion/cancellation — go nowhere without an installed logger, and
+/// Task 12's acceptance evidence is exactly that tally. Hand-rolled so the
+/// example stays dependency-free; installed via the static `set_logger`
+/// because core's `log` dep carries no `std`/`alloc` feature (only the app
+/// opts in), so `set_boxed_logger` doesn't exist here.
+static STDERR_LOGGER: StderrLogger = StderrLogger;
+
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, meta: &log::Metadata) -> bool {
+        meta.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                % 86_400;
+            eprintln!(
+                "{:02}:{:02}:{:02} {} {}",
+                secs / 3600,
+                (secs % 3600) / 60,
+                secs % 60,
+                record.level(),
+                record.args()
+            );
+        }
+    }
+
+    fn flush(&self) {}
+}
+
 fn main() {
+    let _ = log::set_logger(&STDERR_LOGGER);
+    log::set_max_level(log::LevelFilter::Info);
     let mut args = std::env::args().skip(1);
     let first = args.next();
     let second = args.next();
