@@ -72,7 +72,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
-use crate::dedup::{self, DedupState, DupeGroup, StoredGroup};
+use crate::dedup::{self, DedupPage, DedupState, DupeGroup, StoredGroup};
 use crate::dimensions::{ColdReader, FileDetail};
 use crate::hotindex::HotIndex;
 use crate::model::{FileId, ParsedQuery};
@@ -787,7 +787,7 @@ impl Engine {
     /// pollers read [`Engine::dedup_state`]. A run can be stopped with
     /// [`Engine::dedup_cancel`].
     pub fn dedup_start(&self) {
-        launch_dedup(&self.dedup, self.settings().dedup_gear);
+        launch_dedup(&self.dedup, Arc::clone(&self.hot), self.settings().dedup_gear);
     }
 
     /// Asks the running dedup run to stop at its next checkpoint (the
@@ -814,51 +814,78 @@ impl Engine {
     /// COMPLETED run's group count (a cancelled run keeps the previous
     /// one); `errors` counts files skipped because they could not be
     /// read, were locked by another handle, or are cloud placeholders —
-    /// all "marked skipped, not grouped" per the design.
+    /// all "marked skipped, not grouped" per the design. The completion
+    /// aggregates `alive_groups`/`wasted_bytes` are computed ONCE at that
+    /// completion instant (an alive-scan over the fresh groups against
+    /// the hot index of the moment) and cached here — this call stays a
+    /// plain copy; a cancelled run carries the previous run's values and
+    /// a fresh engine reports 0/0.
     pub fn dedup_state(&self) -> DedupState {
         lock_unpoisoned(&self.dedup.book).state
     }
 
-    /// The last completed run's groups, `[offset, offset + limit)` of the
-    /// size-descending order, members materialized as search-style
-    /// [`crate::Hit`]s from the hot index. Files deleted since the
-    /// run drop out; a group falling below two surviving members dissolves
-    /// (its slot in the ordering disappears, the other groups keep their
-    /// relative order).
-    pub fn dedup_groups(&self, offset: u32, limit: u32) -> Vec<DupeGroup> {
-        if limit == 0 {
-            return Vec::new();
-        }
+    /// The last completed run's groups as a [`DedupPage`]: the
+    /// `[offset, offset + limit)` slice of the size-descending order,
+    /// members materialized as search-style [`crate::Hit`]s from the hot
+    /// index, plus `total_alive` — the count of groups that still
+    /// materialize (>= 2 surviving members) across ALL pages, scanned
+    /// live against the current hot index (a cancelled run keeps serving
+    /// the previous run's groups; files deleted since any run drop out).
+    /// A group falling below two surviving members dissolves (its slot in
+    /// the ordering disappears, the other groups keep their relative
+    /// order) — the same rule the run-completion aggregates in
+    /// [`Engine::dedup_state`] apply at their completion instant.
+    pub fn dedup_groups(&self, offset: u32, limit: u32) -> DedupPage {
         // Snapshot the stored groups (cheap Arc clone) and release the
         // bookkeeping lock before touching the hot index — the engine's
         // locks never nest.
         let groups = Arc::clone(&lock_unpoisoned(&self.dedup.book).groups);
         let hot = read_unpoisoned(&self.hot);
-        let mut skipped: u32 = 0;
+        // First pass: alive-member count per group (`slot_of_id` presence,
+        // the exact rule the materialization below applies). This is the
+        // total's O(groups) scan the plan budgets per page-granularity
+        // call — and it doubles as the dissolved-group filter, so skipped
+        // groups never materialize their members at all.
+        let alive_counts: Vec<u32> = groups
+            .iter()
+            .map(|group| {
+                group
+                    .members
+                    .iter()
+                    .filter(|id| hot.slot_of_id(**id).is_some())
+                    .count() as u32
+            })
+            .collect();
+        let total_alive = alive_counts.iter().filter(|&&alive| alive >= 2).count() as u32;
         let mut page = Vec::new();
-        for group in groups.iter() {
-            let members: Vec<crate::query::Hit> = group
-                .members
-                .iter()
-                .filter_map(|id| hot.slot_of_id(*id).map(|slot| query::hit_of(&hot, slot)))
-                .collect();
-            if members.len() < 2 {
-                continue;
-            }
-            if skipped < offset {
-                skipped += 1;
-                continue;
-            }
-            page.push(DupeGroup {
-                hash: group.hash,
-                size: group.size,
-                members,
-            });
-            if page.len() == limit as usize {
-                break;
+        if limit > 0 {
+            let mut skipped: u32 = 0;
+            for (group, &alive) in groups.iter().zip(&alive_counts) {
+                if alive < 2 {
+                    continue;
+                }
+                if skipped < offset {
+                    skipped += 1;
+                    continue;
+                }
+                page.push(DupeGroup {
+                    hash: group.hash,
+                    size: group.size,
+                    members: group
+                        .members
+                        .iter()
+                        .filter_map(|id| hot.slot_of_id(*id).map(|slot| query::hit_of(&hot, slot)))
+                        .collect(),
+                });
+                if page.len() == limit as usize {
+                    break;
+                }
             }
         }
-        page
+        DedupPage {
+            groups: page,
+            total_alive,
+        }
     }
 
     /// The absolute disk path of an index-relative path (root segment
@@ -1189,9 +1216,14 @@ fn scan_cycle(
 /// Claims the dedup slot, resets the state machine to `Grouping` (the
 /// `Idle -> Grouping` transition `dedup_start` promises — synchronously,
 /// so pollers never miss it) and spawns the worker thread at the gear's
-/// worker count. A no-op when a run is already going. Returns whether a
-/// run was started.
-fn launch_dedup(dedup: &Arc<DedupShared>, gear: DedupGear) -> bool {
+/// worker count. `hot` travels along because the cycle's Done path needs
+/// a hot-index read for the run-completion aggregates. A no-op when a run
+/// is already going. Returns whether a run was started.
+fn launch_dedup(
+    dedup: &Arc<DedupShared>,
+    hot: Arc<RwLock<HotIndex>>,
+    gear: DedupGear,
+) -> bool {
     // Clear any stale cancel BEFORE the claim: a cancelled predecessor
     // leaves the flag set, and it must not pre-arm its successor.
     // `dedup_cancel` is a no-op while idle, so nothing can set the flag
@@ -1208,8 +1240,15 @@ fn launch_dedup(dedup: &Arc<DedupShared>, gear: DedupGear) -> bool {
     }
     {
         let mut book = lock_unpoisoned(&dedup.book);
+        // The completion aggregates carry the previous run's values
+        // through this reset: a run that ends CANCELLED keeps serving the
+        // previous groups, and its final report must not zero their
+        // aggregates (a COMPLETING run recomputes both fresh).
+        let (alive_groups, wasted_bytes) = (book.state.alive_groups, book.state.wasted_bytes);
         book.state = DedupState {
             phase: DedupPhase::Grouping,
+            alive_groups,
+            wasted_bytes,
             ..DedupState::default()
         };
         // `groups` keeps the previous run's list: dedup_groups goes on
@@ -1219,7 +1258,7 @@ fn launch_dedup(dedup: &Arc<DedupShared>, gear: DedupGear) -> bool {
     let gentle = gear == DedupGear::Gentle;
     let spawn = thread::Builder::new().name("synso-dedup".into()).spawn({
         let dedup = Arc::clone(dedup);
-        move || dedup_cycle(dedup, workers, gentle)
+        move || dedup_cycle(dedup, hot, workers, gentle)
     });
     match spawn {
         Ok(_) => true,
@@ -1244,8 +1283,14 @@ fn launch_dedup(dedup: &Arc<DedupShared>, gear: DedupGear) -> bool {
 /// `workers` is the gates' worker-pool size ([`DedupGear::workers`]);
 /// `gentle` drops THIS thread below normal priority on Windows — see the
 /// import note for why the gates' internal workers stay normal-priority
-/// (accepted limitation).
-fn dedup_cycle(dedup: Arc<DedupShared>, workers: usize, gentle: bool) {
+/// (accepted limitation). `hot` is the engine's hot index, read once at
+/// Done for the run-completion aggregates ([`alive_aggregates`]).
+fn dedup_cycle(
+    dedup: Arc<DedupShared>,
+    hot: Arc<RwLock<HotIndex>>,
+    workers: usize,
+    gentle: bool,
+) {
     let _slot = SlotGuard(&dedup.running);
     // Gentle gear: below-normal priority for the whole run on this thread
     // (best-effort — a failure would only mean normal priority; there is
@@ -1340,6 +1385,14 @@ fn dedup_cycle(dedup: Arc<DedupShared>, workers: usize, gentle: bool) {
     let groups = outcome.groups.len() as u64;
     log::info!("synso: dedup run finished: {groups} group(s); {tally}");
     let hashed = outcome.hashed_first + outcome.hashed_full;
+    // The run-completion aggregates: one alive-scan over the fresh groups
+    // against the CURRENT hot index, computed OUTSIDE the bookkeeping
+    // lock (locks never nest) and cached in the state machine, so
+    // `dedup_state()` stays a plain copy.
+    let (alive_groups, wasted_bytes) = {
+        let hot = read_unpoisoned(&hot);
+        alive_aggregates(&hot, &outcome.groups)
+    };
     {
         let mut book = lock_unpoisoned(&dedup.book);
         book.state = DedupState {
@@ -1352,10 +1405,36 @@ fn dedup_cycle(dedup: Arc<DedupShared>, workers: usize, gentle: bool) {
             // another handle, or a cloud placeholder); the outcome
             // counters keep them apart (fresh/recycle stay internal).
             errors: c.errors + c.locked + c.placeholders,
+            alive_groups,
+            wasted_bytes,
         };
         book.groups = Arc::new(outcome.groups);
     }
     broadcast(&subscribers, EngineEvent::DedupFinished { groups });
+}
+
+/// The run-completion aggregates (Task 8): alive-member counts per group
+/// against the CURRENT hot index (`slot_of_id` presence — the exact rule
+/// [`Engine::dedup_groups`] materializes by), `alive_groups` counting the
+/// groups that still materialize (>= 2 live members) and `wasted_bytes`
+/// summing `size × (alive − 1)` over exactly those. Free function so the
+/// cycle computes it with no engine lock held — the hot read must never
+/// nest inside the bookkeeping lock.
+fn alive_aggregates(hot: &HotIndex, groups: &[StoredGroup]) -> (u64, u64) {
+    let mut alive_groups = 0u64;
+    let mut wasted_bytes = 0u64;
+    for group in groups {
+        let alive = group
+            .members
+            .iter()
+            .filter(|id| hot.slot_of_id(**id).is_some())
+            .count();
+        if alive >= 2 {
+            alive_groups += 1;
+            wasted_bytes += group.size * (alive as u64 - 1);
+        }
+    }
+    (alive_groups, wasted_bytes)
 }
 
 /// Loads a fresh hot index from the store and swaps it in, under the store
@@ -2106,8 +2185,9 @@ mod tests {
         assert_eq!(state.groups, 1);
 
         let page = engine.dedup_groups(0, 10);
-        assert_eq!(page.len(), 1);
-        let group = &page[0];
+        assert_eq!(page.groups.len(), 1);
+        assert_eq!(page.total_alive, 1);
+        let group = &page.groups[0];
         assert_eq!(group.size, 11, "alpha bravo");
         assert_eq!(group.members.len(), 2);
         let mut names: Vec<&str> = group.members.iter().map(|m| m.name.as_str()).collect();
@@ -2122,10 +2202,112 @@ mod tests {
         // single group yields nothing.
         assert!(engine
             .dedup_groups(0, 10)
+            .groups
             .iter()
             .flat_map(|g| &g.members)
             .all(|m| m.name != "other.txt"));
-        assert!(engine.dedup_groups(1, 10).is_empty());
+        assert!(engine.dedup_groups(1, 10).groups.is_empty());
+    }
+
+    /// THE paged-frontend contract (Task 8): `dedup_groups` returns a
+    /// [`DedupPage`] whose `total_alive` counts every group that still
+    /// materializes against the CURRENT hot index (>= 2 surviving members),
+    /// dissolved groups' members never materialize — and the run-completion
+    /// aggregates (`alive_groups` / `wasted_bytes`) recount ONLY the
+    /// surviving group once its rivals' members leave the store and a
+    /// rerun folds the book. Before any completed run both are 0.
+    #[test]
+    fn dedup_page_total_alive_and_wasted_track_surviving_groups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        // Group A: two 11-byte twins. Group B: two 5-byte twins. The
+        // differing sizes make the wasted arithmetic attributable per
+        // group (each alive pair wastes exactly one redundant copy).
+        fs::write(root.join("a1.txt"), b"alpha bravo").unwrap();
+        fs::write(root.join("a2.txt"), b"alpha bravo").unwrap();
+        fs::write(root.join("b1.txt"), b"bbbbb").unwrap();
+        fs::write(root.join("b2.txt"), b"bbbbb").unwrap();
+        for name in ["a1.txt", "a2.txt", "b1.txt", "b2.txt"] {
+            backdate(&root.join(name));
+        }
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        // No completed run yet: zero aggregates, zero alive total.
+        let state = engine.dedup_state();
+        assert_eq!(
+            (state.alive_groups, state.wasted_bytes),
+            (0, 0),
+            "before any run the aggregates are 0/0"
+        );
+        assert_eq!(engine.dedup_groups(0, 10).total_alive, 0);
+
+        // Run 1: both pairs group.
+        engine.dedup_start();
+        let (groups, _progress) = wait_dedup_finished(&rx);
+        assert_eq!(groups, 2);
+
+        let state = engine.dedup_state();
+        assert_eq!(state.phase, DedupPhase::Done);
+        assert_eq!(state.groups, 2);
+        assert_eq!(
+            state.alive_groups, 2,
+            "both groups fully alive at completion"
+        );
+        assert_eq!(
+            state.wasted_bytes,
+            11 + 5,
+            "each pair wastes one copy of its size"
+        );
+
+        let page = engine.dedup_groups(0, 10);
+        assert_eq!(page.groups.len(), 2);
+        assert_eq!(page.total_alive, 2);
+        // limit 0: an empty page still reports the full alive total.
+        assert_eq!(engine.dedup_groups(0, 0).groups.len(), 0);
+        assert_eq!(engine.dedup_groups(0, 0).total_alive, 2);
+        // Paging past the alive total yields nothing.
+        assert!(engine.dedup_groups(2, 10).groups.is_empty());
+
+        // Group B's members leave the disk; the rescan reconciles the
+        // store and the hot index (the existing fixture deletion pattern).
+        fs::remove_file(root.join("b1.txt")).unwrap();
+        fs::remove_file(root.join("b2.txt")).unwrap();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        // Live view, BEFORE any rerun: the dissolved group's members never
+        // materialize and the alive total recounts only group A.
+        let page = engine.dedup_groups(0, 10);
+        assert_eq!(page.total_alive, 1, "group B dissolved below 2 members");
+        assert_eq!(page.groups.len(), 1);
+        let names: Vec<&str> = page.groups[0]
+            .members
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(
+            names.iter().all(|n| n.starts_with('a')),
+            "only group A materializes: {names:?}"
+        );
+
+        // A rerun folds the book over the post-deletion store: the
+        // aggregates recount ONLY the surviving group.
+        engine.dedup_start();
+        let (groups, _progress) = wait_dedup_finished(&rx);
+        assert_eq!(groups, 1, "group B is gone from the store");
+        let state = engine.dedup_state();
+        assert_eq!(state.alive_groups, 1);
+        assert_eq!(
+            state.wasted_bytes, 11,
+            "wasted counts only the surviving group's one redundant copy"
+        );
     }
 
     #[test]
@@ -2147,7 +2329,7 @@ mod tests {
         engine.dedup_start();
         let (groups, _progress) = wait_dedup_finished(&rx);
         assert_eq!(groups, 0, "zero-size files never group");
-        assert!(engine.dedup_groups(0, 10).is_empty());
+        assert!(engine.dedup_groups(0, 10).groups.is_empty());
         let state = engine.dedup_state();
         assert_eq!(state.phase, DedupPhase::Done);
         assert_eq!(state.errors, 0, "the size-0 filter is not an error");
@@ -2182,7 +2364,7 @@ mod tests {
         engine.dedup_start();
         let (groups, _progress) = wait_dedup_finished(&rx);
         assert_eq!(groups, 0, "the locked member cannot confirm a group");
-        assert!(engine.dedup_groups(0, 10).is_empty());
+        assert!(engine.dedup_groups(0, 10).groups.is_empty());
         let state = engine.dedup_state();
         assert_eq!(state.phase, DedupPhase::Done);
         assert!(
@@ -2195,7 +2377,7 @@ mod tests {
         engine.dedup_start();
         let (groups, _progress) = wait_dedup_finished(&rx);
         assert_eq!(groups, 1);
-        assert_eq!(engine.dedup_groups(0, 10)[0].members.len(), 2);
+        assert_eq!(engine.dedup_groups(0, 10).groups[0].members.len(), 2);
         assert_eq!(engine.dedup_state().errors, 0, "errors are per run");
     }
 
@@ -2331,7 +2513,14 @@ mod tests {
         engine.dedup_start();
         let (groups, _progress) = wait_dedup_finished(&rx);
         assert_eq!(groups, 1);
-        assert_eq!(engine.dedup_groups(0, 10).len(), 1);
+        assert_eq!(engine.dedup_groups(0, 10).groups.len(), 1);
+        // Run-completion aggregates (Task 8) for the 4-byte twin pair.
+        let state = engine.dedup_state();
+        assert_eq!(
+            (state.alive_groups, state.wasted_bytes),
+            (1, 4),
+            "one alive pair wastes one redundant 4-byte copy"
+        );
 
         // Run 2 gets real work: 300 identical unhashed 80KB copies join the
         // index via a rescan (the unchanged twins keep their hashes — the
@@ -2388,7 +2577,12 @@ mod tests {
             "a cancelled run keeps the previous run's group count"
         );
         assert_eq!(
-            engine.dedup_groups(0, 10).len(),
+            (state.alive_groups, state.wasted_bytes),
+            (1, 4),
+            "a cancelled run carries the PREVIOUS run's aggregates, not zeroes"
+        );
+        assert_eq!(
+            engine.dedup_groups(0, 10).groups.len(),
             1,
             "dedup_groups still serves the previous run's group"
         );

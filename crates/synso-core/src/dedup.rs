@@ -117,6 +117,15 @@ const PERSIST_BATCH: usize = 128;
 /// this run because they could not be read, were locked by another
 /// handle, OR were cloud placeholders — all are "marked skipped, not
 /// grouped" per the design.
+///
+/// `alive_groups` / `wasted_bytes` are the run-completion aggregates
+/// (Task 8), computed once when a run reaches `Done` — over the fresh
+/// group list against the hot index of that instant, so they describe the
+/// LAST COMPLETED run's time point (a cancelled run keeps the previous
+/// one's values; 0/0 before the first run ever completes). `alive_groups`
+/// counts the groups that still materialize (>= 2 live members);
+/// `wasted_bytes` sums `size × (alive − 1)` over exactly those — the
+/// bytes deleting one redundant copy of every alive group would reclaim.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DedupState {
@@ -125,6 +134,12 @@ pub struct DedupState {
     pub total: u64,
     pub groups: u64,
     pub errors: u64,
+    /// Groups of the last completed run that still materialize (>= 2 live
+    /// members) at that run's completion instant.
+    pub alive_groups: u64,
+    /// `Σ size × (alive − 1)` over the alive groups — the reclaimable
+    /// redundancy the last completed run found.
+    pub wasted_bytes: u64,
 }
 
 /// One content-identical file group as returned by
@@ -142,6 +157,22 @@ pub struct DupeGroup {
     pub size: u64,
     /// The group's members (>= 2), stable order (files-row id ascending).
     pub members: Vec<crate::query::Hit>,
+}
+
+/// One page of [`crate::engine::Engine::dedup_groups`]: the page's
+/// materialized groups plus `total_alive`, the count of groups that
+/// still materialize against the CURRENT hot index (>= 2 surviving
+/// members) across ALL pages — the full alive-filtered total a paged
+/// frontend needs without paging to the end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DedupPage {
+    /// The `[offset, offset + limit)` slice of the size-descending alive
+    /// ordering, members materialized as hits.
+    pub groups: Vec<DupeGroup>,
+    /// Full alive-group count at call time (a live scan, unlike the
+    /// run-completion snapshot [`DedupState::alive_groups`] carries).
+    pub total_alive: u32,
 }
 
 /// Engine-side record of one finished run's group: members as `files` row
