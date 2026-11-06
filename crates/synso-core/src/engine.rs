@@ -163,8 +163,10 @@ pub enum EngineEvent {
     /// no payload — polls of `stats()`/`search()` are the source of truth.
     FsChanged,
     /// Dedup pipeline progress (Task 9): `done`/`total` count the records
-    /// of the current stage, emitted at every stage change and every 500
-    /// records within one. The final event carries `phase: Done` with
+    /// of the current stage, emitted at every stage transition and at each
+    /// chunk boundary within a stage (65,536-candidate chunks — not
+    /// mid-chunk), plus one final tick at each stage's end. The final
+    /// event carries `phase: Done` with
     /// `done == total ==` the hash computations the run performed — or,
     /// for a cancelled run ([`Engine::dedup_cancel`]), ONE final event
     /// with `phase: Cancelled` re-carrying the last `(done, total)`

@@ -4566,7 +4566,7 @@ mod tests {
         assert_eq!(
             *reader.opened.lock().unwrap(),
             vec![root.join("a.bin"), root.join("a.bin")],
-            "twin.bin twice (probe + gate④), certified member never"
+            "a.bin twice (probe + gate④), certified twin.bin never"
         );
         assert_eq!(outcome.groups.len(), 1);
         let group = &outcome.groups[0];
