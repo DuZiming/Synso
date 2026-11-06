@@ -45,7 +45,6 @@ tauri-plugin-single-instance = "2"
 # OS UI language for the tray menu's "auto" resolution (see tray.rs);
 # the crate is already in the graph via synso-core — this only widens
 # the feature set.
-windows = { workspace = true, features = ["Win32_Globalization"] }
 serde = { version = "1", features = ["derive"] }
 crossbeam-channel.workspace = true
 # Facade logging; the file backend lives in `logging.rs` (Task 19).
@@ -56,3 +55,11 @@ log = { workspace = true, features = ["std"] }
 [dev-dependencies]
 # The logging rotation tests need a throwaway directory.
 tempfile.workspace = true
+
+# Windows-only: the tray's OS-language probe (GetUserDefaultUILanguage).
+# Unconditional, this pulled the whole `windows` crate family into
+# non-Windows targets — windows-future 0.3.2's bindings do not cfg
+# themselves empty there, breaking the first macOS build (2026-11-06
+# port). synso-core already spells it this way.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Globalization"] }
