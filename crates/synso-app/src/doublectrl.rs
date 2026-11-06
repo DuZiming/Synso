@@ -59,6 +59,17 @@ pub(crate) enum TapKey {
 }
 
 /// Spawns the hook thread (never returns; one per process).
+///
+/// WINDOWS ONLY (macOS port, 2026-11-06): rdev's macOS event-tap callback
+/// calls HIToolbox's TIS APIs from a non-main dispatch context — the
+/// GCD queue assertion kills the process with SIGTRAP on the FIRST key
+/// press (crash reports `string_from_code` → `TSMGetInputSourceProperty`
+/// → `dispatch_assert_queue_fail`). Until rdev fixes that, non-Windows
+/// builds skip the hook entirely; the configured global combo
+/// (default `Ctrl+;`, the always-registered tauri-plugin-global-shortcut
+/// path) remains the summon on every platform. The `DoubleTap` state
+/// machine and its tests stay platform-independent.
+#[cfg(windows)]
 pub(crate) fn spawn(app: tauri::AppHandle) {
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     std::thread::Builder::new()
