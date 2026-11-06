@@ -16,9 +16,11 @@
 //!
 //! Skip rules: a Windows cloud placeholder (checked via
 //! [`crate::scanner::is_placeholder_attr`] on `GetFileAttributesW` output,
-//! BEFORE the file is opened) and any open/read failure mark the file
-//! skipped — it never enters a group and never panics the run. Counters
-//! for both land in [`DedupOutcome`].
+//! BEFORE the file is opened), a Windows sharing violation (another handle
+//! owns the file — a [`OpenSkip::Locked`] skip, nothing read), and any
+//! other open/read failure mark the file skipped — it never enters a group
+//! and never panics the run. Counters for all three land in
+//! [`DedupOutcome`].
 //!
 //! Concurrency contract with the engine: hashing happens entirely OUTSIDE
 //! the store lock; the lock is taken only for the initial snapshot and for
@@ -54,9 +56,15 @@
 //! Windows).
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf, MAIN_SEPARATOR_STR};
 use std::sync::Mutex;
+
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
 
 use xxhash_rust::xxh64::{xxh64, Xxh64};
 
@@ -85,8 +93,9 @@ const PERSIST_BATCH: usize = 128;
 /// performed (0 = every hash was already persisted, i.e. a fully
 /// incremental run). `groups` is the group count of the last COMPLETED run
 /// (0 before the first one finishes); `errors` counts files skipped for
-/// this run because they could not be read OR were cloud placeholders —
-/// both are "marked skipped, not grouped" per the design.
+/// this run because they could not be read, were locked by another
+/// handle, OR were cloud placeholders — all are "marked skipped, not
+/// grouped" per the design.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DedupState {
@@ -135,6 +144,11 @@ pub(crate) struct DedupOutcome {
     pub hashed_full: u64,
     /// Files skipped because they could not be resolved, opened or read.
     pub errors: u64,
+    /// Files skipped because another handle denied our open (a Windows
+    /// sharing violation, [`OpenSkip::Locked`]): nothing was read, and the
+    /// next run simply retries.
+    #[allow(dead_code)] // Task 4-7 wiring: gate counters + engine swap read it.
+    pub locked: u64,
     /// Files skipped because Windows reports them as cloud placeholders
     /// (never opened, so hashing never triggers a hydration download).
     pub placeholders: u64,
@@ -151,7 +165,8 @@ pub(crate) trait FileReader {
     fn open(&self, path: &Path) -> std::io::Result<std::fs::File>;
 }
 
-/// Production reader: real `GetFileAttributesW` + `std::fs::File::open`.
+/// Production reader: real `GetFileAttributesW` + a read-only open that
+/// denies write-sharing on Windows (see the `open` impl for why).
 pub(crate) struct RealFileReader;
 
 impl FileReader for RealFileReader {
@@ -160,8 +175,72 @@ impl FileReader for RealFileReader {
     }
 
     fn open(&self, path: &Path) -> std::io::Result<std::fs::File> {
-        std::fs::File::open(path)
+        let mut opts = OpenOptions::new();
+        opts.read(true);
+        #[cfg(windows)]
+        // Deny write-sharing — `FILE_SHARE_READ` is the ONLY access we
+        // grant other openers: while this handle is open no writer can
+        // open the file, so the bytes we hash are stable. std's default
+        // open shares write access and could hash mid-write drift (a
+        // group keyed on content the file no longer has) — this setting
+        // is that bug's fix. Symmetrically, a file a writer (or an
+        // exclusive holder) already owns fails HERE with
+        // ERROR_SHARING_VIOLATION; `classify_open_err` files it under
+        // [`OpenSkip::Locked`].
+        opts.share_mode(FILE_SHARE_READ.0);
+        // No share modes off Windows (mac port): the plain read open
+        // above — locked detection degenerates to "open failed", with
+        // the mtime grace window ([`is_fresh`]) as the backstop.
+        opts.open(path)
     }
+}
+
+// ---------------------------------------------------------------------
+// Open semantics (Task 3): how a failed open is classified and when a
+// candidate is too young to read. The gate code (Task 4-6) consumes both.
+
+/// Why an open attempt was skipped: [`OpenSkip::Locked`] means another
+/// handle denied our access — the file exists, we just cannot read it
+/// right now, and the next run retries; [`OpenSkip::Error`] is every
+/// other failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenSkip {
+    /// Another handle denies our access (a Windows sharing violation).
+    #[cfg_attr(not(windows), allow(dead_code))] // constructed on Windows only
+    Locked,
+    /// Any other open failure.
+    Error,
+}
+
+/// Classifies an open failure into its skip kind: only
+/// `raw_os_error() == Some(32)` (`ERROR_SHARING_VIOLATION`) is
+/// [`OpenSkip::Locked`], everything else — access denied, vanished file,
+/// a non-OS error — stays [`OpenSkip::Error`]. Off Windows no failure can
+/// mean "locked by another handle", so every failure is an error there.
+pub(crate) fn classify_open_err(err: &std::io::Error) -> OpenSkip {
+    match err.raw_os_error() {
+        #[cfg(windows)]
+        // ERROR_SHARING_VIOLATION: an open handle's access or share mode
+        // conflicts with ours.
+        Some(32) => OpenSkip::Locked,
+        _ => OpenSkip::Error,
+    }
+}
+
+/// mtime grace window in seconds: a candidate whose snapshot mtime is
+/// younger than this may still be mid-write (a half-finished download, a
+/// growing log) and must not be read this run. The grace applies only to
+/// candidates about to be OPENED — reusing a persisted hash is never
+/// gated on freshness; that policy lives in the gate code (Task 4).
+#[allow(dead_code)] // Task 4 wiring: gate_head checks the grace before it opens.
+pub(crate) const FRESH_SECS: i64 = 300;
+
+/// True while `mtime` (snapshot seconds) is inside the grace window that
+/// ends at `now` — `now` is injected by the caller, so tests control the
+/// clock.
+#[allow(dead_code)] // Task 4 wiring: gate_head checks the grace before it opens.
+pub(crate) fn is_fresh(mtime: i64, now: i64) -> bool {
+    now - mtime < FRESH_SECS
 }
 
 /// Resolves an index-relative path (root segment first, `MAIN_SEPARATOR`-
@@ -455,7 +534,8 @@ fn advance_stage_progress(
 /// Hashes the first [`FIRST_CHUNK`] bytes of snapshot entry `idx`, recording
 /// the computed value in `pending` for batched persistence. `None` (with the
 /// skip counted) when the path cannot be resolved, the file is a Windows
-/// cloud placeholder (never opened), or it cannot be opened/read.
+/// cloud placeholder (never opened), or it cannot be opened/read (a
+/// sharing violation is a [`OpenSkip::Locked`] skip, not an error).
 fn hash_first_of(
     snapshot: &Snapshot,
     idx: usize,
@@ -466,13 +546,7 @@ fn hash_first_of(
 ) -> Option<u64> {
     let entry = &snapshot.files[idx];
     let path = open_candidate(snapshot, entry, roots, reader, outcome)?;
-    let mut file = match reader.open(&path) {
-        Ok(file) => file,
-        Err(_) => {
-            outcome.errors += 1;
-            return None;
-        }
-    };
+    let mut file = open_or_skip(reader, &path, outcome)?;
     let mut chunk = [0u8; FIRST_CHUNK];
     let mut filled = 0;
     while filled < chunk.len() {
@@ -510,13 +584,7 @@ fn hash_full_of(
 ) -> Option<u64> {
     let entry = &snapshot.files[idx];
     let path = open_candidate(snapshot, entry, roots, reader, outcome)?;
-    let mut file = match reader.open(&path) {
-        Ok(file) => file,
-        Err(_) => {
-            outcome.errors += 1;
-            return None;
-        }
-    };
+    let mut file = open_or_skip(reader, &path, outcome)?;
     let mut hasher = Xxh64::new(0);
     let mut buffer = vec![0u8; READ_BUFFER];
     loop {
@@ -575,6 +643,28 @@ fn open_candidate(
         }
     }
     Some(abs)
+}
+
+/// The open step both hash stages share: opens `path` via `reader`,
+/// counting a failure as the matching [`DedupOutcome`] skip — a Windows
+/// sharing violation is a [`OpenSkip::Locked`] skip, every other failure
+/// keeps the error semantics. `None` means "skipped": no file came back,
+/// so the caller has nothing to read.
+fn open_or_skip(
+    reader: &dyn FileReader,
+    path: &Path,
+    outcome: &mut DedupOutcome,
+) -> Option<std::fs::File> {
+    match reader.open(path) {
+        Ok(file) => Some(file),
+        Err(err) => {
+            match classify_open_err(&err) {
+                OpenSkip::Locked => outcome.locked += 1,
+                OpenSkip::Error => outcome.errors += 1,
+            }
+            None
+        }
+    }
 }
 
 /// Persists one batch of computed hashes under one short store lock (single
@@ -1350,5 +1440,104 @@ mod tests {
         assert_eq!(outcome.hashed_full, 0, "full hashes never needed");
         assert_eq!(reader.opened.lock().unwrap().len(), 2);
         assert!(outcome.groups.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Task 3: open semantics — deny-write sharing, Locked/Error
+    // classification, mtime grace window.
+
+    /// Sharing violations are the only Locked kind — and that code exists
+    /// (with that meaning) only on Windows; every other open failure,
+    /// OS-code or not, stays an error everywhere.
+    #[test]
+    fn open_semantics_classifies_open_errors() {
+        #[cfg(windows)]
+        assert_eq!(
+            classify_open_err(&std::io::Error::from_raw_os_error(32)),
+            OpenSkip::Locked,
+            "ERROR_SHARING_VIOLATION is a Locked skip"
+        );
+        // Off Windows no failure can mean "locked by another handle".
+        #[cfg(not(windows))]
+        assert_eq!(
+            classify_open_err(&std::io::Error::from_raw_os_error(32)),
+            OpenSkip::Error
+        );
+        assert_eq!(
+            classify_open_err(&std::io::Error::from_raw_os_error(5)),
+            OpenSkip::Error,
+            "access denied is an error, not a lock"
+        );
+        assert_eq!(
+            classify_open_err(&std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "not an os error"
+            )),
+            OpenSkip::Error
+        );
+    }
+
+    /// The grace window boundary: a candidate modified 299s ago may still
+    /// be mid-write (fresh, skipped); at exactly 300s the grace is over
+    /// and the file is read. A future mtime (clock skew) is inside the
+    /// window — the arithmetic is a plain difference, no abs() tricks.
+    #[test]
+    fn open_semantics_fresh_window_boundary() {
+        let now = 1_800_000_000;
+        assert!(is_fresh(now - 299, now));
+        assert!(!is_fresh(now - 300, now));
+        assert!(!is_fresh(now - 3_600, now), "long-settled files are read");
+        assert!(is_fresh(now + 5, now), "clock skew stays in the window");
+    }
+
+    /// A real file held with NO sharing flags (the [`crate::engine`] tests'
+    /// precedent) must fail our deny-write open as a Locked skip — the
+    /// open-path helper returns no file (nothing is ever read), the skip
+    /// lands in `locked`, and the end-to-end run hashes only the unlocked
+    /// sibling. Releasing the handle makes the file openable again.
+    #[cfg(windows)]
+    #[test]
+    fn open_semantics_real_exclusive_lock_is_locked_skip() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("locked.txt"), b"shared secret").unwrap();
+        fs::write(root.join("free.txt"), b"shared secret").unwrap();
+
+        // Hold the file with NO sharing flags: any other open fails.
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(root.join("locked.txt"))
+            .unwrap();
+
+        // The open-path helper: no file comes back (so no content can be
+        // read), the failure is a Locked skip, not an error.
+        let reader = RealFileReader;
+        let mut outcome = DedupOutcome::default();
+        assert!(open_or_skip(&reader, &root.join("locked.txt"), &mut outcome).is_none());
+        assert_eq!(outcome.locked, 1);
+        assert_eq!(outcome.errors, 0);
+
+        // End-to-end through the pipeline (whose deny-write open hits the
+        // same exclusive holder): the locked member never enters a group,
+        // never reaches a hash, and is not counted as an error.
+        let (_tstore, store) = test_store();
+        upsert_fixture_row(&store, "locked.txt");
+        upsert_fixture_row(&store, "free.txt");
+        let roots = vec![root.to_string_lossy().into_owned()];
+        let outcome = run_pipeline(&store, &roots, &reader, &noop_progress);
+        assert_eq!(outcome.locked, 1, "the sharing violation is a Locked skip");
+        assert_eq!(outcome.errors, 0, "not an error");
+        assert_eq!(outcome.hashed_first, 1, "only free.txt was read");
+        assert!(outcome.groups.is_empty(), "one hash never pairs");
+
+        // Release the handle: the file opens like any other.
+        drop(held);
+        let mut after = DedupOutcome::default();
+        assert!(open_or_skip(&reader, &root.join("locked.txt"), &mut after).is_some());
+        assert_eq!(after.locked, 0);
     }
 }
