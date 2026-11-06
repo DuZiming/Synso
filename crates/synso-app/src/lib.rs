@@ -89,6 +89,9 @@ pub fn run() {
             quick::init(app.handle());
             // Double-Ctrl summon (v1.2 user request), always on; the
             // configured combo stays registered as the fallback.
+            // Windows-only (see doublectrl::spawn docs: rdev macOS
+            // event tap trips a GCD queue assertion on first key press).
+            #[cfg(windows)]
             doublectrl::spawn(app.handle().clone());
 
             // Tray: icon + the five-item menu (best-effort — a failed

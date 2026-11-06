@@ -39,7 +39,6 @@ tauri-plugin-dialog = "2"
 # webview origin is not a secure context, so navigator.clipboard is out).
 tauri-plugin-clipboard-manager = "2"
 # Low-level keyboard hook for the double-Ctrl quick-search summon (v1.2).
-rdev = "0.5"
 tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
 # OS UI language for the tray menu's "auto" resolution (see tray.rs);
@@ -63,3 +62,6 @@ tempfile.workspace = true
 # port). synso-core already spells it this way.
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_Globalization"] }
+# Windows-only: double-Ctrl summon keyboard hook (rdev). The macOS
+# event-tap path trips a GCD queue assertion (see doublectrl::spawn).
+rdev = "0.5"
