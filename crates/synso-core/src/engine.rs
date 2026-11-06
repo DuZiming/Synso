@@ -824,8 +824,10 @@ impl Engine {
     /// they re-carry the last in-run report. `groups` is the last
     /// COMPLETED run's group count (a cancelled run keeps the previous
     /// one); `errors` counts files skipped because they could not be
-    /// read, were locked by another handle, or are cloud placeholders —
-    /// all "marked skipped, not grouped" per the design. The completion
+    /// read, were locked by another handle, are cloud placeholders, or
+    /// were dropped by the final grouping's liveness gate (an index row
+    /// whose file has left the disk) — all "marked skipped, not
+    /// grouped" per the design. The completion
     /// aggregates `alive_groups`/`wasted_bytes` are computed ONCE at that
     /// completion instant (an alive-scan over the fresh groups against
     /// the hot index of the moment) and cached here — this call stays a
@@ -1353,7 +1355,7 @@ fn dedup_cycle(
     // ONE summary line per run (the spec's per-gate accounting), on both
     // exits — completion and cancellation.
     let tally = format!(
-        "size_gate {}f/{}B head_gate {}f/{}B sample_gate {}f/{}B skips errors {} locked {} fresh {} placeholders {} recycle {} hashed first {} full {}",
+        "size_gate {}f/{}B head_gate {}f/{}B sample_gate {}f/{}B skips errors {} locked {} fresh {} placeholders {} recycle {} vanished {} hashed first {} full {}",
         c.size_gate.files,
         c.size_gate.bytes,
         c.head_gate.files,
@@ -1365,6 +1367,7 @@ fn dedup_cycle(
         c.fresh,
         c.placeholders,
         c.recycle,
+        c.vanished,
         outcome.hashed_first,
         outcome.hashed_full,
     );
@@ -1382,7 +1385,7 @@ fn dedup_cycle(
         // reload groups on cancel.
         let final_report = {
             let mut book = lock_unpoisoned(&dedup.book);
-            book.state.errors = c.errors + c.locked + c.placeholders;
+            book.state.errors = c.errors + c.locked + c.placeholders + c.vanished;
             book.state.groups = book.groups.len() as u64;
             EngineEvent::DedupProgress {
                 phase: book.state.phase,
@@ -1413,9 +1416,10 @@ fn dedup_cycle(
             groups,
             // All skip kinds share the public counter (the design's
             // "marked skipped, not grouped" — unreadable, locked by
-            // another handle, or a cloud placeholder); the outcome
+            // another handle, a cloud placeholder, or a liveness drop:
+            // an index row whose file left the disk); the outcome
             // counters keep them apart (fresh/recycle stay internal).
-            errors: c.errors + c.locked + c.placeholders,
+            errors: c.errors + c.locked + c.placeholders + c.vanished,
             alive_groups,
             wasted_bytes,
         };

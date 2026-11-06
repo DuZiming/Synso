@@ -21,6 +21,21 @@
 //!    survivors still lacking one. Final groups key on `(size, full)`
 //!    with `>= 2` members.
 //!
+//! The final grouping runs a **liveness gate** (Ruling 10, Task 12 fix
+//! round 1) over its members. THE INVARIANT: every group member was
+//! either opened this run or stat-verified present this run. A member
+//! whose full hash arrived without an open — SoA-persisted `hash_full`
+//! or gate②'s ≤4KiB reuse-terminal — proves presence with one
+//! `attributes` stat; a dead row or a cloud placeholder drops (counted
+//! as [`OutcomeCounters::vanished`], folded into the public errors), and
+//! a run falling below 2 members dissolves. Without it, index rows for
+//! files that left the disk (wholesale-deleted subtrees pending a
+//! rescan) would ghost-group out of persisted hashes alone — the old
+//! pipeline masked this incidentally (its full stage opened every
+//! member lacking a persisted `hash_full`); here the guarantee is
+//! explicit, at the price of warm re-runs being stat-only (one
+//! `GetFileAttributesW` per unopened member) instead of zero-I/O.
+//!
 //! Candidates stream straight from the store into SoA columns
 //! ([`Candidates`] + [`Dirs`]): non-directory `size > 0` rows, recycle-bin
 //! subtrees (a `$Recycle.Bin` dir name in any casing) excluded up front.
@@ -75,7 +90,7 @@
 //! exercised against a real exclusively-opened file in the engine tests on
 //! Windows).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf, MAIN_SEPARATOR_STR};
@@ -115,8 +130,9 @@ const PERSIST_BATCH: usize = 128;
 /// incremental run). `groups` is the group count of the last COMPLETED run
 /// (0 before the first one finishes); `errors` counts files skipped for
 /// this run because they could not be read, were locked by another
-/// handle, OR were cloud placeholders — all are "marked skipped, not
-/// grouped" per the design.
+/// handle, were cloud placeholders, or were dropped by the final
+/// grouping's liveness gate (an index row whose file has left the disk)
+/// — all are "marked skipped, not grouped" per the design.
 ///
 /// `alive_groups` / `wasted_bytes` are the run-completion aggregates
 /// (Task 8), computed once when a run reaches `Done` — over the fresh
@@ -634,6 +650,11 @@ pub(crate) struct OutcomeCounters {
     /// Recycle-bin subtree exclusions — checked for EVERY candidate up
     /// front, persisted-hash ones included.
     pub(crate) recycle: u64,
+    /// Liveness-gate drops (Ruling 10, Task 12 fix round 1): group
+    /// members whose full hash arrived without an open this run and
+    /// whose file failed the presence/placeholder stat at grouping
+    /// time — index rows for files that left the disk.
+    pub(crate) vanished: u64,
 }
 
 impl OutcomeCounters {
@@ -652,6 +673,7 @@ impl OutcomeCounters {
         self.fresh += other.fresh;
         self.placeholders += other.placeholders;
         self.recycle += other.recycle;
+        self.vanished += other.vanished;
     }
 }
 
@@ -2386,6 +2408,24 @@ pub(crate) fn run_gates(
         .filter(|(_, &hash)| hash != NO_HASH)
         .map(|(&slot, &hash)| (slot, hash))
         .collect();
+    // ---- Liveness gate (Ruling 10, Task 12 fix round 1): the merge's
+    // "opened this run" provenance. gate③'s terminal smalls were
+    // whole-read this run; gate④ freshly computed every `full_todo`
+    // member whose assembled `known` was NO_HASH (it could only have
+    // filled those by opening the file). The other two full sources —
+    // SoA-persisted `hash_full` and gate②'s ≤4KiB reuse-terminal —
+    // arrived WITHOUT an open, so their members carry no evidence the
+    // file still exists: wholesale-deleted subtrees pending a rescan
+    // would ghost-group (the Task 12 acceptance divergence). The
+    // invariant below is THE contract: every group member was either
+    // opened this run or stat-verified present this run. ----
+    let mut opened_full: HashSet<FileId> = small_full.keys().copied().collect();
+    for (i, &slot) in sample.full_todo.iter().enumerate() {
+        if known[i] == NO_HASH {
+            opened_full.insert(FileId::from(cands.ids[slot as usize]));
+        }
+    }
+    let mut vanished = 0u64;
     let mut rows: Vec<(u64, u64, FileId)> = Vec::new();
     for (p, &slot) in head.cand.iter().enumerate() {
         if head.head[p] == NO_HASH {
@@ -2407,6 +2447,26 @@ pub(crate) fn run_gates(
         let Some(full_hash) = full_hash else {
             continue; // killed later in the chain, or the full read failed
         };
+        // The liveness gate itself: an unopened member proves presence
+        // with ONE stat (the same `attributes` primitive the gates'
+        // pre-open checks use). A dead row or a cloud placeholder drops
+        // (both count as `vanished` — skipped, not grouped); a run
+        // falling below 2 members dissolves through the >= 2 check
+        // below, exactly like the display's dissolve semantics.
+        if !opened_full.contains(&id) {
+            let alive = cands
+                .index_path(slot as usize, &dirs)
+                .and_then(|index_path| resolve_absolute_path(roots, &index_path))
+                .is_some_and(|path| {
+                    reader
+                        .attributes(&path)
+                        .is_some_and(|attrs| !crate::scanner::is_placeholder_attr(attrs))
+                });
+            if !alive {
+                vanished += 1;
+                continue;
+            }
+        }
         rows.push((cands.sizes[slot as usize], full_hash, id));
     }
     rows.sort_unstable();
@@ -2431,11 +2491,12 @@ pub(crate) fn run_gates(
     outcome.groups = groups;
 
     // ---- Outcome: the four gates' counters summed, this run's hash
-    // counts folded in. ----
+    // counts folded in, the liveness gate's drops tallied. ----
     let mut counters = size_counters;
     counters.accumulate(&head.counters);
     counters.accumulate(&sample.counters);
     counters.accumulate(&full.counters);
+    counters.vanished = vanished;
     outcome.counters = counters;
     outcome.hashed_first = head.hashed_first;
     outcome.hashed_full = sample.hashed_full_small + full.hashed_full;
@@ -2462,12 +2523,14 @@ mod tests {
 
     /// Fake reader: reports configured placeholder paths (and stat-missing
     /// paths) through `attributes`, fails configured paths' `open` with a
-    /// sharing violation, logs every `open` call.
+    /// sharing violation, logs every `open` call and every `attributes`
+    /// call (the liveness gate's stat evidence).
     struct FakeReader {
         placeholders: Vec<PathBuf>,
         missing: Vec<PathBuf>,
         locked: Vec<PathBuf>,
         opened: StdMutex<Vec<PathBuf>>,
+        attr_calls: StdMutex<Vec<PathBuf>>,
     }
 
     impl FakeReader {
@@ -2477,12 +2540,14 @@ mod tests {
                 missing: Vec::new(),
                 locked: Vec::new(),
                 opened: StdMutex::new(Vec::new()),
+                attr_calls: StdMutex::new(Vec::new()),
             }
         }
     }
 
     impl FileReader for FakeReader {
         fn attributes(&self, path: &Path) -> Option<u32> {
+            self.attr_calls.lock().unwrap().push(path.to_path_buf());
             if self.missing.iter().any(|p| p == path) {
                 return None;
             }
@@ -4879,6 +4944,195 @@ mod tests {
         assert_eq!(outcome.groups[0].hash, xxh64(content, 0));
         assert_eq!(outcome.hashed_full, 0, "no full-stage computation at all");
         assert_eq!(outcome.hashed_first, 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Ruling 10 (Task 12 fix round 1): the final grouping's liveness
+    // gate. Invariant: every group member was either OPENED this run or
+    // STAT-VERIFIED PRESENT this run — a member whose full hash arrived
+    // without an open (SoA-persisted `hash_full`, gate②'s ≤4KiB
+    // reuse-terminal) must not ghost-group after its file left the disk.
+
+    /// (a) Two identical ≤4KiB rows with persisted probe+full hashes
+    /// whose files are GONE from the disk: the liveness gate drops both
+    /// members (`vanished == 2`), the ghost pair dissolves, and nothing
+    /// was opened (head reuse is a no-open path).
+    #[test]
+    fn gates_persisted_twin_deleted_from_disk_vanishes_not_groups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        let (_tstore, store) = test_store();
+        let ghost_hash = 0xAA11u64;
+        upsert_row_at(
+            &store,
+            &["fixture"],
+            "a.bin",
+            5,
+            NOW - 10_000,
+            Some(ghost_hash),
+            Some(ghost_hash),
+        );
+        upsert_row_at(
+            &store,
+            &["fixture"],
+            "b.bin",
+            5,
+            NOW - 10_000,
+            Some(ghost_hash),
+            Some(ghost_hash),
+        );
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+
+        let mut reader = FakeReader::new();
+        reader.missing = vec![root.join("a.bin"), root.join("b.bin")];
+        let (outcome, _log) = gates_run(&store, &roots, &reader, &cancel);
+
+        assert!(
+            outcome.groups.is_empty(),
+            "ghost twins must not group: {:?}",
+            outcome.groups
+        );
+        assert_eq!(outcome.counters.vanished, 2, "both members vanished");
+        assert!(
+            reader.opened.lock().unwrap().is_empty(),
+            "head reuse opens nothing"
+        );
+    }
+
+    /// (b) Same fixture with both files PRESENT: the pair groups intact
+    /// from the persisted hashes with zero opens, and the liveness gate
+    /// stat-verified both members (exactly two `attributes` calls) —
+    /// the price of ghost-free groups on a warm re-run.
+    #[test]
+    fn gates_persisted_twin_present_groups_with_stat_verification_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        let (_tstore, store) = test_store();
+        let ghost_hash = 0xAA22u64;
+        fs::create_dir_all(&root).unwrap();
+        for name in ["a.bin", "b.bin"] {
+            fs::write(root.join(name), b"tiny twin bytes").unwrap();
+            upsert_row_at(
+                &store,
+                &["fixture"],
+                name,
+                5,
+                NOW - 10_000,
+                Some(ghost_hash),
+                Some(ghost_hash),
+            );
+        }
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+
+        let reader = FakeReader::new();
+        let (outcome, _log) = gates_run(&store, &roots, &reader, &cancel);
+
+        assert_eq!(outcome.groups.len(), 1, "the pair groups intact");
+        assert_eq!(outcome.groups[0].size, 5);
+        assert_eq!(outcome.groups[0].hash, ghost_hash);
+        assert_eq!(outcome.groups[0].members.len(), 2);
+        assert_eq!(outcome.counters.vanished, 0);
+        assert!(
+            reader.opened.lock().unwrap().is_empty(),
+            "persisted hashes: zero opens"
+        );
+        let mut stats = reader.attr_calls.lock().unwrap().clone();
+        stats.sort();
+        assert_eq!(
+            stats,
+            vec![root.join("a.bin"), root.join("b.bin")],
+            "both unopened members stat-verified, nothing else touched"
+        );
+    }
+
+    /// (c) One twin of a persisted pair stats as a cloud placeholder:
+    /// the reuse member is dropped by the liveness gate (placeholders
+    /// never group), the pair dissolves, and the drop counts as
+    /// `vanished` — not gate②'s placeholder skip (nothing opened it).
+    #[test]
+    fn gates_persisted_placeholder_member_dropped_at_liveness_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        let (_tstore, store) = test_store();
+        let ghost_hash = 0xAA33u64;
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.bin"), b"tiny twin bytes").unwrap();
+        upsert_row_at(
+            &store,
+            &["fixture"],
+            "a.bin",
+            5,
+            NOW - 10_000,
+            Some(ghost_hash),
+            Some(ghost_hash),
+        );
+        upsert_row_at(
+            &store,
+            &["fixture"],
+            "b.bin",
+            5,
+            NOW - 10_000,
+            Some(ghost_hash),
+            Some(ghost_hash),
+        );
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+
+        let mut reader = FakeReader::new();
+        reader.placeholders = vec![root.join("b.bin")];
+        let (outcome, _log) = gates_run(&store, &roots, &reader, &cancel);
+
+        assert!(
+            outcome.groups.is_empty(),
+            "one surviving member dissolves: {:?}",
+            outcome.groups
+        );
+        assert_eq!(outcome.counters.vanished, 1, "only the placeholder twin");
+        assert_eq!(
+            outcome.counters.placeholders, 0,
+            "the drop is the liveness gate's, not gate②'s skip (nothing opened it)"
+        );
+        assert!(reader.opened.lock().unwrap().is_empty());
+    }
+
+    /// (d) A member the pipeline OPENED this run (fresh gate④ fulls) is
+    /// never stat-ed again — the liveness gate touches disk only for
+    /// members whose full hash arrived without an open.
+    #[test]
+    fn gates_freshly_read_members_never_statted_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        let content = vec![b'e'; SAMPLE_BIG]; // > 64KB: probe + sample + full
+        let (_tstore, store) = test_store();
+        gates_fixture(&store, &root, "d1", "a.bin", &content);
+        gates_fixture(&store, &root, "d2", "b.bin", &content);
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+
+        let reader = FakeReader::new();
+        let (outcome, _log) = gates_run(&store, &roots, &reader, &cancel);
+
+        assert_eq!(outcome.groups.len(), 1, "the pair groups as before");
+        assert_eq!(outcome.groups[0].members.len(), 2);
+        assert_eq!(outcome.counters.vanished, 0);
+        assert!(
+            !reader.opened.lock().unwrap().is_empty(),
+            "the members were opened this run"
+        );
+        // Each member is statted exactly three times — gate②'s, gate③'s
+        // and gate④'s own pre-open placeholder checks — and the liveness
+        // gate adds NOTHING for a member it knows was opened this run.
+        let mut per_path: HashMap<PathBuf, usize> = HashMap::new();
+        for path in reader.attr_calls.lock().unwrap().iter() {
+            *per_path.entry(path.clone()).or_default() += 1;
+        }
+        assert_eq!(per_path.len(), 2);
+        assert!(
+            per_path.values().all(|&count| count == 3),
+            "probe + sample + full pre-open stats only, no liveness re-stat: {per_path:?}"
+        );
     }
 
     /// THE AT-SCALE flush-boundary test: 130 identical 32KB files all
