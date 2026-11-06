@@ -301,12 +301,14 @@ pub fn dedup_state(state: State<'_, AppState>) -> DedupState {
 /// One page `[offset, offset + limit)` of the last completed run's dupe
 /// groups, size-descending, members materialized as search-style hits.
 /// Files deleted since the run drop out; a group below two surviving
-/// members dissolves.
+/// members dissolves. (The engine now returns a `DedupPage` with a
+/// `total_alive` full count; Task 11's frontend work surfaces it — until
+/// then the IPC shape stays the plain page of groups.)
 // Sync is safe: an Arc snapshot of the stored groups plus a hot-index
 // read lock — the store mutex is never taken (v1.1 audit).
 #[tauri::command]
 pub fn dedup_groups(state: State<'_, AppState>, offset: u32, limit: u32) -> Vec<DupeGroup> {
-    state.engine.dedup_groups(offset, limit)
+    state.engine.dedup_groups(offset, limit).groups
 }
 
 /// Moves the entries behind `ids` to the OS recycle bin — the engine's

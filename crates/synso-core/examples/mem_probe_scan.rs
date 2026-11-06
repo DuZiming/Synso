@@ -177,10 +177,10 @@ fn dump(db: &str, out: Option<String>) {
     let mut offset = 0u32;
     loop {
         let page = engine.dedup_groups(offset, PAGE);
-        if page.is_empty() {
+        if page.groups.is_empty() {
             break;
         }
-        for group in &page {
+        for group in &page.groups {
             if dumped > 0 {
                 writeln!(&mut writer).expect("write blank separator");
             }
@@ -194,8 +194,8 @@ fn dump(db: &str, out: Option<String>) {
             }
             dumped += 1;
         }
-        offset += page.len() as u32;
-        if page.len() < PAGE as usize {
+        offset += page.groups.len() as u32;
+        if page.groups.len() < PAGE as usize {
             break;
         }
     }
@@ -233,11 +233,11 @@ fn selftest() {
     let mut offset = 0u32;
     loop {
         let page = engine.dedup_groups(offset, PAGE);
-        if page.is_empty() {
+        if page.groups.is_empty() {
             break;
         }
-        let got = page.len();
-        groups.extend(page);
+        let got = page.groups.len();
+        groups.extend(page.groups);
         offset += got as u32;
         if got < PAGE as usize {
             break;
@@ -293,12 +293,24 @@ fn fixture_base() -> PathBuf {
 /// The fixture: `a/x.txt` + `b/x.txt` share 10 identical bytes (one
 /// expected group of two members at size 10), `a/y.bin` carries a size no
 /// other fixture file has (the size-class gate must keep it ungrouped).
+/// Every file is backdated past the pipeline's mtime grace window
+/// (`crate::dedup` skips "fresh" candidates WITHOUT opening them — a
+/// just-written fixture would be skipped wholesale and group nothing;
+/// same settle trick engine.rs's tests apply).
 fn write_fixture(base: &Path) {
     fs::create_dir_all(base.join("a")).expect("mkdir a");
     fs::create_dir_all(base.join("b")).expect("mkdir b");
     fs::write(base.join("a/x.txt"), b"0123456789").expect("write a/x.txt");
     fs::write(base.join("b/x.txt"), b"0123456789").expect("write b/x.txt");
     fs::write(base.join("a/y.bin"), vec![b'y'; 13]).expect("write a/y.bin");
+    for name in ["a/x.txt", "b/x.txt", "a/y.bin"] {
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(base.join(name))
+            .expect("open fixture for backdate");
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+            .expect("backdate fixture mtime");
+    }
 }
 
 /// Waits for the fixture scan's `ScanFinished`; a `ScanFailed` or a stalled
