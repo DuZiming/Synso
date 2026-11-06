@@ -10,9 +10,15 @@
 
 use std::time::{Duration, Instant};
 
+// The rdev-backed hook is WINDOWS-ONLY (see [`spawn`]'s doc): the import
+// and everything that touches rdev types sit behind the same cfg so the
+// crate builds without the dependency on other platforms. The `DoubleTap`
+// state machine above stays platform-independent.
+#[cfg(windows)]
 use rdev::{Event, EventType, Key};
+#[cfg(windows)]
 use tauri::Manager;
-
+#[cfg(windows)]
 use crate::quick;
 
 /// Two Ctrl presses inside this window count as a double tap.
