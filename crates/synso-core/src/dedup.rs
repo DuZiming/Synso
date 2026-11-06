@@ -2646,6 +2646,17 @@ pub(crate) fn run_gates(
         &cands, &dirs, &input, &head, roots, reader, workers, cancel, now, &sample_progress,
         store,
     );
+    // The gate③ terminal-small merge map: built BEFORE flushing, because
+    // flush_persist DRAINS the vec (`pending.clear()`) — these fulls are
+    // the only record of the ≤64KB terminal reads (no side array carries
+    // them) and must reach gate④'s `known` slice (so those files are
+    // never re-opened) and the final grouping.
+    let mut small_full: HashMap<FileId, u64> = HashMap::new();
+    for update in &sample.pending {
+        if let Some(hash) = update.hash_full {
+            small_full.insert(update.id, hash);
+        }
+    }
     flush_persist(store, &mut sample.pending);
     if sample.cancelled {
         outcome.counters = size_counters;
@@ -2664,16 +2675,11 @@ pub(crate) fn run_gates(
     // ---- gate④: full-hash certification. Merge the fulls run_gates
     // already holds (see the doc comment's merge order) into a slice
     // parallel to full_todo — members with a known full skip the read
-    // (the incremental crowd), the rest get the streaming pass. ----
+    // (the incremental crowd and gate③'s terminal smalls, whose values
+    // live in `small_full` above), the rest get the streaming pass. ----
     let mut slot_pos = vec![usize::MAX; cands.ids.len()];
     for (p, &slot) in head.cand.iter().enumerate() {
         slot_pos[slot as usize] = p;
-    }
-    let mut small_full: HashMap<FileId, u64> = HashMap::new();
-    for update in &sample.pending {
-        if let Some(hash) = update.hash_full {
-            small_full.insert(update.id, hash);
-        }
     }
     let known: Vec<u64> = sample
         .full_todo
@@ -5283,6 +5289,53 @@ mod tests {
             assert_eq!(out.pending.len(), 5);
             assert_eq!(log.lock().unwrap().last(), Some(&(5, 5)));
         }
+    }
+
+    /// Two identical files in gate③'s TERMINAL-SMALL class (4KB < size
+    /// ≤ 64KB, e.g. ~32KB) group from the fulls gate③ computed and
+    /// queued in `SampleOutcome.pending` — and gate④ must NOT re-read
+    /// them. This pins the small_full merge ordering: run_gates must
+    /// build its merge map BEFORE flushing the pending residue (the
+    /// flush drains the vec), or the small-terminal source dies (gate④
+    /// re-opens every such file, `hashed_full` double-counts, and a
+    /// gate④ re-open failure would silently dissolve certified groups).
+    #[test]
+    fn gates_sample_small_terminal_group_without_gate4_rereads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        let content = vec![b't'; 32 * 1024]; // 4KB < 32KB ≤ 64KB
+        let (_tstore, store) = test_store();
+        gates_fixture(&store, &root, "d1", "a.bin", &content);
+        gates_fixture(&store, &root, "d2", "b.bin", &content);
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+
+        let reader = FakeReader::new();
+        let (outcome, log) = gates_run(&store, &roots, &reader, &cancel);
+
+        // EXACTLY four opens: gate②'s two probes, gate③'s two whole
+        // reads. Gate④ contributed ZERO — the small-terminal fulls
+        // reached the `known` slice, so no re-read pass.
+        assert_eq!(
+            *reader.opened.lock().unwrap(),
+            vec![
+                root.join("d1").join("a.bin"),
+                root.join("d2").join("b.bin"),
+                root.join("d1").join("a.bin"),
+                root.join("d2").join("b.bin"),
+            ],
+            "gate② probe + gate③ whole read per file; gate④ must not re-open"
+        );
+        // The group forms from the gate③-computed fulls.
+        assert_eq!(outcome.groups.len(), 1);
+        assert_eq!(outcome.groups[0].size, content.len() as u64);
+        assert_eq!(outcome.groups[0].hash, xxh64(&content, 0));
+        assert_eq!(outcome.groups[0].members.len(), 2);
+        // Each file's full hash counted EXACTLY once (gate③'s terminal
+        // path; gate④ re-reads would double it to 4).
+        assert_eq!(outcome.hashed_first, 2);
+        assert_eq!(outcome.hashed_full, 2);
+        assert_eq!(*log.last().unwrap(), (DedupPhase::Done, 4, 4));
     }
 
     /// Two identical ≤4KB files group from gate②'s TERMINAL values
