@@ -65,7 +65,7 @@ use std::sync::{mpsc, Mutex};
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 #[cfg(windows)]
-use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+use windows::Win32::Storage::FileSystem::{FILE_FLAG_SEQUENTIAL_SCAN, FILE_SHARE_READ};
 
 use xxhash_rust::xxh64::{xxh64, Xxh64};
 
@@ -135,7 +135,11 @@ pub(crate) struct StoredGroup {
 }
 
 /// Aggregate outcome of one pipeline run; the engine folds this into its
-/// [`DedupState`] and stores `groups`.
+/// [`DedupState`] and stores `groups`. Two writers share the struct:
+/// `run_pipeline` (the old path, until Task 7 deletes it) fills the
+/// legacy scalars, `run_gates` (the rewritten pipeline) fills `counters`
+/// and mirrors the scalars from it so engine.rs's single fold keeps
+/// working.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DedupOutcome {
     pub groups: Vec<StoredGroup>,
@@ -144,15 +148,28 @@ pub(crate) struct DedupOutcome {
     /// Full hashes computed by this run.
     pub hashed_full: u64,
     /// Files skipped because they could not be resolved, opened or read.
+    /// Legacy mirror: `run_pipeline` writes it directly, `run_gates`
+    /// copies it from [`DedupOutcome::counters`].
     pub errors: u64,
     /// Files skipped because another handle denied our open (a Windows
-    /// sharing violation, [`OpenSkip::Locked`]): nothing was read, and the
-    /// next run simply retries.
-    #[allow(dead_code)] // Task 4-7 wiring: gate counters + engine swap read it.
+    /// sharing violation, [`OpenSkip::Locked`]): nothing was read, and
+    /// the next run simply retries. Same legacy-mirror story as
+    /// `errors` — the counters own the real number.
     pub locked: u64,
     /// Files skipped because Windows reports them as cloud placeholders
     /// (never opened, so hashing never triggers a hydration download).
+    /// Same legacy-mirror story as `errors`.
     pub placeholders: u64,
+    /// Every counter the four gates produced (Task 6; `run_pipeline`
+    /// leaves it zeroed). The skip reasons live here separated
+    /// (`locked`/`fresh`/`placeholders`/`recycle`) and each gate's kill
+    /// tally (`size_gate`/`head_gate`/`sample_gate`) rides along.
+    pub counters: OutcomeCounters,
+    /// True when `cancel` fired and the run stopped at a checkpoint
+    /// (Task 6): every hash computed before the hit is persisted, but
+    /// the group list comes back EMPTY — the engine keeps serving the
+    /// last completed run's groups. `run_pipeline` never sets it.
+    pub cancelled: bool,
 }
 
 /// The disk-touching side of dedup, injected so tests can fake placeholder
@@ -165,6 +182,18 @@ pub(crate) trait FileReader: Sync {
     fn attributes(&self, path: &Path) -> Option<u32>;
     /// Opens the file for reading.
     fn open(&self, path: &Path) -> std::io::Result<std::fs::File>;
+    /// Opens for gate④'s WHOLE-FILE read: the same deny-write semantics
+    /// as [`FileReader::open`] plus — on Windows — the
+    /// `FILE_FLAG_SEQUENTIAL_SCAN` read-ahead hint. Gate④ is the only
+    /// stage that streams a file front to back in fixed steps, so the
+    /// prefetcher is pure win there; gate②'s 4KiB probe and gate③'s
+    /// seek-hopping window reads are NOT sequential and keep plain
+    /// `open`. The default just calls [`FileReader::open`] — test fakes
+    /// inherit it and never need the flag.
+    #[allow(dead_code)] // Task 7 wiring: the engine swap onto run_gates consumes it.
+    fn open_sequential(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        self.open(path)
+    }
 }
 
 /// Production reader: real `GetFileAttributesW` + a read-only open that
@@ -193,6 +222,23 @@ impl FileReader for RealFileReader {
         // No share modes off Windows (mac port): the plain read open
         // above — locked detection degenerates to "open failed", with
         // the mtime grace window ([`is_fresh`]) as the backstop.
+        opts.open(path)
+    }
+
+    /// Gate④'s variant (see [`FileReader::open_sequential`]): the same
+    /// deny-write share mode as `open` — the stability argument lives
+    /// there — plus the sequential-scan hint, so the OS prefetcher
+    /// reads ahead while gate④ streams its 64KB steps.
+    #[allow(dead_code)] // Task 7 wiring: the engine swap onto run_gates consumes it.
+    fn open_sequential(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        let mut opts = OpenOptions::new();
+        opts.read(true);
+        #[cfg(windows)]
+        {
+            opts.share_mode(FILE_SHARE_READ.0);
+            opts.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN.0);
+        }
+        // No share modes off Windows (mac port): see `open`.
         opts.open(path)
     }
 }
@@ -939,8 +985,7 @@ fn bad_u32_id(kind: &str, id: FileId) -> SynsoError {
 
 /// One gate's removal tally: `files` candidates left the grouping
 /// population at this gate and `bytes` is their snapshot-size total.
-#[derive(Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)] // Task 4-6 wiring: run_gates folds these into the outcome.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct GateKills {
     pub(crate) files: u64,
     pub(crate) bytes: u64,
@@ -950,8 +995,7 @@ pub(crate) struct GateKills {
 /// count what each gate REMOVED (files + bytes); the rest are gate②'s
 /// skip-reason matrix, kept separate for the engine's outcome folding
 /// and diagnostics.
-#[derive(Debug, Default, PartialEq, Eq)]
-#[allow(dead_code)] // Task 4-6 wiring: run_gates folds these into the outcome.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct OutcomeCounters {
     /// gate① kills: singleton sizes (no candidate can ever pair).
     pub(crate) size_gate: GateKills,
@@ -973,6 +1017,26 @@ pub(crate) struct OutcomeCounters {
     /// Recycle-bin subtree exclusions — checked for EVERY candidate up
     /// front, persisted-hash ones included.
     pub(crate) recycle: u64,
+}
+
+impl OutcomeCounters {
+    /// Folds `other` into `self`: every field is an additive run total,
+    /// and `run_gates` sums the four gates' tallies into the run
+    /// outcome.
+    #[allow(dead_code)] // Task 7 wiring: the engine swap onto run_gates consumes it.
+    pub(crate) fn accumulate(&mut self, other: &OutcomeCounters) {
+        self.size_gate.files += other.size_gate.files;
+        self.size_gate.bytes += other.size_gate.bytes;
+        self.head_gate.files += other.head_gate.files;
+        self.head_gate.bytes += other.head_gate.bytes;
+        self.sample_gate.files += other.sample_gate.files;
+        self.sample_gate.bytes += other.sample_gate.bytes;
+        self.errors += other.errors;
+        self.locked += other.locked;
+        self.fresh += other.fresh;
+        self.placeholders += other.placeholders;
+        self.recycle += other.recycle;
+    }
 }
 
 /// gate②'s result. THE PARALLEL CONTRACT (Ruling 1): `head`, `full` and
@@ -2058,6 +2122,681 @@ fn merge_sample_worker(
     out.pending.extend(worker.pending);
     out.hashed_full_small += worker.hashed_full_small;
     *done += worker.done;
+}
+
+/// The regroup between gate② and gate③ — the input [`gate_sample`]
+/// documents, and run_gates (Task 6) owns: gate②'s triplet re-sorted by
+/// `(size, head)` (sizes ascending), `head == NO_HASH` members (gate②
+/// skips) dropped, and only the contiguous `(size, head)` runs of two
+/// or more members kept, flattened in run order. This exact shape used
+/// to live only as the gate③ tests' helper; it IS the production path.
+fn sample_input(c: &Candidates, head: &HeadOutcome) -> Vec<u32> {
+    let mut order: Vec<usize> = (0..head.cand.len())
+        .filter(|&p| head.head[p] != NO_HASH)
+        .collect();
+    order.sort_by_key(|&p| (c.sizes[head.cand[p] as usize], head.head[p]));
+    let mut out = Vec::new();
+    let key = |&p: &usize| (c.sizes[head.cand[p] as usize], head.head[p]);
+    let mut run = 0usize;
+    for w in 1..=order.len() {
+        if w < order.len() && key(&order[w]) == key(&order[run]) {
+            continue;
+        }
+        if w - run >= 2 {
+            out.extend(order[run..w].iter().map(|&p| head.cand[p]));
+        }
+        run = w;
+    }
+    out
+}
+
+// ---------------------------------------------------------------------
+// Gate ④ (pipeline rewrite, Task 6): full-hash certification of gate③'s
+// `full_todo`, and `run_gates` — the assembly chaining gates ①→②→③→④
+// into the complete pipeline the engine swaps onto (Task 7).
+
+/// gate④'s result — the gate②/③ result shape: the full hashes THIS gate
+/// computed (parallel to the `cand` slice it was handed), the gate's
+/// counters, its pending updates, its cancel flag.
+///
+/// * `full[k]` — whole-file xxh64 of `cand[k]`, [`NO_HASH`] when not
+///   obtained (skip, or a file a cancel left unprocessed). Fulls the
+///   caller already knew before gate④ (the `known` slice) are NOT
+///   echoed here — the caller holds them already.
+/// * `pending` — computed [`HashUpdate`]s not yet persisted
+///   (`hash_first: None`: gate② already persisted or queued the first
+///   hash; the store's COALESCE write leaves the column untouched).
+///   Chunk boundaries flush at [`PERSIST_BATCH`]; a CANCELLED gate has
+///   flushed before returning.
+/// * `hashed_full` — full hashes computed by this gate (the known-full
+///   reuses are not counted).
+/// * `cancelled` — true when `cancel` fired and gate④ stopped.
+#[derive(Default)]
+#[allow(dead_code)] // Task 7 wiring: the engine swap onto run_gates consumes it.
+struct FullOutcome {
+    full: Vec<u64>,
+    counters: OutcomeCounters,
+    pending: Vec<HashUpdate>,
+    hashed_full: u64,
+    cancelled: bool,
+}
+
+/// One gate④ worker's PRIVATE chunk state (the gate②/③ worker shape):
+/// hits indexed by CHUNK-LOCAL position, pending updates, skip-reason
+/// counters, done. No kill tally: [`OutcomeCounters`] has no gate④ kill
+/// field — a full-certification skip is a skip reason only, and the
+/// file simply stays out of the final grouping.
+#[derive(Default)]
+#[allow(dead_code)] // Task 7 wiring: the engine swap onto run_gates consumes it.
+struct FullWorker {
+    /// `(chunk-local position, hash)` for files whose full read
+    /// completed.
+    hits: Vec<(usize, u64)>,
+    pending: Vec<HashUpdate>,
+    hashed_full: u64,
+    errors: u64,
+    locked: u64,
+    fresh: u64,
+    placeholders: u64,
+    done: u64,
+}
+
+impl FullWorker {
+    /// Records one skipped file (the reason counter) and advances
+    /// `done`. No kill tally: gate④ has no `*_gate` counter — the file
+    /// just stays out of the final grouping. The [`Skip::Recycle`] arm
+    /// is unreachable — gate④ never checks the recycle bit (gate②
+    /// excluded those candidates before anything else, and every
+    /// full_todo member passed it).
+    fn skipped(&mut self, skip: Skip) {
+        match skip {
+            Skip::Error => self.errors += 1,
+            Skip::Locked => self.locked += 1,
+            Skip::Fresh => self.fresh += 1,
+            Skip::Placeholder => self.placeholders += 1,
+            Skip::Recycle => {}
+        }
+        self.done += 1;
+    }
+}
+
+/// The per-file gate④ step: the full open matrix (resolve → placeholder
+/// attributes → mtime grace → open → read) applied uniformly — most
+/// full_todo members were never opened this run (certified members
+/// never are), and state can change between gates. NO recycle step (see
+/// [`FullWorker::skipped`]). The open carries
+/// [`FileReader::open_sequential`] (deny-write + the Windows
+/// sequential-scan hint). The read streams [`READ_BUFFER`] steps and
+/// CANCEL IS CHECKED AT EVERY STEP — the design's sub-second cancel for
+/// giant files. A cancelled step abandons the file: a partial hash is
+/// not the file's full hash and must never be persisted or grouped
+/// (the worker loop's next boundary check stops the pull).
+#[allow(clippy::too_many_arguments)]
+fn gate_full_step(
+    worker: &mut FullWorker,
+    k: usize,
+    slot: usize,
+    c: &Candidates,
+    dirs: &Dirs,
+    roots: &[String],
+    reader: &dyn FileReader,
+    cancel: &AtomicBool,
+    now: i64,
+) {
+    let size = c.sizes[slot];
+
+    // 1. Resolve the absolute disk path.
+    let Some(path) = c
+        .index_path(slot, dirs)
+        .and_then(|index_path| resolve_absolute_path(roots, &index_path))
+    else {
+        worker.skipped(Skip::Error);
+        return;
+    };
+
+    // 2. Cloud placeholder — before the open (never touched).
+    match reader.attributes(&path) {
+        None => {
+            // Unstatable (vanished/unreadable): an error, not a
+            // placeholder — the old pipeline's precedent.
+            worker.skipped(Skip::Error);
+            return;
+        }
+        Some(attrs) if crate::scanner::is_placeholder_attr(attrs) => {
+            worker.skipped(Skip::Placeholder);
+            return;
+        }
+        Some(_) => {}
+    }
+
+    // 3. mtime grace — may still be mid-write.
+    if is_fresh(c.mtimes[slot], now) {
+        worker.skipped(Skip::Fresh);
+        return;
+    }
+
+    // 4. Open (deny-write + sequential-scan hint on Windows).
+    let mut file = match reader.open_sequential(&path) {
+        Ok(file) => file,
+        Err(err) => {
+            worker.skipped(match classify_open_err(&err) {
+                OpenSkip::Locked => Skip::Locked,
+                OpenSkip::Error => Skip::Error,
+            });
+            return;
+        }
+    };
+
+    // 5. Streaming whole read — cancel at every buffer step.
+    let mut hasher = Xxh64::new(0);
+    let mut buffer = vec![0u8; READ_BUFFER];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            // Abandoned mid-file: no hash, no update, no `done` — the
+            // run reports `cancelled` and keeps the group list empty.
+            return;
+        }
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buffer[..n]),
+            Err(_) => {
+                worker.skipped(Skip::Error);
+                return;
+            }
+        }
+    }
+    let hash = hasher.digest();
+    worker.hashed_full += 1;
+    worker.hits.push((k, hash));
+    worker.pending.push(HashUpdate {
+        id: FileId::from(c.ids[slot]),
+        mtime: c.mtimes[slot],
+        size,
+        hash_first: None,
+        hash_full: Some(hash),
+    });
+    worker.done += 1;
+}
+
+/// The worker loop over one gate④ chunk (the gate②/③ loop): an atomic
+/// cursor hands out CHUNK-LOCAL positions; cancel is checked at every
+/// file boundary AND inside each read ([`gate_full_step`]). Members with
+/// an already-known full (`known_chunk[j] != NO_HASH`) advance `done`
+/// without any I/O — the incremental crowd pays nothing, exactly like
+/// gate②'s persisted-hash reuses.
+#[allow(clippy::too_many_arguments)]
+fn gate_full_chunk(
+    worker: &mut FullWorker,
+    cand_chunk: &[u32],
+    known_chunk: &[u64],
+    c: &Candidates,
+    dirs: &Dirs,
+    roots: &[String],
+    reader: &dyn FileReader,
+    cancel: &AtomicBool,
+    now: i64,
+    next: &AtomicUsize,
+) {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let k = next.fetch_add(1, Ordering::Relaxed);
+        if k >= cand_chunk.len() {
+            return;
+        }
+        if known_chunk[k] != NO_HASH {
+            worker.done += 1; // known full: no open, progress advances
+            continue;
+        }
+        gate_full_step(
+            worker, k, cand_chunk[k] as usize, c, dirs, roots, reader, cancel, now,
+        );
+    }
+}
+
+/// [`gate_full`]'s body with the chunk size injected — the test seam
+/// (mirrors [`gate_head_chunked`]/[`gate_sample_chunked`]). `cand` is
+/// gate③'s `full_todo` IN ITS OWN ORDER (the `(size, head)` run order —
+/// sizes ascending), consumed as-is; `known` is parallel to it with the
+/// full hashes the caller already holds.
+#[allow(clippy::too_many_arguments)]
+fn gate_full_chunked(
+    c: &Candidates,
+    dirs: &Dirs,
+    cand: &[u32],
+    known: &[u64],
+    roots: &[String],
+    reader: &dyn FileReader,
+    workers: usize,
+    cancel: &AtomicBool,
+    now: i64,
+    progress: &dyn Fn(u64, u64),
+    store: &Mutex<Store>,
+    chunk_size: usize,
+) -> FullOutcome {
+    debug_assert_eq!(cand.len(), known.len(), "the known slice rides parallel to cand");
+    let total = cand.len() as u64;
+    let mut out = FullOutcome {
+        full: vec![NO_HASH; cand.len()],
+        ..FullOutcome::default()
+    };
+    let mut done: u64 = 0;
+    let mut tick: u64 = 0;
+
+    let mut pos = 0usize;
+    while pos < cand.len() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let end = (pos + chunk_size).min(cand.len());
+        let next = AtomicUsize::new(0);
+        // A `move` closure captures this reference by value (the
+        // cursor itself must stay shared, not moved into one worker).
+        let cursor: &AtomicUsize = &next;
+
+        let (tx, rx) = mpsc::channel::<FullWorker>();
+        if workers <= 1 {
+            let mut worker = FullWorker::default();
+            gate_full_chunk(
+                &mut worker,
+                &cand[pos..end],
+                &known[pos..end],
+                c, dirs, roots, reader, cancel, now, cursor,
+            );
+            let _ = tx.send(worker);
+        } else {
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    let tx = tx.clone();
+                    scope.spawn(move || {
+                        let mut worker = FullWorker::default();
+                        gate_full_chunk(
+                            &mut worker,
+                            &cand[pos..end],
+                            &known[pos..end],
+                            c, dirs, roots, reader, cancel, now, cursor,
+                        );
+                        let _ = tx.send(worker);
+                    });
+                }
+            });
+        }
+        drop(tx); // scope has joined; the channel drains and closes
+        while let Ok(worker) = rx.recv() {
+            // `pos` is this chunk's base in the global full_todo order —
+            // the workers deal chunk-local positions, the result arrays
+            // are global (the gate② scatter rule).
+            merge_full_worker(&mut out, &mut done, pos, worker);
+        }
+
+        // Chunk boundary: batched persist (one short lock per flush)
+        // and progress ticks.
+        if out.pending.len() >= PERSIST_BATCH {
+            flush_persist(store, &mut out.pending);
+        }
+        let crossed = done / PROGRESS_EVERY;
+        if crossed > tick {
+            flush_persist(store, &mut out.pending);
+            progress(done, total);
+            tick = crossed;
+        }
+        pos = end;
+    }
+
+    // Cancel may have fired mid-read (per buffer step) or between
+    // files — flag it and flush the in-flight batch: hashes already
+    // computed land even on a cancelled run. A clean end leaves the
+    // last (sub-batch) residue in `pending` for the caller.
+    if cancel.load(Ordering::Relaxed) {
+        out.cancelled = true;
+        flush_persist(store, &mut out.pending);
+    }
+    progress(done, total);
+    out
+}
+
+/// gate④ — full-hash certification of gate③'s `full_todo` (the plan's
+/// "仅闸③幸存者"): 64KB streaming xxh64 with the cancel checkpoint at
+/// EVERY buffer step, workers/chunks/persist/progress mirroring gate②
+/// ([`CHUNK`] chunks, an atomic cursor per chunk, worker-private state
+/// merged at boundaries, [`PERSIST_BATCH`] flushes, [`PROGRESS_EVERY`]
+/// ticks, `workers <= 1` inline). Progress total is EVERY member handed
+/// in — members whose full is already known (the `known` slice,
+/// run_gates' merge of the persisted/gate②/gate③ values) advance `done`
+/// without I/O, so incremental runs report a full pass at zero opens.
+#[allow(dead_code)] // Task 7 wiring: the engine swap onto run_gates consumes it.
+#[allow(clippy::too_many_arguments)] // the gate's context, passed through.
+fn gate_full(
+    c: &Candidates,
+    dirs: &Dirs,
+    cand: &[u32],
+    known: &[u64],
+    roots: &[String],
+    reader: &dyn FileReader,
+    workers: usize,
+    cancel: &AtomicBool,
+    now: i64,
+    progress: &dyn Fn(u64, u64),
+    store: &Mutex<Store>,
+) -> FullOutcome {
+    gate_full_chunked(
+        c, dirs, cand, known, roots, reader, workers, cancel, now, progress, store, CHUNK,
+    )
+}
+
+/// Folds one gate④ worker's chunk results into the shared outcome: hits
+/// scatter into the parallel array at `base + k` (`k` is the CHUNK-
+/// local position the cursor dealt, `base` the chunk's start — positions
+/// are disjoint across workers), pending joins the batch, counters and
+/// `done` accumulate.
+fn merge_full_worker(out: &mut FullOutcome, done: &mut u64, base: usize, worker: FullWorker) {
+    for (k, hash) in worker.hits {
+        out.full[base + k] = hash;
+    }
+    out.pending.extend(worker.pending);
+    out.hashed_full += worker.hashed_full;
+    let counters = &mut out.counters;
+    counters.errors += worker.errors;
+    counters.locked += worker.locked;
+    counters.fresh += worker.fresh;
+    counters.placeholders += worker.placeholders;
+    *done += worker.done;
+}
+
+/// Folds the run's hash counts into the outcome, mirrors the legacy
+/// scalar skips (engine.rs reads them until Task 7 swaps the engine),
+/// marks the run cancelled and reports [`DedupPhase::Cancelled`] as the
+/// FINAL progress report (no `Done`; groups stay empty — the engine
+/// keeps serving the last completed run's list).
+fn finish_cancelled(
+    outcome: &mut DedupOutcome,
+    hashed_first: u64,
+    hashed_full: u64,
+    last: (u64, u64),
+    progress: &dyn Fn(DedupPhase, u64, u64),
+) {
+    outcome.hashed_first = hashed_first;
+    outcome.hashed_full = hashed_full;
+    outcome.errors = outcome.counters.errors;
+    outcome.locked = outcome.counters.locked;
+    outcome.placeholders = outcome.counters.placeholders;
+    outcome.cancelled = true;
+    progress(DedupPhase::Cancelled, last.0, last.1);
+}
+
+/// The rewritten pipeline (Task 6): gates ①→②→③→④ chained over the
+/// streamed [`Candidates`] snapshot — what Task 7 swaps the engine off
+/// [`run_pipeline`] onto. The store is locked only for the candidate
+/// load and short persist batches (hashing never holds it); disk access
+/// goes through `reader`; `workers` sizes the gates' worker pools
+/// (`<= 1` runs inline); `now` injects the clock (the mtime grace);
+/// `cancel` stops the run at any gate's file boundary and, in gate④,
+/// at every 64KB read step.
+///
+/// Phases & totals (the engine's progress events):
+/// * [`DedupPhase::Grouping`] — gate①, total = every loaded candidate;
+/// * [`DedupPhase::HashingFirst`] — gate②, total = every size-gate
+///   survivor (persisted-hash reuses included);
+/// * [`DedupPhase::Sampling`] — gate③, total = the participants that
+///   actually work (terminal-small + sampled; certified and
+///   short-circuited members are free) — only gate③ knows that count,
+///   so run_gates' phase-start marker for this gate reads `(0, 0)`;
+/// * [`DedupPhase::HashingFull`] — gate④, total = every full_todo
+///   member (known-full reuses advance `done` too);
+/// * [`DedupPhase::Done`] — done = total = first + full hashes computed
+///   THIS run (0 = fully incremental).
+///
+/// FULL-MERGE SEMANTICS (for the Task 7 implementer): a candidate's
+/// authoritative full hash for the final grouping is the FIRST hit of —
+/// gate④'s freshly computed value, then gate③'s terminal-small value
+/// (computed this run; found in `SampleOutcome::pending`'s updates),
+/// then gate②'s [`HeadOutcome::full`] (the ≤4KiB terminal or the
+/// persisted-full passthrough), then the SoA `hash_full` column
+/// (persisted) — the sources agree wherever they overlap. The grouping
+/// POPULATION is gate②'s survivors only (`head != NO_HASH`): files
+/// killed or skipped at any gate stay out even when a stale persisted
+/// full exists (a recycle-bin row must never group). Known-full members
+/// are grouped by `(size, full)` contiguous runs >= 2 into
+/// [`StoredGroup`]s — members id-ascending, groups size-descending /
+/// hash-ascending, byte-for-byte the old pipeline's order (the Task 12
+/// 对拍 baseline).
+///
+/// Cancel: a hit at ANY checkpoint (gate④'s per-buffer-step checks
+/// included) ends the run right there — each gate flushes its own
+/// pending on cancel and run_gates flushes each completed gate's
+/// residue, so every computed hash is persisted; `cancelled` is
+/// reported, the group list comes back EMPTY, and the final progress
+/// report carries [`DedupPhase::Cancelled`] (no `Done`).
+///
+/// Errors are never fatal: a candidate load failure (store error, a
+/// files-row id past `u32::MAX`) yields the trivial run — every phase
+/// reported at `(0, 0)`, empty groups, not cancelled.
+#[allow(dead_code)] // Task 7 wiring: the engine swap onto run_gates consumes it.
+#[allow(clippy::too_many_arguments)] // the plan's pinned signature.
+pub(crate) fn run_gates(
+    store: &Mutex<Store>,
+    roots: &[String],
+    reader: &dyn FileReader,
+    workers: usize,
+    cancel: &AtomicBool,
+    now: i64,
+    progress: &dyn Fn(DedupPhase, u64, u64),
+) -> DedupOutcome {
+    let mut outcome = DedupOutcome::default();
+    let Some((cands, dirs)) = load_candidates(store) else {
+        // Trivial run (mirrors the old load_snapshot semantics): the
+        // phase walk still happens, so subscribers see a complete cycle.
+        progress(DedupPhase::Grouping, 0, 0);
+        progress(DedupPhase::HashingFirst, 0, 0);
+        progress(DedupPhase::Sampling, 0, 0);
+        progress(DedupPhase::HashingFull, 0, 0);
+        progress(DedupPhase::Done, 0, 0);
+        return outcome;
+    };
+
+    // The last (done, total) the gates reported — the Cancelled finish
+    // re-reports it under its own phase. Progress only ever fires from
+    // this orchestration thread (the gates tick at chunk boundaries,
+    // after their workers joined), so a plain Cell carries it.
+    let last = std::cell::Cell::new((0u64, 0u64));
+    let head_progress = |done: u64, total: u64| {
+        last.set((done, total));
+        progress(DedupPhase::HashingFirst, done, total);
+    };
+    let sample_progress = |done: u64, total: u64| {
+        last.set((done, total));
+        progress(DedupPhase::Sampling, done, total);
+    };
+    let full_progress = |done: u64, total: u64| {
+        last.set((done, total));
+        progress(DedupPhase::HashingFull, done, total);
+    };
+
+    let total_all = cands.ids.len() as u64;
+
+    // ---- gate①: the size gate (in-memory — a file can only pair with
+    // an equal-size one). ----
+    progress(DedupPhase::Grouping, 0, total_all);
+    let mut size_counters = OutcomeCounters::default();
+    let sized = gate_size(&cands, &mut size_counters);
+    progress(DedupPhase::Grouping, total_all, total_all);
+
+    // ---- gate②: the first-4KiB probe. Total counts EVERY survivor —
+    // skips AND reuses advance `done` (gate②'s UX contract). ----
+    progress(DedupPhase::HashingFirst, 0, sized.len() as u64);
+    let mut head = gate_head(
+        &cands, &dirs, &sized, roots, reader, workers, cancel, now, &head_progress, store,
+    );
+    // The gate flushed its own pending on cancel; a clean end left the
+    // sub-batch residue — either way persist it before anything else.
+    flush_persist(store, &mut head.pending);
+    if head.cancelled {
+        outcome.counters = size_counters;
+        outcome.counters.accumulate(&head.counters);
+        finish_cancelled(&mut outcome, head.hashed_first, 0, last.get(), progress);
+        return outcome;
+    }
+
+    // ---- gate③: the sampling layer over gate②'s `(size, head)` runs.
+    // run_gates owns the input assembly ([`sample_input`]). ----
+    progress(DedupPhase::Sampling, 0, 0); // marker; gate③ reports its own total
+    let input = sample_input(&cands, &head);
+    let mut sample = gate_sample(
+        &cands, &dirs, &input, &head, roots, reader, workers, cancel, now, &sample_progress,
+        store,
+    );
+    flush_persist(store, &mut sample.pending);
+    if sample.cancelled {
+        outcome.counters = size_counters;
+        outcome.counters.accumulate(&head.counters);
+        outcome.counters.accumulate(&sample.counters);
+        finish_cancelled(
+            &mut outcome,
+            head.hashed_first,
+            sample.hashed_full_small,
+            last.get(),
+            progress,
+        );
+        return outcome;
+    }
+
+    // ---- gate④: full-hash certification. Merge the fulls run_gates
+    // already holds (see the doc comment's merge order) into a slice
+    // parallel to full_todo — members with a known full skip the read
+    // (the incremental crowd), the rest get the streaming pass. ----
+    let mut slot_pos = vec![usize::MAX; cands.ids.len()];
+    for (p, &slot) in head.cand.iter().enumerate() {
+        slot_pos[slot as usize] = p;
+    }
+    let mut small_full: HashMap<FileId, u64> = HashMap::new();
+    for update in &sample.pending {
+        if let Some(hash) = update.hash_full {
+            small_full.insert(update.id, hash);
+        }
+    }
+    let known: Vec<u64> = sample
+        .full_todo
+        .iter()
+        .map(|&slot| {
+            let id = FileId::from(cands.ids[slot as usize]);
+            small_full
+                .get(&id)
+                .copied()
+                .or_else(|| {
+                    let h = head.full[slot_pos[slot as usize]];
+                    (h != NO_HASH).then_some(h)
+                })
+                .or_else(|| {
+                    let h = cands.hash_full[slot as usize];
+                    (h != NO_HASH).then_some(h)
+                })
+                .unwrap_or(NO_HASH)
+        })
+        .collect();
+
+    progress(DedupPhase::HashingFull, 0, sample.full_todo.len() as u64);
+    let mut full = gate_full(
+        &cands,
+        &dirs,
+        &sample.full_todo,
+        &known,
+        roots,
+        reader,
+        workers,
+        cancel,
+        now,
+        &full_progress,
+        store,
+    );
+    flush_persist(store, &mut full.pending);
+    if full.cancelled {
+        outcome.counters = size_counters;
+        outcome.counters.accumulate(&head.counters);
+        outcome.counters.accumulate(&sample.counters);
+        outcome.counters.accumulate(&full.counters);
+        finish_cancelled(
+            &mut outcome,
+            head.hashed_first,
+            sample.hashed_full_small + full.hashed_full,
+            last.get(),
+            progress,
+        );
+        return outcome;
+    }
+
+    // ---- Final grouping: gate② survivors with a known full (see the
+    // doc comment's FULL-MERGE SEMANTICS), run-grouped by (size, full).
+    // Rows carry (size, full, id) and sort as a tuple, so equal
+    // (size, full) runs are contiguous AND their members come out
+    // id-ascending. ----
+    let fresh_full: HashMap<u32, u64> = sample
+        .full_todo
+        .iter()
+        .zip(full.full.iter())
+        .filter(|(_, &hash)| hash != NO_HASH)
+        .map(|(&slot, &hash)| (slot, hash))
+        .collect();
+    let mut rows: Vec<(u64, u64, FileId)> = Vec::new();
+    for (p, &slot) in head.cand.iter().enumerate() {
+        if head.head[p] == NO_HASH {
+            continue; // a gate② kill/skip stays out, stale persisted full or not
+        }
+        let id = FileId::from(cands.ids[slot as usize]);
+        let full_hash = fresh_full
+            .get(&slot)
+            .copied()
+            .or_else(|| small_full.get(&id).copied())
+            .or({
+                let h = head.full[p];
+                (h != NO_HASH).then_some(h)
+            })
+            .or({
+                let h = cands.hash_full[slot as usize];
+                (h != NO_HASH).then_some(h)
+            });
+        let Some(full_hash) = full_hash else {
+            continue; // killed later in the chain, or the full read failed
+        };
+        rows.push((cands.sizes[slot as usize], full_hash, id));
+    }
+    rows.sort_unstable();
+    let mut groups: Vec<StoredGroup> = Vec::new();
+    let mut run = 0usize;
+    for w in 1..=rows.len() {
+        if w < rows.len() && (rows[w].0, rows[w].1) == (rows[run].0, rows[run].1) {
+            continue;
+        }
+        if w - run >= 2 {
+            groups.push(StoredGroup {
+                size: rows[run].0,
+                hash: rows[run].1,
+                members: rows[run..w].iter().map(|&(_, _, id)| id).collect(),
+            });
+        }
+        run = w;
+    }
+    // Size descending for the stable paging contract; hash ascending as
+    // the deterministic tie-break — the old pipeline's exact order.
+    groups.sort_unstable_by(|a, b| b.size.cmp(&a.size).then(a.hash.cmp(&b.hash)));
+    outcome.groups = groups;
+
+    // ---- Outcome: the four gates' counters summed, the legacy scalar
+    // mirrors folded from them (engine.rs reads those until Task 7). ----
+    let mut counters = size_counters;
+    counters.accumulate(&head.counters);
+    counters.accumulate(&sample.counters);
+    counters.accumulate(&full.counters);
+    outcome.counters = counters;
+    outcome.hashed_first = head.hashed_first;
+    outcome.hashed_full = sample.hashed_full_small + full.hashed_full;
+    outcome.errors = outcome.counters.errors;
+    outcome.locked = outcome.counters.locked;
+    outcome.placeholders = outcome.counters.placeholders;
+
+    let hashed = outcome.hashed_first + outcome.hashed_full;
+    progress(DedupPhase::Done, hashed, hashed);
+    outcome
 }
 
 #[cfg(test)]
@@ -3496,28 +4235,9 @@ mod tests {
             .position(|&s| cands.ids[s as usize] == id as u32)
     }
 
-    /// The Task-6 regroup between the gates: gate②'s triplet re-sorted
-    /// by `(size, head)`, runs ≥2, `head != NO_HASH` members only — the
-    /// exact input [`gate_sample`] documents.
-    fn sample_input(c: &Candidates, head: &HeadOutcome) -> Vec<u32> {
-        let mut order: Vec<usize> = (0..head.cand.len())
-            .filter(|&p| head.head[p] != NO_HASH)
-            .collect();
-        order.sort_by_key(|&p| (c.sizes[head.cand[p] as usize], head.head[p]));
-        let mut out = Vec::new();
-        let key = |&p: &usize| (c.sizes[head.cand[p] as usize], head.head[p]);
-        let mut run = 0usize;
-        for w in 1..=order.len() {
-            if w < order.len() && key(&order[w]) == key(&order[run]) {
-                continue;
-            }
-            if w - run >= 2 {
-                out.extend(order[run..w].iter().map(|&p| head.cand[p]));
-            }
-            run = w;
-        }
-        out
-    }
+    // `sample_input` — the Task-6 regroup between the gates — lives in
+    // the production code now (run_gates owns the assembly); the gate③
+    // tests call it from there.
 
     /// Runs gate② then the regroup then gate③ over one reader,
     /// workers=1, no cancel, silent progress — the tests' default chain.
@@ -4032,5 +4752,617 @@ mod tests {
         assert_eq!(row_a.hash_full, Some(xxh64(&content, 0)));
         let row_b = rows.iter().find(|r| r.id == b).unwrap();
         assert_eq!(row_b.hash_full, None, "the cancelled candidate persisted nothing");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 6: gate④ (full certification) + run_gates — the four-gate
+    // assembly the engine swaps onto. The fixtures run the WHOLE
+    // pipeline: 80KB same-content copies survive ①→②→③ into gate④'s
+    // full read and out into real groups.
+
+    /// A run_gates fixture file: writes `content` under
+    /// `<root>/<dir>/<name>` (`dir` may be empty for the root), upserts
+    /// the row with no persisted hashes and a settled mtime, returns the
+    /// row id.
+    fn gates_fixture(
+        store: &StdMutex<Store>,
+        root: &Path,
+        dir: &str,
+        name: &str,
+        content: &[u8],
+    ) -> FileId {
+        let full = if dir.is_empty() {
+            root.join(name)
+        } else {
+            root.join(dir).join(name)
+        };
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(&full, content).unwrap();
+        let mut segments = vec!["fixture"];
+        if !dir.is_empty() {
+            segments.push(dir);
+        }
+        let (id, _) = upsert_row_at(
+            store,
+            &segments,
+            name,
+            content.len() as u64,
+            NOW - 10_000,
+            None,
+            None,
+        );
+        id
+    }
+
+    /// A phase-tagged progress collector for the run_gates tests.
+    fn gates_progress_log() -> std::rc::Rc<StdMutex<Vec<(DedupPhase, u64, u64)>>> {
+        std::rc::Rc::new(StdMutex::new(Vec::new()))
+    }
+
+    /// Runs `run_gates` (workers = 1, `NOW`) with a phase-collecting
+    /// progress closure — the tests' default runner.
+    fn gates_run(
+        store: &StdMutex<Store>,
+        roots: &[String],
+        reader: &dyn FileReader,
+        cancel: &AtomicBool,
+    ) -> (DedupOutcome, Vec<(DedupPhase, u64, u64)>) {
+        let log = gates_progress_log();
+        let sink = std::rc::Rc::clone(&log);
+        let progress = move |phase: DedupPhase, done: u64, total: u64| {
+            sink.lock().unwrap().push((phase, done, total));
+        };
+        let outcome = run_gates(store, roots, reader, 1, cancel, NOW, &progress);
+        let calls = log.lock().unwrap().clone();
+        (outcome, calls)
+    }
+
+    /// THE end-to-end contract: three identical 80KB files in three
+    /// different directories survive all four gates into ONE group of
+    /// three members; every phase was reported at least once, in gate
+    /// order; and the counters came back clean.
+    #[test]
+    fn gates_end_to_end_three_copies_form_one_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        let content = vec![b'e'; SAMPLE_BIG]; // > 64KB: the sampled path
+        let (_tstore, store) = test_store();
+        let mut ids = Vec::new();
+        for (i, dir) in ["d1", "d2", "d3"].iter().enumerate() {
+            ids.push(gates_fixture(&store, &root, dir, &format!("f{i}.bin"), &content));
+        }
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+
+        let (outcome, log) = gates_run(&store, &roots, &FakeReader::new(), &cancel);
+
+        assert!(!outcome.cancelled);
+        assert_eq!(outcome.groups.len(), 1, "three identical files: one group");
+        let group = &outcome.groups[0];
+        assert_eq!(group.size, SAMPLE_BIG as u64);
+        assert_eq!(group.hash, xxh64(&content, 0));
+        let mut expected = ids.clone();
+        expected.sort_unstable();
+        assert_eq!(group.members, expected, "members are the row ids, ascending");
+
+        // Every phase reported at least once, in pipeline order, with
+        // the run's hash counts as the final Done report.
+        let first_of = |phase: DedupPhase| {
+            log.iter()
+                .position(|(p, _, _)| *p == phase)
+                .unwrap_or_else(|| panic!("phase {phase:?} never reported: {log:?}"))
+        };
+        let (g, h, s, f, d) = (
+            first_of(DedupPhase::Grouping),
+            first_of(DedupPhase::HashingFirst),
+            first_of(DedupPhase::Sampling),
+            first_of(DedupPhase::HashingFull),
+            first_of(DedupPhase::Done),
+        );
+        assert!(g < h && h < s && s < f && f < d, "phases in gate order: {log:?}");
+        assert_eq!(
+            *log.last().unwrap(),
+            (DedupPhase::Done, 6, 6),
+            "3 first + 3 full hashes computed this run"
+        );
+
+        assert_eq!(outcome.hashed_first, 3);
+        assert_eq!(outcome.hashed_full, 3, "gate④ computed one full per file");
+        let c = &outcome.counters;
+        assert_eq!(c.size_gate.files + c.head_gate.files + c.sample_gate.files, 0);
+        assert_eq!(c.errors + c.locked + c.fresh + c.placeholders + c.recycle, 0);
+        // The legacy scalar mirrors (engine.rs reads them until Task 7).
+        assert_eq!(outcome.errors, 0);
+        assert_eq!(outcome.locked, 0);
+        assert_eq!(outcome.placeholders, 0);
+    }
+
+    /// Same size, first 4KB differs: the `(size, head)` regroup
+    /// dissolves the pair BEFORE gate③ — nothing sampled, nothing fully
+    /// read, no group, and no gate kill counted (both members carry a
+    /// head; the kill is the regroup's, like the old pipeline's).
+    #[test]
+    fn gates_same_size_different_head_never_reaches_sampling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        let content_a = vec![b'a'; SAMPLE_BIG];
+        let mut content_b = content_a.clone();
+        content_b[100] = b'b'; // inside the first 4KB
+        let (_tstore, store) = test_store();
+        gates_fixture(&store, &root, "", "a.bin", &content_a);
+        gates_fixture(&store, &root, "", "b.bin", &content_b);
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+
+        let reader = FakeReader::new();
+        let (outcome, _log) = gates_run(&store, &roots, &reader, &cancel);
+
+        assert!(outcome.groups.is_empty());
+        assert_eq!(
+            *reader.opened.lock().unwrap(),
+            vec![root.join("a.bin"), root.join("b.bin")],
+            "one open each — the gate② probes; gates ③④ never ran"
+        );
+        assert_eq!(outcome.hashed_full, 0);
+        assert_eq!(outcome.counters.sample_gate.files, 0, "gate③ saw nobody");
+        assert_eq!(outcome.counters.head_gate.files, 0, "both carry a head");
+    }
+
+    /// Same size, same first 4KB, different tail: sampled together,
+    /// sample keys differ, BOTH are shot down as singleton
+    /// `(size, key)` runs — no group, no full hash ever computed.
+    #[test]
+    fn gates_same_head_different_tail_shot_down_by_sampling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        let content_a = vec![b'a'; SAMPLE_BIG];
+        let mut content_b = content_a.clone();
+        content_b[70_000] = b'b'; // inside BOTH windows
+        let (_tstore, store) = test_store();
+        gates_fixture(&store, &root, "", "a.bin", &content_a);
+        gates_fixture(&store, &root, "", "b.bin", &content_b);
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+
+        let reader = FakeReader::new();
+        let (outcome, _log) = gates_run(&store, &roots, &reader, &cancel);
+
+        assert!(outcome.groups.is_empty());
+        assert_eq!(outcome.hashed_full, 0, "shot down before gate④");
+        assert_eq!(outcome.counters.sample_gate.files, 2);
+        assert_eq!(outcome.counters.sample_gate.bytes, 2 * SAMPLE_BIG as u64);
+        assert_eq!(
+            outcome.counters.errors + outcome.counters.locked + outcome.counters.fresh,
+            0,
+            "shot down, not skipped"
+        );
+        assert_eq!(
+            reader.opened.lock().unwrap().len(),
+            4,
+            "2 gate② probes + 2 gate③ window passes"
+        );
+    }
+
+    /// The certified-partner crowd, end to end: a member with REAL
+    /// persisted first+full hashes and a new same-content twin form a
+    /// group — the twin was short-circuited into gate④ (gate③ never
+    /// sampled it), the certified member was never opened, and the
+    /// group's hash is the persisted (real) full. The Task-5 test used
+    /// a fake persisted full because gate③ alone never groups; here it
+    /// must be the content's true hash or the pair could not group.
+    #[test]
+    fn gates_certified_partner_groups_with_new_twin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        let content = vec![b'c'; SAMPLE_BIG];
+        let first = xxh64(&content[..4096], 0);
+        let full = xxh64(&content, 0);
+        let (_tstore, store) = test_store();
+        let a = gates_fixture(&store, &root, "", "a.bin", &content);
+        let (f, _) = upsert_row_at(
+            &store,
+            &["fixture"],
+            "twin.bin",
+            content.len() as u64,
+            NOW - 10_000,
+            Some(first),
+            Some(full),
+        );
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+
+        let reader = FakeReader::new();
+        let (outcome, _log) = gates_run(&store, &roots, &reader, &cancel);
+
+        // Only the new twin was ever opened: its gate② probe, then its
+        // gate④ full read. The certified member lived on persisted
+        // hashes alone.
+        assert_eq!(
+            *reader.opened.lock().unwrap(),
+            vec![root.join("a.bin"), root.join("a.bin")],
+            "twin.bin twice (probe + gate④), certified member never"
+        );
+        assert_eq!(outcome.groups.len(), 1);
+        let group = &outcome.groups[0];
+        assert_eq!(group.size, SAMPLE_BIG as u64);
+        assert_eq!(group.hash, full);
+        let mut members = vec![a, f];
+        members.sort_unstable();
+        assert_eq!(group.members, members, "ids ascending");
+        assert_eq!(outcome.hashed_first, 1, "the twin's probe");
+        assert_eq!(outcome.hashed_full, 1, "the twin's gate④ read");
+        assert_eq!(outcome.counters.head_gate.files, 0);
+        assert_eq!(outcome.counters.sample_gate.files, 0, "short-circuit is free");
+    }
+
+    /// Group order: size descending; equal sizes break by hash
+    /// ascending; members are files-row ids ascending. Two same-size
+    /// groups with different content pin the tiebreak (the expected
+    /// order is computed from the hashes — the test must not assume
+    /// which content hashes smaller).
+    #[test]
+    fn gates_group_ordering_size_desc_hash_asc_members_asc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        let big = vec![b'X'; 100 * 1024];
+        let y = vec![b'Y'; SAMPLE_SMALL + 54 * 1024]; // 70KB, distinct from big
+        let z = vec![b'Z'; y.len()];
+        let (_tstore, store) = test_store();
+        let mut big_ids = Vec::new();
+        let mut y_ids = Vec::new();
+        let mut z_ids = Vec::new();
+        big_ids.push(gates_fixture(&store, &root, "d1", "b1.bin", &big));
+        big_ids.push(gates_fixture(&store, &root, "d1", "b2.bin", &big));
+        y_ids.push(gates_fixture(&store, &root, "d2", "y1.bin", &y));
+        y_ids.push(gates_fixture(&store, &root, "d2", "y2.bin", &y));
+        z_ids.push(gates_fixture(&store, &root, "d3", "z1.bin", &z));
+        z_ids.push(gates_fixture(&store, &root, "d3", "z2.bin", &z));
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+
+        let (outcome, _log) = gates_run(&store, &roots, &FakeReader::new(), &cancel);
+
+        assert_eq!(outcome.groups.len(), 3);
+        // Size descending: the 100KB group first...
+        assert_eq!(outcome.groups[0].size, big.len() as u64);
+        assert_eq!(outcome.groups[0].hash, xxh64(&big, 0));
+        big_ids.sort_unstable();
+        assert_eq!(outcome.groups[0].members, big_ids);
+        // ...then the two 70KB groups, hash ascending.
+        let (hy, hz) = (xxh64(&y, 0), xxh64(&z, 0));
+        let (lo, hi) = if hy <= hz { (hy, hz) } else { (hz, hy) };
+        assert_eq!(outcome.groups[1].size, y.len() as u64);
+        assert_eq!(outcome.groups[1].hash, lo, "equal sizes: hash ascending");
+        assert_eq!(outcome.groups[2].size, z.len() as u64);
+        assert_eq!(outcome.groups[2].hash, hi);
+        for group in &outcome.groups[1..] {
+            let ids = if group.hash == hy { &y_ids } else { &z_ids };
+            let mut ids = ids.clone();
+            ids.sort_unstable();
+            assert_eq!(group.members, ids, "members id ascending");
+        }
+    }
+
+    /// The brief's pinned cancel case: the progress callback arms
+    /// `cancel` at the FIRST HashingFull report — gate④ never runs, the
+    /// run finishes cancelled with an empty group list, and the hashes
+    /// the earlier gates computed are already persisted (visible after
+    /// the store is REOPENED — cancel never loses computed work).
+    #[test]
+    fn gates_cancel_at_hashing_full_flushes_computed_hashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        let content = vec![b'e'; SAMPLE_BIG];
+        // The STORE's tempdir (test_store opens `index.db` in it) — the
+        // reopened database below must be THIS file, not a fresh one.
+        let (store_tmp, store) = test_store();
+        gates_fixture(&store, &root, "d1", "a.bin", &content);
+        gates_fixture(&store, &root, "d2", "b.bin", &content);
+        let roots = gate_roots(&root);
+
+        let cancel = AtomicBool::new(false);
+        let log = gates_progress_log();
+        let sink = std::rc::Rc::clone(&log);
+        // A borrowing closure: it arms `cancel` and logs synchronously
+        // while run_gates runs, and both locals outlive the call.
+        let progress = |phase: DedupPhase, done: u64, total: u64| {
+            if phase == DedupPhase::HashingFull {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            sink.lock().unwrap().push((phase, done, total));
+        };
+        let outcome = run_gates(&store, &roots, &FakeReader::new(), 1, &cancel, NOW, &progress);
+        let log = log.lock().unwrap().clone();
+
+        assert!(outcome.cancelled);
+        assert!(outcome.groups.is_empty(), "a cancelled run reports no groups");
+        assert_eq!(
+            *log.last().unwrap(),
+            (DedupPhase::Cancelled, 0, 2),
+            "the final report is the cancelled one"
+        );
+        assert!(
+            !log.iter().any(|(p, _, _)| *p == DedupPhase::Done),
+            "cancel replaces Done"
+        );
+
+        // The store REOPENED sees the computed first hashes: gate②
+        // completed and flushed before the cancel point.
+        let db = store_tmp.path().join("index.db");
+        drop(store);
+        let reopened = Store::open(&db).unwrap();
+        let rows = reopened.all_files().unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(
+                row.hash_first,
+                Some(xxh64(&content[..4096], 0)),
+                "gate②'s computed hash survived the cancel"
+            );
+            assert_eq!(row.hash_full, None, "gate④ never ran");
+        }
+    }
+
+    /// Cancel armed at the first report of EACH phase — Grouping,
+    /// HashingFirst, Sampling, HashingFull — always ends the run
+    /// cancelled with an empty group list and a Cancelled final report.
+    #[test]
+    fn gates_cancel_at_any_phase_ends_cancelled() {
+        for arm in [
+            DedupPhase::Grouping,
+            DedupPhase::HashingFirst,
+            DedupPhase::Sampling,
+            DedupPhase::HashingFull,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("fixture");
+            let content = vec![b'e'; SAMPLE_BIG];
+            let (_tstore, store) = test_store();
+            gates_fixture(&store, &root, "d1", "a.bin", &content);
+            gates_fixture(&store, &root, "d2", "b.bin", &content);
+            let roots = gate_roots(&root);
+
+            let cancel = AtomicBool::new(false);
+            let log = gates_progress_log();
+            let sink = std::rc::Rc::clone(&log);
+            let progress = |phase: DedupPhase, done: u64, total: u64| {
+                if phase == arm {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                sink.lock().unwrap().push((phase, done, total));
+            };
+            let outcome = run_gates(&store, &roots, &FakeReader::new(), 1, &cancel, NOW, &progress);
+            let log = log.lock().unwrap().clone();
+
+            assert!(outcome.cancelled, "arming at {arm:?} must cancel the run");
+            assert!(outcome.groups.is_empty(), "arming at {arm:?}: no groups");
+            assert_eq!(
+                log.last().map(|(p, _, _)| *p),
+                Some(DedupPhase::Cancelled),
+                "arming at {arm:?}: the final report is Cancelled: {log:?}"
+            );
+            assert!(
+                !log.iter().any(|(p, _, _)| *p == DedupPhase::Done),
+                "arming at {arm:?}: cancel replaces Done"
+            );
+        }
+    }
+
+    /// Arms `cancel` when `target` is opened for the `n`-th time. A full
+    /// pipeline run opens each fixture file exactly THREE times (gate②
+    /// probe, gate③ window pass, gate④ sequential read), so n = 3 on
+    /// the second file arms the cancel exactly at gate④'s open of it.
+    struct ArmOnNthOpen<'a> {
+        inner: FakeReader,
+        target: PathBuf,
+        n: usize,
+        opens: StdMutex<usize>,
+        cancel: &'a AtomicBool,
+    }
+
+    impl FileReader for ArmOnNthOpen<'_> {
+        fn attributes(&self, path: &Path) -> Option<u32> {
+            self.inner.attributes(path)
+        }
+        fn open(&self, path: &Path) -> std::io::Result<std::fs::File> {
+            let file = self.inner.open(path)?;
+            if path == self.target {
+                let mut opens = self.opens.lock().unwrap();
+                *opens += 1;
+                if *opens == self.n {
+                    self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Ok(file)
+        }
+    }
+
+    /// Gate④ checks cancel at EVERY 64KB buffer step, not only between
+    /// files: `a` completes its full read (its hash lands — 已算哈希照常
+    /// 落库); `b`'s gate④ open arms the cancel and its FIRST buffer step
+    /// abandons it, so `b` never gets a full hash. A between-files-only
+    /// check would have completed `b` too and failed the `b` assertion.
+    #[test]
+    fn gates_full_gate_checks_cancel_every_buffer_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        let content = vec![b'e'; SAMPLE_BIG]; // 80KB: two 64KB read steps
+        let (_tstore, store) = test_store();
+        gates_fixture(&store, &root, "d1", "a.bin", &content);
+        gates_fixture(&store, &root, "d2", "b.bin", &content);
+        let roots = gate_roots(&root);
+
+        let cancel = AtomicBool::new(false);
+        let reader = ArmOnNthOpen {
+            inner: FakeReader::new(),
+            target: root.join("d2").join("b.bin"),
+            n: 3,
+            opens: StdMutex::new(0),
+            cancel: &cancel,
+        };
+        let (outcome, log) = gates_run(&store, &roots, &reader, &cancel);
+
+        assert!(outcome.cancelled);
+        assert!(outcome.groups.is_empty());
+        assert_eq!(
+            log.last().map(|(p, _, _)| *p),
+            Some(DedupPhase::Cancelled)
+        );
+
+        // `a` finished before the armed open; `b` was abandoned at its
+        // first buffer step.
+        let full = xxh64(&content, 0);
+        let rows = crate::engine::lock_unpoisoned(&store).all_files().unwrap();
+        let row_a = rows.iter().find(|r| r.name == "a.bin").unwrap();
+        assert_eq!(row_a.hash_full, Some(full), "a's computed hash landed");
+        let row_b = rows.iter().find(|r| r.name == "b.bin").unwrap();
+        assert_eq!(
+            row_b.hash_full, None,
+            "b was abandoned mid-read: no partial hash may persist"
+        );
+    }
+
+    /// Gate④ multi-chunk scatter (the gate②/③ bug class): members split
+    /// across chunks and workers — every computed full hash must land on
+    /// ITS OWN slot in the outcome array, whatever the chunking.
+    #[test]
+    fn gate_full_multi_chunk_scatters_every_full_to_its_own_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+
+        let (_tstore, store) = test_store();
+        let mut contents: Vec<Vec<u8>> = Vec::new();
+        for i in 0..5u8 {
+            // > 64KB so gate④ really streams: distinct tails, identical
+            // first 4KB (one (size, head) run through the sampler).
+            let mut content = vec![b'A'; SAMPLE_BIG];
+            content[4096 + i as usize] = b'0' + i;
+            let name = format!("f{i}.bin");
+            fs::write(root.join(&name), &content).unwrap();
+            let _ = upsert_row_at(
+                &store,
+                &["fixture"],
+                &name,
+                content.len() as u64,
+                NOW - 10_000,
+                None,
+                None,
+            );
+            contents.push(content);
+        }
+        let (cands, dirs) = load_cands(&store);
+        // The candidate stream is id-ascending, so slots are 0..5 in
+        // insertion order.
+        let slots: Vec<u32> = (0..5u32).collect();
+        let roots = gate_roots(&root);
+
+        for (workers, chunk_size) in [(1, 2), (2, 2), (1, 3), (2, 4)] {
+            let reader = FakeReader::new();
+            let cancel = AtomicBool::new(false);
+            let known = vec![NO_HASH; slots.len()];
+            let log = progress_log();
+            let sink = std::rc::Rc::clone(&log);
+            let progress = move |done: u64, total: u64| {
+                sink.lock().unwrap().push((done, total));
+            };
+            let out = gate_full_chunked(
+                &cands, &dirs, &slots, &known, &roots, &reader, workers, &cancel, NOW, &progress,
+                &store, chunk_size,
+            );
+
+            assert!(!out.cancelled);
+            assert_eq!(out.hashed_full, 5);
+            for (i, content) in contents.iter().enumerate() {
+                let expected = xxh64(content, 0);
+                assert_eq!(
+                    out.full[i], expected,
+                    "chunk_size={chunk_size} workers={workers}: f{i}'s full must sit at its own slot {i}"
+                );
+            }
+            assert_eq!(out.pending.len(), 5);
+            assert_eq!(log.lock().unwrap().last(), Some(&(5, 5)));
+        }
+    }
+
+    /// Two identical ≤4KB files group from gate②'s TERMINAL values
+    /// alone (the probe read IS the whole file): full_todo members are
+    /// known-full at gate④ without a single full-stage open — pinning
+    /// the `HeadOutcome::full` source of run_gates' full merge.
+    #[test]
+    fn gates_small_terminal_files_group_from_head_fulls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        let content = b"tiny twin bytes"; // 15 bytes: terminal at gate②
+        let (_tstore, store) = test_store();
+        gates_fixture(&store, &root, "d1", "a.bin", content);
+        gates_fixture(&store, &root, "d2", "b.bin", content);
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+
+        let reader = FakeReader::new();
+        let (outcome, _log) = gates_run(&store, &roots, &reader, &cancel);
+
+        // One open per file — the gate② probes. gate③ certified them,
+        // gate④ had nothing to read.
+        assert_eq!(reader.opened.lock().unwrap().len(), 2);
+        assert_eq!(outcome.groups.len(), 1);
+        assert_eq!(outcome.groups[0].size, content.len() as u64);
+        assert_eq!(outcome.groups[0].hash, xxh64(content, 0));
+        assert_eq!(outcome.hashed_full, 0, "no full-stage computation at all");
+        assert_eq!(outcome.hashed_first, 2);
+    }
+
+    /// A store whose candidate load fails (an id past `u32::MAX` — the
+    /// loader's checked conversion) yields the trivial run: empty
+    /// groups, not cancelled, zero counters, and the complete phase
+    /// walk at `(0, 0)`.
+    #[test]
+    fn gates_store_load_error_yields_trivial_run() {
+        let (_tstore, store) = test_store();
+        // One pair that would normally group — plus a row the loader
+        // must reject, which turns the WHOLE run trivial.
+        let (_twin_a, _twin_b) = (
+            upsert_row(&store, &["fixture"], "twin_a.bin", 5, false, None, None).0,
+            upsert_row(&store, &["fixture"], "twin_b.bin", 5, false, None, None).0,
+        );
+        let fixture_dir = crate::engine::lock_unpoisoned(&store)
+            .all_dirs()
+            .unwrap()
+            .iter()
+            .find(|(_, _, name)| name == "fixture")
+            .map(|(id, _, _)| *id)
+            .unwrap();
+        {
+            let mut guard = crate::engine::lock_unpoisoned(&store);
+            guard
+                .conn_mut()
+                .execute(
+                    "INSERT INTO files(id, dir, name, size, mtime, ctime, atime, ext_id, is_dir,
+                                       py_full, py_init, scan_gen)
+                     VALUES (?1, ?2, 'huge.bin', 5, 0, 0, 0, 0, 0, '', '', 0)",
+                    rusqlite::params![i64::MAX, fixture_dir],
+                )
+                .unwrap();
+        }
+        let roots = vec![String::new()];
+        let cancel = AtomicBool::new(false);
+
+        let (outcome, log) = gates_run(&store, &roots, &FakeReader::new(), &cancel);
+
+        assert!(outcome.groups.is_empty());
+        assert!(!outcome.cancelled);
+        assert_eq!(outcome.counters, OutcomeCounters::default());
+        assert_eq!(
+            log,
+            vec![
+                (DedupPhase::Grouping, 0, 0),
+                (DedupPhase::HashingFirst, 0, 0),
+                (DedupPhase::Sampling, 0, 0),
+                (DedupPhase::HashingFull, 0, 0),
+                (DedupPhase::Done, 0, 0),
+            ],
+            "the trivial run still walks every phase"
+        );
     }
 }
