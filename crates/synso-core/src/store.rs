@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Row, Statement};
 
 use crate::model::{FileId, FileRecord};
 use crate::pinyin::pinyin_keys;
@@ -371,6 +371,30 @@ impl Store {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Streams the dedup-candidate rows (non-directory `files` rows with
+    /// `size > 0`) as seven-column [`CandidateRow`]s, id-ascending — the
+    /// SQL-side prefilter of the old whole-table snapshot load, so a dedup
+    /// run pays for candidates only and streams them instead of
+    /// materializing `FileRecord`s. The cursor owns its prepared
+    /// statement: drop it before using the `Store` again (the dedup load
+    /// holds the store lock across the whole drain).
+    // Task 2-6 wiring: the production caller (`load_candidates`) arrives
+    // with the pipeline rewrite; until then only the test suite drains it.
+    #[allow(dead_code)]
+    pub(crate) fn iter_dedup_candidates(&self) -> Result<CandidateCursor<'_>> {
+        let stmt = self.conn.prepare(
+            "SELECT id, dir, name, size, mtime, hash_first, hash_full
+             FROM files
+             WHERE is_dir = 0 AND size > 0 AND id > ?1
+             ORDER BY id LIMIT 1",
+        )?;
+        Ok(CandidateCursor {
+            stmt,
+            last_id: FileId::MIN,
+            done: false,
+        })
+    }
+
     /// Every `extensions` row as `(id, ext)`, id-ordered. Read source for
     /// the hot index's ext-string lookup (`Hit.ext`).
     pub fn all_extensions(&self) -> Result<Vec<(i64, String)>> {
@@ -397,6 +421,91 @@ impl Store {
     pub(crate) fn conn_mut(&mut self) -> &mut Connection {
         &mut self.conn
     }
+}
+
+/// One dedup-candidate row streamed by [`Store::iter_dedup_candidates`]:
+/// the seven `files` columns the pipeline needs (the table carries
+/// fifteen; the SELECT takes only these). `size` and the hashes
+/// round-trip the same bit-preserving casts [`Store::all_files`] uses.
+#[allow(dead_code)] // Task 2-6 wiring: drained by dedup's `load_candidates`.
+pub(crate) struct CandidateRow {
+    /// `files` row id (the load presses these into `u32` with a checked
+    /// conversion — past `u32::MAX` it reports an explicit error, never
+    /// truncates).
+    pub(crate) id: FileId,
+    /// Containing directory's `dirs` row id.
+    pub(crate) parent: FileId,
+    pub(crate) size: u64,
+    /// Snapshot mtime — identity half of the hash-persist guard.
+    pub(crate) mtime: i64,
+    pub(crate) hash_first: Option<u64>,
+    pub(crate) hash_full: Option<u64>,
+    pub(crate) name: String,
+}
+
+/// Streaming cursor over the dedup candidates, id-ascending (see
+/// [`Store::iter_dedup_candidates`]). Keyset pagination (`id > last`,
+/// `LIMIT 1`): a rusqlite `Rows` handle resets its statement whenever it
+/// is dropped, so a long-lived statement cannot be stepped one row per
+/// `next()` call — the handle dropped after a single step rewinds the
+/// query, and the cursor would stream row 1 forever. The walk instead
+/// advances through the query itself, re-binding the last streamed id;
+/// the statement is prepared once and reused (its per-call drop-reset is
+/// exactly what makes each bind start clean).
+#[allow(dead_code)] // Task 2-6 wiring: drained by dedup's `load_candidates`.
+pub(crate) struct CandidateCursor<'a> {
+    stmt: Statement<'a>,
+    /// Id of the last row handed out; the next one is strictly greater.
+    /// Starts at `FileId::MIN` so even a hand-inserted non-positive row
+    /// id streams (and trips the load's checked u32 conversion).
+    last_id: FileId,
+    /// Set when the walk reports no further row (or errors): over.
+    done: bool,
+}
+
+impl Iterator for CandidateCursor<'_> {
+    type Item = Result<CandidateRow>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        // One keyset seek per call: `query_row` binds, steps the single
+        // LIMIT 1 row and resets (via the internal Rows drop), so the
+        // next call binds onto a clean statement again.
+        let row =
+            self.stmt
+                .query_row(params![self.last_id], map_candidate_row);
+        match row {
+            Ok(row) => {
+                self.last_id = row.id;
+                Some(Ok(row))
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                self.done = true;
+                None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e.into()))
+            }
+        }
+    }
+}
+
+/// Maps one streamed row into a [`CandidateRow`] (columns in SELECT
+/// order; u64 columns via the bit-preserving i64 casts the upsert used).
+#[allow(dead_code)] // Task 2-6 wiring: drained by dedup's `load_candidates`.
+fn map_candidate_row(row: &Row<'_>) -> rusqlite::Result<CandidateRow> {
+    Ok(CandidateRow {
+        id: row.get(0)?,
+        parent: row.get(1)?,
+        name: row.get(2)?,
+        size: row.get::<_, i64>(3)? as u64,
+        mtime: row.get(4)?,
+        hash_first: row.get::<_, Option<i64>>(5)?.map(|h| h as u64),
+        hash_full: row.get::<_, Option<i64>>(6)?.map(|h| h as u64),
+    })
 }
 
 /// Applies pending schema migrations and records the resulting version in

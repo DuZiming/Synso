@@ -63,6 +63,7 @@ use xxhash_rust::xxh64::{xxh64, Xxh64};
 use crate::engine::DedupPhase;
 use crate::model::FileId;
 use crate::store::{HashUpdate, Store};
+use crate::{Result, SynsoError};
 
 /// Bytes hashed in the first stage (the design's "first 4KB").
 const FIRST_CHUNK: usize = 4096;
@@ -592,6 +593,250 @@ fn flush_persist(store: &Mutex<Store>, pending: &mut Vec<HashUpdate>) {
     pending.clear();
 }
 
+// ---------------------------------------------------------------------
+// Candidate streaming load (pipeline rewrite, Task 2): the SoA/arena
+// picture the rewritten pipeline works from. The old `Snapshot` /
+// `load_snapshot` pair above stays in place until the engine swap
+// deletes it.
+
+/// Sentinel a candidate's hash column carries when the store row has no
+/// persisted hash yet (the streamed row's `Option` flattened).
+pub(crate) const NO_HASH: u64 = u64::MAX;
+
+/// Directory name whose subtree the dedup run excludes (the recycle
+/// bin): the dir itself carries the rule by name, deeper levels inherit
+/// it through [`Dirs::recycle`].
+const RECYCLE_BIN_DIR: &str = "$Recycle.Bin";
+
+/// A candidate's parent slot when its dir row is missing from `dirs` (a
+/// files row without its dir row — only a hand-edited database produces
+/// one): `index_path` treats it as a broken chain.
+const UNRESOLVED_PARENT: u32 = u32::MAX;
+
+/// Every dedup candidate — non-directory `files` rows with `size > 0` —
+/// as parallel SoA columns, streamed straight from
+/// [`Store::iter_dedup_candidates`] one push per row: zero per-file heap
+/// allocations (the old `all_files` + `Vec<Entry>` load materialized
+/// every name twice). Slot `i` addresses all columns at once;
+/// `parents` hold `Dirs` SLOTS, not row ids, so the later path/group
+/// walks chase plain indices.
+#[derive(Debug, Default)]
+#[allow(dead_code)] // Task 4-6 wiring: the pipeline rewrite consumes it.
+pub(crate) struct Candidates {
+    /// `files` row ids, u32-pressed (checked — past `u32::MAX` the load
+    /// reports an explicit error, never truncates).
+    pub(crate) ids: Vec<u32>,
+    /// Containing directory's slot in [`Dirs`]; [`UNRESOLVED_PARENT`]
+    /// when the dir row is missing.
+    pub(crate) parents: Vec<u32>,
+    pub(crate) sizes: Vec<u64>,
+    /// Snapshot mtime — identity half of the hash-persist guard.
+    pub(crate) mtimes: Vec<i64>,
+    /// First-4KiB hash; [`NO_HASH`] when not persisted.
+    pub(crate) hash_first: Vec<u64>,
+    /// Whole-file hash; [`NO_HASH`] when not persisted.
+    pub(crate) hash_full: Vec<u64>,
+    /// Start offset of each row's name in [`Self::names`].
+    pub(crate) name_off: Vec<u32>,
+    /// All names, one byte arena.
+    pub(crate) names: Vec<u8>,
+}
+
+impl Candidates {
+    /// Appends one streamed row: hash `Option`s flatten to [`NO_HASH`],
+    /// the name appends to the arena.
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        id: u32,
+        parent_slot: u32,
+        size: u64,
+        mtime: i64,
+        hash_first: Option<u64>,
+        hash_full: Option<u64>,
+        name: &str,
+    ) {
+        self.ids.push(id);
+        self.parents.push(parent_slot);
+        self.sizes.push(size);
+        self.mtimes.push(mtime);
+        self.hash_first.push(hash_first.unwrap_or(NO_HASH));
+        self.hash_full.push(hash_full.unwrap_or(NO_HASH));
+        self.name_off.push(self.names.len() as u32);
+        self.names.extend_from_slice(name.as_bytes());
+    }
+
+    /// Candidate `i`'s file name out of the arena.
+    // Task 4-6 wiring: the group -> Hit materialization reads names.
+    #[allow(dead_code)]
+    pub(crate) fn name(&self, i: usize) -> &str {
+        arena_name(&self.names, &self.name_off, i)
+    }
+
+    /// The candidate's index-relative path (root segment, ..., name,
+    /// `MAIN_SEPARATOR`-joined), or `None` when its dir chain is broken.
+    /// Same on-demand shape and cycle budget as the old
+    /// `Snapshot::index_path` — only candidates that actually need
+    /// hashing pay for it.
+    // Task 4-6 wiring: the hash stages resolve paths through this.
+    #[allow(dead_code)]
+    pub(crate) fn index_path(&self, i: usize, dirs: &Dirs) -> Option<String> {
+        let mut segments = vec![self.name(i)];
+        let mut budget = dirs.parents.len() + 1; // a corrupt parent cycle cannot loop
+        let mut current = self.parents[i];
+        loop {
+            if current == UNRESOLVED_PARENT {
+                return None;
+            }
+            let slot = current as usize;
+            if budget == 0 {
+                return None;
+            }
+            budget -= 1;
+            let Some(parent) = dirs.parents.get(slot) else {
+                return None; // broken chain: slot out of range
+            };
+            segments.push(dirs.name(slot));
+            match parent {
+                Some(next) => current = *next,
+                None => break, // root reached
+            }
+        }
+        segments.reverse();
+        Some(segments.join(MAIN_SEPARATOR_STR))
+    }
+}
+
+/// The `dirs` table as parallel SoA columns (the path-rebuilding half of
+/// the snapshot, arena-ified like [`Candidates`]). Rows stream in
+/// id-ascending (`all_dirs`), so slot order mirrors row-id order and a
+/// parent row always precedes its children (`resolve_dir` creates a
+/// dir's parent levels first).
+#[derive(Debug, Default)]
+#[allow(dead_code)] // Task 4-6 wiring: the pipeline rewrite consumes it.
+pub(crate) struct Dirs {
+    /// Parent slot per row (`None` = root). `parents.len()` is the slot
+    /// bound every other column shares.
+    pub(crate) parents: Vec<Option<u32>>,
+    /// Start offset of each row's name in [`Self::names`].
+    pub(crate) name_off: Vec<u32>,
+    /// All names, one byte arena.
+    pub(crate) names: Vec<u8>,
+    /// Recycle-bin bit: the dir is named [`RECYCLE_BIN_DIR`] or its
+    /// parent slot's bit is set, propagated in one id-ascending pass.
+    /// The rewritten pipeline excludes such subtrees outright.
+    pub(crate) recycle: Vec<bool>,
+    /// `dirs` row id -> slot; the recycle propagation and the candidate
+    /// load resolve row ids through this.
+    pub(crate) by_id: HashMap<FileId, u32>,
+}
+
+impl Dirs {
+    /// Appends one streamed dir row and its `by_id` entry.
+    fn push(&mut self, id: FileId, parent_slot: Option<u32>, name: &str, recycle: bool) {
+        self.by_id.insert(id, self.parents.len() as u32);
+        self.parents.push(parent_slot);
+        self.name_off.push(self.names.len() as u32);
+        self.names.extend_from_slice(name.as_bytes());
+        self.recycle.push(recycle);
+    }
+
+    /// Dir `slot`'s name out of the arena.
+    // Task 4-6 wiring: the group -> Hit materialization reads names.
+    #[allow(dead_code)]
+    pub(crate) fn name(&self, slot: usize) -> &str {
+        arena_name(&self.names, &self.name_off, slot)
+    }
+}
+
+/// Reads row `i`'s name from an offset-table arena (the end offset is
+/// the next row's, or the arena end for the last row). The slices are
+/// whole names of originally-valid UTF-8 `String`s, so validation cannot
+/// fail.
+fn arena_name<'a>(names: &'a [u8], name_off: &'a [u32], i: usize) -> &'a str {
+    let start = name_off[i] as usize;
+    let end = name_off
+        .get(i + 1)
+        .map_or(names.len(), |&off| off as usize);
+    std::str::from_utf8(&names[start..end]).expect("name arena holds valid UTF-8")
+}
+
+/// Loads [`Candidates`] + [`Dirs`] under one short store lock (hashing
+/// then proceeds lock-free, like the old snapshot). Any store error —
+/// including a candidate id past `u32::MAX` — yields `None`: the run
+/// then finishes trivially with no groups and is never fatal (the next
+/// run, after the store heals, finds everything). That mirrors the old
+/// `load_snapshot`'s error semantics.
+// Task 4-6 wiring: the rewritten pipeline loads through this.
+#[allow(dead_code)]
+pub(crate) fn load_candidates(store: &Mutex<Store>) -> Option<(Candidates, Dirs)> {
+    load_candidates_checked(store).ok()
+}
+
+/// The checked-conversion core behind [`load_candidates`] — explicit
+/// errors, so the test suite (and any future caller that wants them) can
+/// tell a corrupt id apart from an empty store.
+fn load_candidates_checked(store: &Mutex<Store>) -> Result<(Candidates, Dirs)> {
+    let guard = crate::engine::lock_unpoisoned(store);
+
+    // Dirs first: candidates resolve their parent slots against it, and
+    // the recycle bits propagate in this same id-ascending pass.
+    let mut dirs = Dirs::default();
+    for (id, parent, name) in guard.all_dirs()? {
+        // Checked press: dir slots are u32 too.
+        u32::try_from(id).map_err(|_| bad_u32_id("dir", id))?;
+        let parent_slot = match parent {
+            None => None,
+            Some(parent_id) => {
+                // resolve_dir creates a dir's parent levels before the dir
+                // itself, so ids ascend parent-first; a violation means a
+                // hand-edited database. Debug builds stop here; a release
+                // build treats the orphan as a root (its subtree's recycle
+                // bits then rest on the name rule alone — corruption
+                // already means the index is suspect).
+                debug_assert!(
+                    parent_id < id,
+                    "dirs must load parent-first (resolve_dir build invariant): \
+                     parent {parent_id} >= dir {id}"
+                );
+                dirs.by_id.get(&parent_id).copied()
+            }
+        };
+        let recycle =
+            name == RECYCLE_BIN_DIR || parent_slot.is_some_and(|s| dirs.recycle[s as usize]);
+        dirs.push(id, parent_slot, &name, recycle);
+    }
+
+    let mut cands = Candidates::default();
+    for row in guard.iter_dedup_candidates()? {
+        let row = row?;
+        let id = u32::try_from(row.id).map_err(|_| bad_u32_id("candidate", row.id))?;
+        let parent_slot = dirs
+            .by_id
+            .get(&row.parent)
+            .copied()
+            .unwrap_or(UNRESOLVED_PARENT);
+        cands.push(
+            id,
+            parent_slot,
+            row.size,
+            row.mtime,
+            row.hash_first,
+            row.hash_full,
+            &row.name,
+        );
+    }
+    Ok((cands, dirs))
+}
+
+/// The explicit error a `files`/`dirs` id that exceeds `u32::MAX`
+/// produces (the SoA world presses ids into `u32`; it never truncates).
+fn bad_u32_id(kind: &str, id: FileId) -> SynsoError {
+    SynsoError::BadQuery(format!(
+        "{kind} id {id} exceeds u32::MAX — the SoA world cannot address it"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,6 +911,183 @@ mod tests {
     }
 
     fn noop_progress(_: DedupPhase, _: u64, _: u64) {}
+
+    // ------------------------------------------------------------------
+    // Task 2: candidate streaming load (SoA + name arena + recycle bits).
+    // The old-pipeline tests above keep exercising `load_snapshot`.
+
+    /// Upserts a fully specified row — size, `is_dir` and persisted hashes
+    /// chosen by the test — under `dir_path`; returns
+    /// `(files row id, containing dir id)`.
+    #[allow(clippy::too_many_arguments)]
+    fn upsert_row(
+        store: &StdMutex<Store>,
+        dir_path: &[&str],
+        name: &str,
+        size: u64,
+        is_dir: bool,
+        hash_first: Option<u64>,
+        hash_full: Option<u64>,
+    ) -> (FileId, FileId) {
+        let mut rec = FileRecord {
+            id: 0,
+            parent: 0,
+            name: name.to_string(),
+            size,
+            mtime: 1_700_000_000,
+            ctime: 1_700_000_001,
+            atime: 1_700_000_002,
+            ext_id: 0,
+            is_dir,
+            hash_first,
+            hash_full,
+            py_full: String::new(),
+            py_init: String::new(),
+        };
+        crate::engine::lock_unpoisoned(store)
+            .upsert_file(dir_path, &mut rec)
+            .unwrap();
+        (rec.id, rec.parent)
+    }
+
+    /// A size>0 non-directory row and a persisted-hash row load; the
+    /// size=0 row and the directory row do not. `None` hashes come back
+    /// as [`NO_HASH`], `Some` pass through verbatim, names resolve from
+    /// the arena, and slot order mirrors the id-ascending stream.
+    #[test]
+    fn candidates_load_filters_and_no_hash_sentinel() {
+        let (_tmp, store) = test_store();
+        let (a, _) = upsert_row(&store, &["fixture"], "a.bin", 5, false, None, None);
+        let (b, _) = upsert_row(&store, &["fixture"], "b.bin", 5, false, Some(0x11), Some(0x22));
+        let _zero = upsert_row(&store, &["fixture"], "zero.bin", 0, false, None, None);
+        // A dir row with size>0: excluded by the is_dir filter alone.
+        let _dir = upsert_row(&store, &["fixture"], "sub", 5, true, None, None);
+
+        let Some((cands, _dirs)) = load_candidates(&store) else {
+            panic!("fixture store must load");
+        };
+        assert_eq!(
+            cands.ids.len(),
+            2,
+            "size=0 row and dir row are not candidates"
+        );
+        assert_eq!(cands.ids[0], a as u32, "stream is id-ascending");
+        assert_eq!(cands.ids[1], b as u32);
+        assert_eq!(cands.sizes, vec![5, 5]);
+        assert_eq!(cands.mtimes, vec![1_700_000_000, 1_700_000_000]);
+        assert_eq!(cands.parents[0], cands.parents[1], "same dir -> same slot");
+        // None <-> NO_HASH round trip; persisted hashes pass through.
+        assert_eq!(cands.hash_first[0], NO_HASH);
+        assert_eq!(cands.hash_full[0], NO_HASH);
+        assert_eq!(cands.hash_first[1], 0x11);
+        assert_eq!(cands.hash_full[1], 0x22);
+        assert_eq!(cands.name(0), "a.bin");
+        assert_eq!(cands.name(1), "b.bin");
+    }
+
+    /// `index_path` rebuilds the `MAIN_SEPARATOR`-joined chain from the
+    /// dir arena, root segment first — the contract the old
+    /// `Snapshot::index_path` had.
+    #[test]
+    fn candidates_index_path_rebuilds_chain() {
+        let (_tmp, store) = test_store();
+        upsert_row(
+            &store,
+            &["fixture", "docs", "inner"],
+            "memo.md",
+            3,
+            false,
+            None,
+            None,
+        );
+
+        let Some((cands, dirs)) = load_candidates(&store) else {
+            panic!("fixture store must load");
+        };
+        assert_eq!(cands.ids.len(), 1);
+        let path = cands.index_path(0, &dirs).unwrap();
+        assert_eq!(
+            path,
+            format!("fixture{MAIN_SEPARATOR}docs{MAIN_SEPARATOR}inner{MAIN_SEPARATOR}memo.md")
+        );
+    }
+
+    /// The `$Recycle.Bin` root carries the bit by name; `a` and `b`
+    /// inherit it through the id-ascending propagation; an ordinary tree
+    /// does not; and a candidate stored under the deepest dir points at a
+    /// recycle dir.
+    #[test]
+    fn candidates_recycle_bits_propagate_to_nested_dirs() {
+        let (_tmp, store) = test_store();
+        let (twin, _b_dir) = upsert_row(
+            &store,
+            &["$Recycle.Bin", "a", "b"],
+            "twin.bin",
+            5,
+            false,
+            None,
+            None,
+        );
+        let (lone_id, _fixture_dir) =
+            upsert_row(&store, &["fixture"], "lone.bin", 5, false, None, None);
+
+        let Some((cands, dirs)) = load_candidates(&store) else {
+            panic!("fixture store must load");
+        };
+        let rows = crate::engine::lock_unpoisoned(&store).all_dirs().unwrap();
+        let slot_of_name = |name: &str| {
+            dirs.by_id[&rows.iter().find(|(_, _, n)| n == name).unwrap().0] as usize
+        };
+        assert!(
+            dirs.recycle[slot_of_name("$Recycle.Bin")],
+            "the root dir carries the bit by name"
+        );
+        assert!(dirs.recycle[slot_of_name("a")], "nested child inherits it");
+        assert!(dirs.recycle[slot_of_name("b")], "so does the deepest level");
+        assert!(!dirs.recycle[slot_of_name("fixture")], "an ordinary tree does not");
+        assert_eq!(dirs.name(slot_of_name("b")), "b");
+        // twin.bin's parent slot is b, and b is recycle; lone.bin's is not.
+        assert_eq!(cands.ids, vec![twin as u32, lone_id as u32], "both size>0 files load");
+        assert_eq!(cands.parents[0] as usize, slot_of_name("b"));
+        assert!(dirs.recycle[cands.parents[0] as usize]);
+        assert!(
+            !dirs.recycle[cands.parents[1] as usize],
+            "the ordinary tree's candidate is not recycle"
+        );
+    }
+
+    /// A `files` row id beyond `u32::MAX` (only possible in a hand-edited
+    /// database) is an explicit checked-conversion error, never a silent
+    /// truncation — and the run-facing load degrades to `None` (the
+    /// trivial-run semantics of `load_snapshot`).
+    #[test]
+    fn candidates_reject_file_id_beyond_u32() {
+        let (_tmp, store) = test_store();
+        let (_id, fixture_dir) = upsert_row(&store, &["fixture"], "twin_a.bin", 5, false, None, None);
+        {
+            let mut guard = crate::engine::lock_unpoisoned(&store);
+            guard
+                .conn_mut()
+                .execute(
+                    "INSERT INTO files(id, dir, name, size, mtime, ctime, atime, ext_id, is_dir,
+                                       py_full, py_init, scan_gen)
+                     VALUES (?1, ?2, 'huge.bin', 5, 0, 0, 0, 0, 0, '', '', 0)",
+                    rusqlite::params![i64::MAX, fixture_dir],
+                )
+                .unwrap();
+        }
+
+        let err = load_candidates_checked(&store).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("9223372036854775807"),
+            "the error must name the offending id, got: {text}"
+        );
+        assert!(
+            load_candidates(&store).is_none(),
+            "a store-side error means an empty run"
+        );
+    }
 
     #[test]
     fn resolve_absolute_path_matches_root_segment() {
