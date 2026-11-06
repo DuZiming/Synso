@@ -1553,9 +1553,17 @@ pub(crate) fn sample_key(hashes: &[u64]) -> u64 {
 ///   certified members (never touched — their full hash is already
 ///   known from [`HeadOutcome::full`]/the SoA), short-circuited new
 ///   members (their run held a certified member), ≤64KB-terminal
-///   members (full hash computed here — find it in `pending`), and
-///   sampled survivors (`(size, sample_key)` runs ≥2 — gate④ full-reads
-///   them). Skipped and singleton-killed members are absent.
+///   members (full hash computed here — find it in [`SampleOutcome::small_full`]),
+///   and sampled survivors (`(size, sample_key)` runs ≥2 — gate④
+///   full-reads them). Skipped and singleton-killed members are absent.
+/// * `small_full` — PARALLEL to `full_todo` (Ruling 1 shape): the
+///   ≤64KB-terminal members' whole-file hashes computed by THIS gate,
+///   [`NO_HASH`] for every other member (certified/short-circuited/
+///   sampled carry no gate③-computed full). This side array is the
+///   authoritative record of the terminal reads — it survives every
+///   boundary flush, unlike `pending`, which is persistence-only and
+///   DRAINED by each [`PERSIST_BATCH`]/[`PROGRESS_EVERY`] flush; the
+///   caller merges fulls from HERE, never from `pending`.
 /// * `counters` — gate③'s tally: `sample_gate` counts every candidate
 ///   that left without `full_todo` membership (open/read skips +
 ///   singleton-key kills — `files` equals `errors + locked + fresh +
@@ -1570,7 +1578,9 @@ pub(crate) fn sample_key(hashes: &[u64]) -> u64 {
 ///   the column untouched), `hash_full: Some`. Sample keys are never
 ///   persisted. Chunk boundaries flush at [`PERSIST_BATCH`]; a
 ///   CANCELLED gate has flushed before returning; otherwise the
-///   residue travels back for the caller's end-of-run flush.
+///   residue travels back for the caller's end-of-run flush. The
+///   persistence record only — the VALUES for the merge live in
+///   [`SampleOutcome::small_full`].
 /// * `hashed_full_small` — full hashes computed by the ≤64KB terminal
 ///   path this gate (the sampled path computes none — that is gate④'s
 ///   job).
@@ -1581,6 +1591,9 @@ pub(crate) fn sample_key(hashes: &[u64]) -> u64 {
 #[allow(dead_code)] // Task 6 wiring: run_gates consumes it.
 pub(crate) struct SampleOutcome {
     pub(crate) full_todo: Vec<u32>,
+    /// Parallel to `full_todo`: the gate③-computed terminal fulls,
+    /// [`NO_HASH`] where the member's full is not this gate's product.
+    pub(crate) small_full: Vec<u64>,
     pub(crate) counters: OutcomeCounters,
     pub(crate) pending: Vec<HashUpdate>,
     pub(crate) hashed_full_small: u64,
@@ -1628,8 +1641,9 @@ enum SampleKind {
 ///   increment crowd — restored/rewritten files next to their
 ///   unchanged, already-hashed twins).
 /// * Clean runs put their NEW members to work: `size ≤ 64KB` → one
-///   open, whole read, terminal full hash (see
-///   [`SampleOutcome::pending`]); `size > 64KB` → one open, one seek +
+///   open, whole read, terminal full hash (recorded in
+///   [`SampleOutcome::small_full`], persisted via `pending`);
+///   `size > 64KB` → one open, one seek +
 ///   [`SAMPLE_WINDOW`] read per window offset ([`sample_window_offsets`]),
 ///   `sample_key` per [`sample_key`], then ONE `(size, sample_key)`
 ///   contiguous-run grouping over ALL sampled members: runs ≥2 survive
@@ -1751,7 +1765,10 @@ fn gate_sample_chunked(
     let mut out = SampleOutcome::default();
     let mut results_key: Vec<Option<u64>> = vec![None; participants.len()];
     let mut removed = vec![false; participants.len()];
-    let mut terminal_ok = vec![false; participants.len()];
+    // Participant-indexed terminal fulls — the flush-proof record of
+    // the ≤64KB whole reads (pending is persistence-only and DRAINED
+    // by every boundary flush; these values must outlive it).
+    let mut terminal_full = vec![NO_HASH; participants.len()];
     let mut done: u64 = 0;
     let mut tick: u64 = 0;
 
@@ -1797,7 +1814,7 @@ fn gate_sample_chunked(
             // workers deal chunk-local participant positions, the
             // result arrays are global (the gate② scatter rule).
             merge_sample_worker(
-                &mut out, &mut results_key, &mut removed, &mut terminal_ok, &mut done, pos,
+                &mut out, &mut results_key, &mut removed, &mut terminal_full, &mut done, pos,
                 worker,
             );
         }
@@ -1847,24 +1864,39 @@ fn gate_sample_chunked(
 
     // full_todo in input order: the free members, the survivors, and
     // the terminal small reads; skips and singleton kills stay out.
+    // `small_full` rides PARALLEL to it (the gate③-computed terminal
+    // fulls, NO_HASH for every other member) — the lockstep push is the
+    // Ruling-1 contract, so a desync would break the caller's merge.
     for (i, &slot) in cand.iter().enumerate() {
         match kinds[i] {
-            SampleKind::Certified | SampleKind::ShortCircuit => out.full_todo.push(slot),
+            SampleKind::Certified | SampleKind::ShortCircuit => {
+                out.full_todo.push(slot);
+                out.small_full.push(NO_HASH);
+            }
             SampleKind::TerminalSmall => {
-                if terminal_ok[participant_of[i]] {
-                    // Read succeeded — the terminal hash exists in
-                    // `pending`. (A skip or a member a cancel left
-                    // unprocessed stays out.)
+                let full = terminal_full[participant_of[i]];
+                if full != NO_HASH {
+                    // Read succeeded — the terminal hash is recorded in
+                    // `terminal_full` (and persisted via `pending`).
+                    // (A skip or a member a cancel left unprocessed
+                    // stays out.)
                     out.full_todo.push(slot);
+                    out.small_full.push(full);
                 }
             }
             SampleKind::Sampled => {
                 if survived[participant_of[i]] {
                     out.full_todo.push(slot);
+                    out.small_full.push(NO_HASH);
                 }
             }
         }
     }
+    debug_assert_eq!(
+        out.full_todo.len(),
+        out.small_full.len(),
+        "small_full rides parallel to full_todo"
+    );
 
     // Cancel may have fired mid-chunk or between chunks — workers stop
     // at file boundaries either way: flag it and flush the in-flight
@@ -1888,11 +1920,13 @@ struct SampleWorker {
     /// `(chunk-local participant, sample key)` — the sampled path's
     /// successes.
     keys: Vec<(usize, u64)>,
-    /// Chunk-local participant positions whose ≤64KB whole read
-    /// succeeded (the terminal hash is in `pending`). Success is
-    /// marked EXPLICITLY: a member a cancel left unprocessed must not
-    /// be mistaken for a success (the default is "not done").
-    small_hits: Vec<usize>,
+    /// `(chunk-local participant, whole-file hash)` — the ≤64KB
+    /// terminal path's successes. Success is marked EXPLICITLY with the
+    /// hash itself (a member a cancel left unprocessed must not be
+    /// mistaken for a success — the default is "not done"), and the
+    /// hash must NOT be read back out of `pending`: the boundary
+    /// flushes drain it mid-gate at scale.
+    small_fulls: Vec<(usize, u64)>,
     /// `(chunk-local participant, reason, snapshot size)` — every skip;
     /// the merge folds these into the reason counters and the
     /// `sample_gate` kill tally.
@@ -2055,7 +2089,7 @@ fn gate_sample_step(
         }
         let hash = hasher.digest();
         worker.hashed_full_small += 1;
-        worker.small_hits.push(j);
+        worker.small_fulls.push((j, hash));
         worker.pending.push(HashUpdate {
             id: FileId::from(c.ids[slot]),
             mtime: c.mtimes[slot],
@@ -2087,15 +2121,17 @@ fn read_window(file: &mut std::fs::File, offset: u64, buf: &mut [u8]) -> Option<
 /// keys scatter into the participant-indexed array at `base + j` (`j`
 /// is the CHUNK-LOCAL participant position, `base` the chunk's start —
 /// positions are disjoint across workers), terminal-small successes
-/// mark themselves explicitly (a cancel-left-unprocessed member must
-/// not pass), removals fold into the reason counters AND the
-/// `sample_gate` kill tally (the inclusive equation), pending and
-/// `done` accumulate.
+/// scatter their whole-file hashes into the participant-indexed
+/// `terminal_full` array EXPLICITLY (a cancel-left-unprocessed member
+/// must not pass, and the value must not be recovered from `pending` —
+/// the boundary flushes drain it), removals fold into the reason
+/// counters AND the `sample_gate` kill tally (the inclusive equation),
+/// pending and `done` accumulate.
 fn merge_sample_worker(
     out: &mut SampleOutcome,
     results_key: &mut [Option<u64>],
     removed: &mut [bool],
-    terminal_ok: &mut [bool],
+    terminal_full: &mut [u64],
     done: &mut u64,
     base: usize,
     worker: SampleWorker,
@@ -2103,8 +2139,8 @@ fn merge_sample_worker(
     for (j, key) in worker.keys {
         results_key[base + j] = Some(key);
     }
-    for j in worker.small_hits {
-        terminal_ok[base + j] = true;
+    for (j, hash) in worker.small_fulls {
+        terminal_full[base + j] = hash;
     }
     for (j, skip, size) in worker.removed {
         removed[base + j] = true;
@@ -2550,7 +2586,8 @@ fn finish_cancelled(
 /// FULL-MERGE SEMANTICS (for the Task 7 implementer): a candidate's
 /// authoritative full hash for the final grouping is the FIRST hit of —
 /// gate④'s freshly computed value, then gate③'s terminal-small value
-/// (computed this run; found in `SampleOutcome::pending`'s updates),
+/// (computed this run; found in the [`SampleOutcome::small_full`]
+/// side array — flush-proof, unlike `pending`),
 /// then gate②'s [`HeadOutcome::full`] (the ≤4KiB terminal or the
 /// persisted-full passthrough), then the SoA `hash_full` column
 /// (persisted) — the sources agree wherever they overlap. The grouping
@@ -2646,17 +2683,10 @@ pub(crate) fn run_gates(
         &cands, &dirs, &input, &head, roots, reader, workers, cancel, now, &sample_progress,
         store,
     );
-    // The gate③ terminal-small merge map: built BEFORE flushing, because
-    // flush_persist DRAINS the vec (`pending.clear()`) — these fulls are
-    // the only record of the ≤64KB terminal reads (no side array carries
-    // them) and must reach gate④'s `known` slice (so those files are
-    // never re-opened) and the final grouping.
-    let mut small_full: HashMap<FileId, u64> = HashMap::new();
-    for update in &sample.pending {
-        if let Some(hash) = update.hash_full {
-            small_full.insert(update.id, hash);
-        }
-    }
+    // Persist the terminal-small updates; the VALUES for the merge are
+    // NOT read from here — `pending` is persistence-only and was
+    // already drained by gate③'s own boundary flushes at scale. The
+    // flush-proof record is the `SampleOutcome::small_full` side array.
     flush_persist(store, &mut sample.pending);
     if sample.cancelled {
         outcome.counters = size_counters;
@@ -2676,10 +2706,22 @@ pub(crate) fn run_gates(
     // already holds (see the doc comment's merge order) into a slice
     // parallel to full_todo — members with a known full skip the read
     // (the incremental crowd and gate③'s terminal smalls, whose values
-    // live in `small_full` above), the rest get the streaming pass. ----
+    // live in the `SampleOutcome::small_full` side array), the rest get
+    // the streaming pass. ----
     let mut slot_pos = vec![usize::MAX; cands.ids.len()];
     for (p, &slot) in head.cand.iter().enumerate() {
         slot_pos[slot as usize] = p;
+    }
+    debug_assert_eq!(
+        sample.full_todo.len(),
+        sample.small_full.len(),
+        "gate③'s terminal fulls ride parallel to full_todo"
+    );
+    let mut small_full: HashMap<FileId, u64> = HashMap::new();
+    for (&slot, &hash) in sample.full_todo.iter().zip(sample.small_full.iter()) {
+        if hash != NO_HASH {
+            small_full.insert(FileId::from(cands.ids[slot as usize]), hash);
+        }
     }
     let known: Vec<u64> = sample
         .full_todo
@@ -4352,10 +4394,13 @@ mod tests {
             assert_eq!(update.hash_first, None, "gate② already carried hash_first");
             assert_eq!(update.hash_full, Some(full));
         }
-        // Terminal: both reach gate④ via full_todo, in input order.
+        // Terminal: both reach gate④ via full_todo, in input order —
+        // with their fulls riding the flush-proof side array (pending
+        // alone cannot be trusted: boundary flushes drain it).
         assert_eq!(out.full_todo.len(), 2);
         assert_eq!(sample_pos(&out.full_todo, &cands, a), Some(0));
         assert_eq!(sample_pos(&out.full_todo, &cands, b), Some(1));
+        assert_eq!(out.small_full, vec![full, full], "parallel to full_todo");
         // Nothing killed, nothing skipped, gate②'s tally untouched.
         assert_eq!(out.counters.sample_gate.files, 0);
         assert_eq!(out.counters.errors + out.counters.locked + out.counters.fresh, 0);
@@ -4413,6 +4458,11 @@ mod tests {
         assert_eq!(out.full_todo.len(), 2, "both reach gate④");
         assert_eq!(sample_pos(&out.full_todo, &cands, a), Some(0));
         assert_eq!(sample_pos(&out.full_todo, &cands, f), Some(1));
+        assert_eq!(
+            out.small_full,
+            vec![NO_HASH, NO_HASH],
+            "neither member's full is gate③'s product"
+        );
         assert!(out.pending.is_empty(), "gate③ computed nothing");
         assert_eq!(out.hashed_full_small, 0);
         assert_eq!(out.counters.sample_gate.files, 0);
@@ -4670,6 +4720,15 @@ mod tests {
             assert_eq!(out.hashed_full_small, 5);
             assert_eq!(out.full_todo, expected_slots, "input order preserved");
             assert_eq!(out.counters.sample_gate.files, 0);
+            // The side array rides parallel to full_todo across every
+            // chunk/worker split: each file's hash at its own position.
+            for (i, content) in contents.iter().enumerate() {
+                assert_eq!(
+                    out.small_full[i],
+                    xxh64(content, 0),
+                    "chunk_size={chunk_size} workers={workers}: f{i}'s full at its own side-array slot"
+                );
+            }
             let mut updates: Vec<(FileId, Option<u64>)> = out
                 .pending
                 .iter()
@@ -4751,6 +4810,12 @@ mod tests {
         );
         assert_eq!(log.lock().unwrap().last(), Some(&(1, 2)));
         assert_eq!(out.full_todo, vec![slot_of(&cands, a)]);
+        assert!(
+            out.small_full == vec![xxh64(&content, 0)],
+            "a's full rides the flush-proof side array even though the \
+             cancel flushed (drained) pending — the exact hazard the \
+             array exists for"
+        );
         assert!(out.pending.is_empty(), "the cancel flushed the batch first");
         // And the flush really landed: a.bin's row now carries hash_full.
         let rows = crate::engine::lock_unpoisoned(&store).all_files().unwrap();
@@ -5364,6 +5429,66 @@ mod tests {
         assert_eq!(outcome.groups[0].hash, xxh64(content, 0));
         assert_eq!(outcome.hashed_full, 0, "no full-stage computation at all");
         assert_eq!(outcome.hashed_first, 2);
+    }
+
+    /// THE AT-SCALE flush-boundary test: 130 identical 32KB files all
+    /// take gate③'s terminal-small path, so `out.pending` reaches
+    /// `PERSIST_BATCH` (128) and the chunk-boundary flush DRAINS it
+    /// mid-gate — the residue run_gates used to build its merge map
+    /// from comes back empty. The fulls must reach gate④ through the
+    /// flush-proof `SampleOutcome::small_full` side array instead:
+    /// gate④ opens ZERO files, every full hash is counted exactly
+    /// once, and the whole crowd still groups. (2-file fixtures cannot
+    /// see this boundary; the real library's 4KB<size≤64KB bucket is
+    /// ~533K files, so EVERY real run crosses it many times over.)
+    #[test]
+    fn gates_sample_small_terminal_fulls_survive_boundary_flushes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        let content = vec![b't'; 32 * 1024];
+        let (_tstore, store) = test_store();
+        const N: usize = 130; // > PERSIST_BATCH: the boundary flush fires
+        let mut ids = Vec::new();
+        for i in 0..N {
+            ids.push(gates_fixture(&store, &root, "", &format!("f{i:03}.bin"), &content));
+        }
+        let roots = gate_roots(&root);
+        let cancel = AtomicBool::new(false);
+
+        let reader = FakeReader::new();
+        let (outcome, log) = gates_run(&store, &roots, &reader, &cancel);
+
+        // EXACTLY two opens per file — gate②'s probe and gate③'s whole
+        // read. Gate④ contributed ZERO despite the drained residue.
+        let mut per_path: HashMap<PathBuf, usize> = HashMap::new();
+        for path in reader.opened.lock().unwrap().iter() {
+            *per_path.entry(path.clone()).or_default() += 1;
+        }
+        assert_eq!(per_path.len(), N, "every fixture opened");
+        assert!(
+            per_path.values().all(|&count| count == 2),
+            "each file exactly probe + whole read, never a gate④ re-read"
+        );
+        // The group forms from the gate③-computed fulls: ONE group of
+        // all 130 members, ids ascending.
+        assert_eq!(outcome.groups.len(), 1);
+        assert_eq!(outcome.groups[0].size, content.len() as u64);
+        assert_eq!(outcome.groups[0].hash, xxh64(&content, 0));
+        let mut expected = ids.clone();
+        expected.sort_unstable();
+        assert_eq!(outcome.groups[0].members, expected);
+        // Each full counted EXACTLY once (gate③'s terminal path; a
+        // re-read pass would double it to 260).
+        assert_eq!(outcome.hashed_first, N as u64);
+        assert_eq!(outcome.hashed_full, N as u64);
+        assert_eq!(*log.last().unwrap(), (DedupPhase::Done, 2 * N as u64, 2 * N as u64));
+        // And the boundary flush really landed: every row carries its
+        // full hash.
+        let rows = crate::engine::lock_unpoisoned(&store).all_files().unwrap();
+        assert_eq!(rows.len(), N);
+        for row in &rows {
+            assert_eq!(row.hash_full, Some(xxh64(&content, 0)));
+        }
     }
 
     /// A store whose candidate load fails (an id past `u32::MAX` — the
