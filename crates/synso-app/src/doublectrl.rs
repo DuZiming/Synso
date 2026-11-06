@@ -22,9 +22,11 @@ use tauri::Manager;
 use crate::quick;
 
 /// Two Ctrl presses inside this window count as a double tap.
+#[cfg_attr(not(windows), allow(dead_code))]
 const TAP_WINDOW: Duration = Duration::from_millis(500);
 
 /// The double-tap state machine, pure and clock-injected for tests.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) struct DoubleTap {
     last_ctrl: Option<Instant>,
 }
@@ -58,6 +60,7 @@ impl DoubleTap {
 }
 
 /// The key classes the detector distinguishes.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TapKey {
     Ctrl,
