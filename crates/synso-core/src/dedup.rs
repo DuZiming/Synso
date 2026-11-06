@@ -1135,6 +1135,28 @@ pub(crate) fn gate_head(
     progress: &dyn Fn(u64, u64),
     store: &Mutex<Store>,
 ) -> HeadOutcome {
+    gate_head_chunked(
+        c, dirs, cand, roots, reader, workers, cancel, now, progress, store, CHUNK,
+    )
+}
+
+/// [`gate_head`]'s body with the chunk size injected — the test seam that
+/// lets the suite cross chunk boundaries with small fixtures (production
+/// always goes through [`gate_head`], i.e. [`CHUNK`]).
+#[allow(clippy::too_many_arguments)]
+fn gate_head_chunked(
+    c: &Candidates,
+    dirs: &Dirs,
+    cand: &[u32],
+    roots: &[String],
+    reader: &dyn FileReader,
+    workers: usize,
+    cancel: &AtomicBool,
+    now: i64,
+    progress: &dyn Fn(u64, u64),
+    store: &Mutex<Store>,
+    chunk_size: usize,
+) -> HeadOutcome {
     let mut order = cand.to_vec();
     // Directory order, ONCE at the gate's entry: (parent dir slot, row
     // id) is a total order (ids are unique). `head`/`full` stay parallel
@@ -1159,7 +1181,7 @@ pub(crate) fn gate_head(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let end = (pos + CHUNK).min(order.len());
+        let end = (pos + chunk_size).min(order.len());
         let chunk = &order[pos..end];
         let next = AtomicUsize::new(0);
         // A `move` closure captures this reference by value (the
@@ -1187,7 +1209,10 @@ pub(crate) fn gate_head(
         }
         drop(tx); // scope has joined; the channel drains and closes
         while let Ok(worker) = rx.recv() {
-            merge_worker(&mut out, &mut done, worker);
+            // `pos` is this chunk's base in the global directory order —
+            // the workers deal chunk-local positions, the parallel
+            // arrays are global (Ruling 1).
+            merge_worker(&mut out, &mut done, pos, worker);
         }
 
         // Chunk boundary: batched persist (one short lock per flush)
@@ -1378,14 +1403,16 @@ fn gate_head_step(
 }
 
 /// Folds one worker's chunk results into the shared outcome: hits
-/// scatter into the parallel arrays (chunk positions are disjoint
-/// across workers), pending joins the batch, counters accumulate.
-fn merge_worker(out: &mut HeadOutcome, done: &mut u64, worker: GateWorker) {
+/// scatter into the parallel arrays at `base + k` (`k` is the CHUNK-
+/// local position the cursor dealt, `base` the chunk's start in the
+/// global directory order — positions are disjoint across workers),
+/// pending joins the batch, counters accumulate.
+fn merge_worker(out: &mut HeadOutcome, done: &mut u64, base: usize, worker: GateWorker) {
     for (k, hash) in worker.head_hits {
-        out.head[k] = hash;
+        out.head[base + k] = hash;
     }
     for (k, hash) in worker.full_hits {
-        out.full[k] = hash;
+        out.full[base + k] = hash;
     }
     out.pending.extend(worker.pending);
     out.hashed_first += worker.hashed_first;
@@ -2525,6 +2552,86 @@ mod tests {
         let mut sorted_in = input.clone();
         sorted_in.sort_unstable();
         assert_eq!(sorted_out, sorted_in, "a permutation of the input slots");
+    }
+
+    /// Multi-chunk runs scatter correctly: workers deal CHUNK-LOCAL
+    /// positions, `head`/`full` are GLOBAL directory-order arrays — with
+    /// distinct contents every candidate's hash must land at ITS OWN
+    /// position, across the boundary. Chunk size 2 over 5 candidates =
+    /// chunks [0,1] [2,3] [4]; before the base-offset fix, chunk 2's
+    /// first candidate clobbered chunk 1's slot 0.
+    #[test]
+    fn gate_head_multi_chunk_scatters_every_head_to_its_own_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(root.join("d1")).unwrap();
+        fs::create_dir_all(root.join("d2")).unwrap();
+
+        let (_tstore, store) = test_store();
+        // Distinct contents -> distinct hashes, so a swapped slot cannot
+        // pass unnoticed. Every file <= 4KiB: terminal, full == head.
+        let contents: Vec<Vec<u8>> = (0..5)
+            .map(|i| format!("content number {i:02} padding").into_bytes())
+            .collect();
+        for (i, content) in contents.iter().enumerate() {
+            let dir = if i < 3 { "d1" } else { "d2" };
+            fs::write(root.join(dir).join(format!("f{i}.bin")), content).unwrap();
+            upsert_row_at(
+                &store,
+                &["fixture", dir],
+                &format!("f{i}.bin"),
+                content.len() as u64,
+                NOW - 1_000,
+                None,
+                None,
+            );
+        }
+        let (cands, dirs) = load_cands(&store);
+        let roots = gate_roots(&root);
+
+        for (workers, chunk_size) in [(1, 2), (2, 2), (1, 3), (2, 4)] {
+            let reader = FakeReader::new();
+            let cancel = AtomicBool::new(false);
+            let out = gate_head_chunked(
+                &cands,
+                &dirs,
+                &all_slots(&cands),
+                &roots,
+                &reader,
+                workers,
+                &cancel,
+                NOW,
+                &|_, _| {},
+                &store,
+                chunk_size,
+            );
+
+            assert_eq!(out.cand.len(), 5, "every candidate present");
+            for (i, content) in contents.iter().enumerate() {
+                let id = cands.ids[i];
+                let expected = xxh64(content, 0);
+                let pos = pos_of(&out, &cands, id as FileId);
+                assert_eq!(
+                    out.head[pos], expected,
+                    "chunk_size={chunk_size} workers={workers}: f{i}'s head must sit at its own slot {pos}"
+                );
+                assert_eq!(
+                    out.full[pos], expected,
+                    "chunk_size={chunk_size} workers={workers}: f{i} is terminal, full == head at slot {pos}"
+                );
+            }
+            assert!(
+                out.head.iter().all(|&h| h != NO_HASH),
+                "chunk_size={chunk_size} workers={workers}: no slot may stay NO_HASH"
+            );
+            assert!(
+                out.full.iter().all(|&h| h != NO_HASH),
+                "chunk_size={chunk_size} workers={workers}: all candidates terminal here"
+            );
+            // Persisted nothing is lost either way: 5 computed updates.
+            assert_eq!(out.pending.len(), 5);
+            assert_eq!(out.hashed_first, 5);
+        }
     }
 
     /// workers = 2 and workers = 1 agree: same head/full arrays, same
