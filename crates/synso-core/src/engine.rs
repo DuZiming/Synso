@@ -92,9 +92,13 @@ pub struct EngineOptions {
 }
 
 /// Phase of a dedup run (Task 9). The engine walks `Idle -> Grouping ->
-/// HashingFirst -> HashingFull -> Done` (intermediate stages are skipped
-/// when they have no work); `Grouping` reappears as the in-progress phase
-/// of every new run.
+/// HashingFirst -> Sampling -> HashingFull -> Done` (intermediate stages
+/// are skipped when they have no work); `Grouping` reappears as the
+/// in-progress phase of every new run. `Sampling` (pipeline rewrite,
+/// Task 6) is gate③'s phase between the first probe and the full read;
+/// `Cancelled` is the final report of a cancelled run — Task 6's
+/// `run_gates` emits it as the last progress phase, Task 7 wires the
+/// state machine to land there instead of `Done`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 // JSON bridges (the app's IPC) spell phases snake_case — the same
@@ -106,8 +110,13 @@ pub enum DedupPhase {
     Idle,
     Grouping,
     HashingFirst,
+    /// Gate③'s sampling pass (pipeline rewrite, Task 6).
+    Sampling,
     HashingFull,
     Done,
+    /// A cancelled run's final state (Task 6 reports it; Task 7 wires
+    /// the engine state machine to it).
+    Cancelled,
 }
 
 /// Event broadcast to every subscriber that registered before the event
