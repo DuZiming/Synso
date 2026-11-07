@@ -4,8 +4,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 import type {
+  DedupPage,
   DedupState,
-  DupeGroup,
   EngineStats,
   FileDetail,
   ParsedQuery,
@@ -129,19 +129,32 @@ export function dedupStart(): Promise<void> {
   return invoke("dedup_start");
 }
 
-/** Snapshot of the dedup state machine (phase + progress + group count). */
+/** Snapshot of the dedup state machine (phase + progress + group count
+ * plus the run-completion aggregates `alive_groups`/`wasted_bytes`). */
 export function dedupState(): Promise<DedupState> {
   return invoke("dedup_state");
 }
 
 /** One page `[offset, offset + limit)` of the last run's dupe groups,
- * size-descending. Deleted files drop out; groups below 2 members
- * dissolve. */
+ * size-descending — returned as a [`DedupPage`]: the page's `groups`
+ * plus `total_alive`, the count of groups that still materialize (>= 2
+ * live members) across ALL pages, scanned against the CURRENT hot index.
+ * Deleted files drop out; groups below 2 members dissolve; a cancelled
+ * run keeps serving the previous run's groups. */
 export function dedupGroups(
   offset: number,
   limit: number,
-): Promise<DupeGroup[]> {
+): Promise<DedupPage> {
   return invoke("dedup_groups", { offset, limit });
+}
+
+/** Asks the running dedup run to stop at its next checkpoint (the
+ * dashboard's stop button; idempotent, a no-op while idle). The run
+ * keeps every hash it already computed, reports `cancelled` as its
+ * FINAL `dedup-progress` phase, broadcasts NO `dedup-finished`, and the
+ * last completed run's groups stay on duty. */
+export function dedupCancel(): Promise<void> {
+  return invoke("dedup_cancel");
 }
 
 /** Moves the entries behind `ids` to the recycle bin (never a permanent

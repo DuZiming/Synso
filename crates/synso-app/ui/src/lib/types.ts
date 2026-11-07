@@ -27,6 +27,9 @@ export interface Settings {
   mem_hot_threshold: number;
   mem_decay_half_life_h: number;
   mem_preload_on_start: boolean;
+  // v1.2 dedup gear (Task 7): how aggressively dedup runs. Applies to the
+  // NEXT analysis run (the engine reads it when a run starts).
+  dedup_gear: "gentle" | "standard" | "turbo";
 }
 
 /// Mirror of `synso_core::TierStats` (the settings dashboard's gauges).
@@ -90,7 +93,14 @@ export interface ScanFailedPayload {
 
 /// Payload of the `dedup-progress` event.
 export interface DedupProgressPayload {
-  phase: "idle" | "grouping" | "hashing_first" | "hashing_full" | "done";
+  phase:
+    | "idle"
+    | "grouping"
+    | "hashing_first"
+    | "sampling"
+    | "hashing_full"
+    | "done"
+    | "cancelled";
   done: number;
   total: number;
 }
@@ -148,19 +158,27 @@ export type DedupPhase =
   | "idle"
   | "grouping"
   | "hashing_first"
+  | "sampling"
   | "hashing_full"
-  | "done";
+  | "done"
+  | "cancelled";
 
 /// Mirror of `synso_core::DedupState` (`dedup_state`'s payload): phase of
 /// the state machine, `done`/`total` of the CURRENT stage (at `done` they
 /// equal this run's hash computations), the last completed run's group
 /// count and the files skipped unreadable / as cloud placeholders.
+/// `alive_groups`/`wasted_bytes` are the run-completion aggregates (a
+/// cancelled run keeps the previous run's values; 0/0 before the first
+/// completed run): the groups that still materialize (>= 2 live members)
+/// and the bytes deleting one redundant copy of each would reclaim.
 export interface DedupState {
   phase: DedupPhase;
   done: number;
   total: number;
   groups: number;
   errors: number;
+  alive_groups: number;
+  wasted_bytes: number;
 }
 
 /// Mirror of `synso_core::DupeGroup` (`dedup_groups`' payload): one
@@ -170,6 +188,16 @@ export interface DupeGroup {
   hash: number;
   size: number;
   members: Hit[];
+}
+
+/// Mirror of `synso_core::DedupPage` (`dedup_groups`' payload): the
+/// page's materialized groups plus `total_alive`, the count of groups
+/// that still materialize (>= 2 live members) across ALL pages, scanned
+/// against the CURRENT hot index — the full alive-filtered total a paged
+/// frontend needs without paging to the end.
+export interface DedupPage {
+  groups: DupeGroup[];
+  total_alive: number;
 }
 
 /// Mirror of `synso_core::SizeNode` (`size_tree`'s payload): one node of

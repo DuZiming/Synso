@@ -25,6 +25,65 @@ pub const DEFAULT_LANG: &str = "auto";
 /// `settings.shortcut` default: the design's global hotkey spelling.
 pub const DEFAULT_SHORTCUT: &str = "Ctrl+;";
 
+/// How aggressively a dedup run may use the machine (Task 7): the engine
+/// maps the gear onto the gates' worker-pool size ([`DedupGear::workers`])
+/// and, for [`DedupGear::Gentle`], drops the dedup thread below normal
+/// priority (Windows) so hashing stays out of everything else's way.
+/// Persisted as the string `settings.dedup_gear` ("gentle"/"standard"/
+/// "turbo"); an unreadable or unknown spelling falls back to
+/// [`DedupGear::Standard`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(rename_all = "snake_case")
+)]
+pub enum DedupGear {
+    /// One worker; the dedup thread itself runs below normal priority —
+    /// dedup must never make the rest of the app (or the user's work)
+    /// perceptibly slower.
+    Gentle,
+    /// Two workers at normal priority — the default.
+    #[default]
+    Standard,
+    /// Four workers at normal priority — the machine is ours while the
+    /// run lasts.
+    Turbo,
+}
+
+impl DedupGear {
+    /// The meta-row spelling ([`DedupGear`] stored under
+    /// `settings.dedup_gear`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DedupGear::Gentle => "gentle",
+            DedupGear::Standard => "standard",
+            DedupGear::Turbo => "turbo",
+        }
+    }
+
+    /// Parses the meta-row spelling; anything else (a hand-edited row or a
+    /// spelling a newer schema retired) falls back to
+    /// [`DedupGear::Standard`].
+    fn parse(value: &str) -> DedupGear {
+        match value {
+            "gentle" => DedupGear::Gentle,
+            "turbo" => DedupGear::Turbo,
+            _ => DedupGear::Standard,
+        }
+    }
+
+    /// The gate worker-pool size the gear maps onto (the plan's pinned
+    /// table: Gentle=1 / Standard=2 / Turbo=4).
+    pub fn workers(self) -> usize {
+        match self {
+            DedupGear::Gentle => 1,
+            DedupGear::Standard => 2,
+            DedupGear::Turbo => 4,
+        }
+    }
+}
+
 /// User-visible settings (the brief's five fields plus the first-run
 /// wizard's completion flag), backed by the `meta` table via
 /// [`Engine::settings`] / [`Engine::set_settings`].
@@ -70,6 +129,10 @@ pub struct Settings {
     pub mem_decay_half_life_h: u32,
     /// Preload the hot tier from persisted heat at startup / after scans.
     pub mem_preload_on_start: bool,
+    // ---- Task 7: dedup gear ----
+    /// How aggressively dedup runs ([`DedupGear`]: worker count + a
+    /// below-normal-priority hint for [`DedupGear::Gentle`]).
+    pub dedup_gear: DedupGear,
 }
 
 impl Default for Settings {
@@ -89,6 +152,7 @@ impl Default for Settings {
             mem_hot_threshold: 8,
             mem_decay_half_life_h: 24,
             mem_preload_on_start: true,
+            dedup_gear: DedupGear::Standard,
         }
     }
 }
@@ -164,6 +228,9 @@ pub fn load(store: &Store) -> Settings {
                 _ => None,
             })
             .unwrap_or(true),
+        dedup_gear: read(store, "dedup_gear")
+            .map(|v| DedupGear::parse(&v))
+            .unwrap_or_default(),
     }
 }
 
@@ -231,6 +298,10 @@ pub fn save(store: &Store, settings: &Settings) -> Result<()> {
             "0"
         },
     )?;
+    store.set_meta(
+        &format!("{KEY_PREFIX}dedup_gear"),
+        settings.dedup_gear.as_str(),
+    )?;
     Ok(())
 }
 
@@ -291,6 +362,11 @@ mod tests {
         assert!(first.settings().volumes.is_empty());
         assert_eq!(first.settings().shortcut, "Ctrl+;");
         assert!(!first.settings().first_run_done);
+        assert_eq!(
+            first.settings().dedup_gear,
+            DedupGear::Standard,
+            "fresh DB: the dedup gear default"
+        );
 
         // Save a modified set.
         let mut modified = Settings {
@@ -305,6 +381,7 @@ mod tests {
         modified.mem_hot_budget_mb = 128;
         modified.mem_staging_ttl_secs = 60;
         modified.mem_preload_on_start = false;
+        modified.dedup_gear = DedupGear::Turbo;
         first.set_settings(&modified).unwrap();
         assert_eq!(first.settings(), modified, "read-back after save");
 
@@ -359,6 +436,58 @@ mod tests {
         cleared.volumes = Vec::new();
         save(&store, &cleared).unwrap();
         assert_eq!(load(&store), cleared);
+    }
+
+    /// The dedup gear's meta spelling (Task 7): each valid string loads as
+    /// its variant, and a missing, empty or unknown row (a hand-edited
+    /// database, a spelling a newer schema retired) falls back to
+    /// [`DedupGear::Standard`].
+    #[test]
+    fn dedup_gear_parses_and_bad_value_falls_back_to_standard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("index.db")).unwrap();
+
+        // Missing row: the default.
+        assert_eq!(load(&store).dedup_gear, DedupGear::Standard);
+
+        for (spelling, gear) in [
+            ("gentle", DedupGear::Gentle),
+            ("standard", DedupGear::Standard),
+            ("turbo", DedupGear::Turbo),
+        ] {
+            store.set_meta("settings.dedup_gear", spelling).unwrap();
+            assert_eq!(load(&store).dedup_gear, gear, "spelling {spelling:?}");
+        }
+
+        for bad in ["warp", "GENTLE", "", "gentle "] {
+            store.set_meta("settings.dedup_gear", bad).unwrap();
+            assert_eq!(
+                load(&store).dedup_gear,
+                DedupGear::Standard,
+                "bad spelling {bad:?} falls back to Standard"
+            );
+        }
+    }
+
+    /// The JSON spelling of every gear (the app's settings IPC): snake_case
+    /// — the same convention the `settings.*` meta rows use, so one
+    /// spelling travels from the store through the IPC to the frontend.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn dedup_gear_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&DedupGear::Gentle).unwrap(),
+            "\"gentle\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DedupGear::Standard).unwrap(),
+            "\"standard\""
+        );
+        assert_eq!(serde_json::to_string(&DedupGear::Turbo).unwrap(), "\"turbo\"");
+        assert_eq!(
+            serde_json::from_str::<DedupGear>("\"turbo\"").unwrap(),
+            DedupGear::Turbo
+        );
     }
 
     fn open_engine(db_path: &Path) -> Engine {

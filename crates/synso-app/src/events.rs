@@ -9,7 +9,7 @@
 //! same convention `engine_stats` & co. return over IPC, so the frontend
 //! maps Rust data 1:1 instead of tracking two spellings. Dedup phases
 //! serialize as snake_case strings ("idle", "grouping", "hashing_first",
-//! "hashing_full", "done").
+//! "sampling", "hashing_full", "done", "cancelled").
 
 use crossbeam_channel::Receiver;
 use serde::Serialize;
@@ -22,8 +22,10 @@ enum PhasePayload {
     Idle,
     Grouping,
     HashingFirst,
+    Sampling,
     HashingFull,
     Done,
+    Cancelled,
 }
 
 impl From<DedupPhase> for PhasePayload {
@@ -32,8 +34,10 @@ impl From<DedupPhase> for PhasePayload {
             DedupPhase::Idle => PhasePayload::Idle,
             DedupPhase::Grouping => PhasePayload::Grouping,
             DedupPhase::HashingFirst => PhasePayload::HashingFirst,
+            DedupPhase::Sampling => PhasePayload::Sampling,
             DedupPhase::HashingFull => PhasePayload::HashingFull,
             DedupPhase::Done => PhasePayload::Done,
+            DedupPhase::Cancelled => PhasePayload::Cancelled,
         }
     }
 }

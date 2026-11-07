@@ -1,9 +1,12 @@
 <script lang="ts">
   // Dedup view (Task 16): the 查重 tab. On mount it reads `dedup_state`
   // (so a background auto-start run is picked up mid-flight) and loads the
-  // last run's groups page by page; `dedup-progress` / `dedup-finished`
-  // events then drive the progress card, and `fs-changed` re-syncs groups
-  // when files change underneath (restores, external deletes).
+  // FIRST page of the last run's groups — every further page is fetched
+  // on demand (`dedup_groups` answers with the page plus `total_alive`,
+  // so the pager never needs a full pull). `dedup-progress` /
+  // `dedup-finished` events then drive the progress card, and
+  // `fs-changed` re-syncs when files change underneath (restores,
+  // external deletes).
   //
   // Deletion composes the engine's `delete_to_trash` purely in the
   // frontend: per group, 保留最新 / 保留最旧 pick the mtime extreme and
@@ -12,28 +15,44 @@
   // the command fires. The engine never materializes a 1-member group,
   // but the view still refuses to queue every member of a group: at
   // least one file per group always survives.
+  //
+  // The header's 取消分析 button asks a running run to stop at its next
+  // checkpoint (`dedup_cancel`); the run then reports `cancelled` as its
+  // final progress phase and the PREVIOUS run's groups stay on duty —
+  // the list is left untouched. The gear button cycles the settings'
+  // `dedup_gear` (gentle -> standard -> turbo) and persists immediately
+  // via the whole-object settings_set flow; the engine reads the gear
+  // when a run starts, so a switch takes effect on the NEXT analysis.
   import { onMount } from "svelte";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { t } from "../i18n";
   import { formatTime, humanBytes } from "../lib/format";
   import {
+    dedupCancel,
     dedupGroups,
     dedupStart,
     dedupState,
     deleteToTrash,
+    settingsGet,
+    settingsSet,
   } from "../lib/tauri";
-  import type { DedupPhase, DupeGroup } from "../lib/types";
+  import type {
+    DedupPhase,
+    DedupProgressPayload,
+    DupeGroup,
+    Settings,
+  } from "../lib/types";
 
   /** Overview stats live in the parent; fires after our deletes so the
    * tiles re-read `engine_stats` (the index was already synced). */
   let { onchanged }: { onchanged?: () => void } = $props();
 
-  /// Groups per list page (the brief's 20).
+  /// Groups per list page AND per IPC fetch (the brief's 20).
   const PAGE_SIZE = 20;
-  /// Groups fetched per IPC call while loading the whole list.
-  const FETCH_CHUNK = 50;
-  /// Safety cap for the fetch loop (50 × 2000 = 100k groups).
-  const MAX_FETCH_PAGES = 2000;
+
+  /** The dedup gear, spelled exactly as `Settings.dedup_gear` over IPC. */
+  type Gear = Settings["dedup_gear"];
+  const GEARS: readonly Gear[] = ["gentle", "standard", "turbo"];
 
   let loading = $state(true);
   let loadError = $state<string | null>(null);
@@ -42,10 +61,23 @@
   let done = $state(0);
   let total = $state(0);
   let errors = $state(0);
+  /** Run-completion aggregates — the header's figures (groups that still
+   * materialize and the bytes one redundant copy of each would reclaim).
+   * A cancelled run keeps the previous run's values. */
+  let aliveGroups = $state(0);
+  let wastedBytes = $state(0);
   let starting = $state(false);
 
+  /** The CURRENT page's groups — fetched one page at a time, never a
+   * full pull. */
   let groups = $state<DupeGroup[]>([]);
   let page = $state(0);
+  /** Alive-group total across ALL pages (drives the pager). */
+  let totalAlive = $state(0);
+
+  /** Dedup gear (Settings.dedup_gear), cycled by the header button. */
+  let gear = $state<Gear>("standard");
+  let gearBusy = $state(false);
 
   /** Group indexes currently expanded (member list visible). */
   let expanded = $state<number[]>([]);
@@ -70,18 +102,11 @@
   const running = $derived(
     phase === "grouping" ||
       phase === "hashing_first" ||
+      phase === "sampling" ||
       phase === "hashing_full",
   );
-  const wastedTotal = $derived(
-    groups.reduce((sum, g) => sum + wastedOf(g), 0),
-  );
-  const pageCount = $derived(
-    Math.max(1, Math.ceil(groups.length / PAGE_SIZE)),
-  );
-  const safePage = $derived(Math.min(page, pageCount - 1));
-  const pageGroups = $derived(
-    groups.slice(safePage * PAGE_SIZE, (safePage + 1) * PAGE_SIZE),
-  );
+  const totalPages = $derived(Math.ceil(totalAlive / PAGE_SIZE));
+  const safePage = $derived(Math.min(page, Math.max(totalPages - 1, 0)));
 
   function wastedOf(group: DupeGroup): number {
     return group.size * (group.members.length - 1);
@@ -173,35 +198,94 @@
     }
   }
 
+  /** Asks the running run to stop at its next checkpoint. No local state
+   * changes here: the final `cancelled` progress event drives the UI
+   * (see its listener). */
+  function cancelAnalysis(): void {
+    void dedupCancel();
+  }
+
+  /** Cycles gentle -> standard -> turbo and persists immediately through
+   * the whole-object settings_set flow (a fresh settings_get per click,
+   * like the language switch, so no other live setting is reverted).
+   * Optimistic: the button flips at once; a failed save reverts it. */
+  async function cycleGear(): Promise<void> {
+    if (gearBusy) return;
+    const prev = gear;
+    const next = GEARS[(GEARS.indexOf(prev) + 1) % GEARS.length];
+    gear = next;
+    gearBusy = true;
+    try {
+      const settings = await settingsGet();
+      await settingsSet({ ...settings, dedup_gear: next });
+    } catch {
+      // Errors keep the previous gear (the SettingsView precedent).
+      gear = prev;
+    }
+    gearBusy = false;
+  }
+
+  /** Loads the persisted gear for display. The backend state may not be
+   * managed yet for a fast-mounting window (see initI18n's retry note) —
+   * this is a display default (the engine's own default is standard), so
+   * a few quick retries suffice; cycleGear re-reads at click time anyway. */
+  async function loadGear(): Promise<void> {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const persisted = (await settingsGet()).dedup_gear;
+        // A cycle clicking in before this read resolved already flipped
+        // the gear optimistically — its value is the authoritative one.
+        if (!gearBusy) gear = persisted;
+        return;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+    }
+  }
+
   async function refreshState(): Promise<void> {
     const state = await dedupState();
     phase = state.phase;
     done = state.done;
     total = state.total;
     errors = state.errors;
+    aliveGroups = state.alive_groups;
+    wastedBytes = state.wasted_bytes;
   }
 
-  /** Loads every group (pages until a short page) and resets the pager.
-   * The engine pages size-descending with a stable order, so client-side
-   * pagination over the materialized list matches the engine's own. */
-  async function loadGroups(): Promise<void> {
-    const acc: DupeGroup[] = [];
-    for (
-      let offset = 0;
-      acc.length < FETCH_CHUNK * MAX_FETCH_PAGES;
-      offset += FETCH_CHUNK
-    ) {
-      const chunk = await dedupGroups(offset, FETCH_CHUNK);
-      acc.push(...chunk);
-      if (chunk.length < FETCH_CHUNK) break;
+  /** Fetches ONE page (`[p·20, (p+1)·20)` of the size-descending alive
+   * ordering) — the engine answers with the page plus `total_alive`,
+   * which also refreshes the pager. Tolerance: groups can dissolve
+   * underneath (deletes, fs changes) and shrink `total_alive` past the
+   * current page; a 0-group answer with alive groups left is out of
+   * range by construction (count and page share one snapshot), so clamp
+   * to the recomputed last page and refetch once. */
+  async function loadPage(p: number): Promise<void> {
+    const result = await dedupGroups(p * PAGE_SIZE, PAGE_SIZE);
+    if (result.groups.length === 0 && result.total_alive > 0) {
+      const last = Math.max(Math.ceil(result.total_alive / PAGE_SIZE) - 1, 0);
+      const clamped = await dedupGroups(last * PAGE_SIZE, PAGE_SIZE);
+      groups = clamped.groups;
+      totalAlive = clamped.total_alive;
+      page = last;
+      return;
     }
-    groups = acc;
-    page = 0;
+    groups = result.groups;
+    totalAlive = result.total_alive;
+    page = p;
   }
 
+  /** Pager click: one page fetch; failures surface like load errors. */
+  function gotoPage(p: number): void {
+    void loadPage(p).catch((err) => (loadError = String(err)));
+  }
+
+  /** State + first page: the view's one re-sync (mount, run completion,
+   * deletes, fs changes). Always lands on page 0 — the canonical read of
+   * the CURRENT group list. */
   async function refresh(): Promise<void> {
     try {
-      await Promise.all([refreshState(), loadGroups()]);
+      await Promise.all([refreshState(), loadPage(0)]);
       loadError = null;
     } catch (err) {
       loadError = String(err);
@@ -216,6 +300,7 @@
 
   onMount(() => {
     void refresh();
+    void loadGear();
 
     const unlisteners: UnlistenFn[] = [];
     const on = <P,>(name: string, handler: (payload: P) => void): void => {
@@ -223,17 +308,19 @@
         unlisteners.push(un),
       );
     };
-    on(
-      "dedup-progress",
-      (payload: { phase: DedupPhase; done: number; total: number }) => {
-        phase = payload.phase;
-        done = payload.done;
-        total = payload.total;
-      },
-    );
+    on("dedup-progress", (payload: DedupProgressPayload) => {
+      phase = payload.phase;
+      done = payload.done;
+      total = payload.total;
+      // A cancelled run broadcasts no dedup-finished: re-read the state
+      // so the header lands on the cancelled snapshot (the aggregates
+      // keep the previous run's values). The group list stays untouched —
+      // it is still the previous run's, by contract.
+      if (payload.phase === "cancelled") void refreshState();
+    });
     // The state machine reached Done before this fired, so the fresh
     // groups are already servable — reload them (state included, for the
-    // per-run error count).
+    // per-run error count and the fresh aggregates).
     on("dedup-finished", () => void refresh());
     // External file changes (a recycle-bin restore, another process):
     // re-sync groups once the watcher's debounce has settled.
@@ -264,9 +351,11 @@
         <span>
           {#if phase === "done"}
             <span class="muted">{$t("dedup.phase.done")} · </span>
+          {:else if phase === "cancelled"}
+            <span class="muted">{$t("dedup.phase.cancelled")} · </span>
           {/if}
-          {groups.length.toLocaleString()} {$t("dedup.statsGroups")}
-          · {$t("dedup.wasted")} {humanBytes(wastedTotal)}
+          {aliveGroups.toLocaleString()} {$t("dedup.statsGroups")}
+          · {$t("dedup.wasted")} {humanBytes(wastedBytes)}
         </span>
         {#if errors > 0}
           <span class="muted">
@@ -276,15 +365,30 @@
         {/if}
       {/if}
     </p>
-    {#if !running}
+    <div class="head-actions">
       <button
-        class={phase === "idle" ? "primary" : "ghost"}
-        onclick={startAnalysis}
-        disabled={loading || starting}
+        class="ghost small"
+        title={$t("dedup.gear.nextRunHint")}
+        aria-label={$t("dedup.gear.label")}
+        disabled={gearBusy}
+        onclick={() => void cycleGear()}
       >
-        {phase === "idle" ? $t("dedup.start") : $t("dedup.rerun")}
+        {$t("dedup.gear.label")}: {$t(`dedup.gear.${gear}`)}
       </button>
-    {/if}
+      {#if running}
+        <button class="ghost" onclick={cancelAnalysis}>
+          {$t("dedup.action.cancel")}
+        </button>
+      {:else}
+        <button
+          class={phase === "idle" ? "primary" : "ghost"}
+          onclick={startAnalysis}
+          disabled={loading || starting}
+        >
+          {phase === "idle" ? $t("dedup.start") : $t("dedup.rerun")}
+        </button>
+      {/if}
+    </div>
   </header>
 
   {#if running}
@@ -311,17 +415,17 @@
     </div>
   {/if}
 
-  {#if !loading && !loadError && !running && groups.length === 0}
+  {#if !loading && !loadError && !running && totalAlive === 0}
     <!-- Idle: nothing analyzed yet (not the same as "no dupes"). -->
     <p class="dedup-empty muted">
       {phase === "done" ? $t("dedup.empty") : $t("dedup.phase.idle")}
     </p>
-  {:else if !loading && !loadError && (groups.length > 0 || running)}
+  {:else if !loading && !loadError && (totalAlive > 0 || running)}
     {#if running && groups.length > 0}
       <p class="muted dedup-stale">{$t("dedup.stale")}</p>
     {/if}
     <ul class="groups">
-      {#each pageGroups as group, i (safePage * PAGE_SIZE + i)}
+      {#each groups as group, i (safePage * PAGE_SIZE + i)}
         {@const gi = safePage * PAGE_SIZE + i}
         {@const numChecked = checkedCountIn(gi, group)}
         <li class="group">
@@ -389,22 +493,22 @@
         </li>
       {/each}
     </ul>
-    {#if pageCount > 1}
+    {#if totalPages > 1}
       <nav class="pager" aria-label={$t("tabs.dedup")}>
         <button
           class="ghost small"
           aria-label={$t("a11y.prevPage")}
           disabled={safePage === 0}
-          onclick={() => (page -= 1)}
+          onclick={() => gotoPage(safePage - 1)}
         >
           ‹
         </button>
-        <span class="count">{safePage + 1} / {pageCount}</span>
+        <span class="count">{safePage + 1} / {totalPages}</span>
         <button
           class="ghost small"
           aria-label={$t("a11y.nextPage")}
-          disabled={safePage >= pageCount - 1}
-          onclick={() => (page += 1)}
+          disabled={safePage >= totalPages - 1}
+          onclick={() => gotoPage(safePage + 1)}
         >
           ›
         </button>
@@ -475,6 +579,15 @@
     align-items: center;
     justify-content: space-between;
     gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  /* The gear button sits beside the start/cancel button, both secondary
+     to the stats line. */
+  .head-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
     flex-wrap: wrap;
   }
 

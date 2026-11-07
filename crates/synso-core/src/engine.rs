@@ -36,17 +36,22 @@
 //! serialize; events that arrive while a scan holds the mutex queue in the
 //! watcher's channel and apply right after — nothing is dropped.
 //!
-//! Dedup (Task 9): [`Engine::dedup_start`] runs the staged hashing
-//! pipeline (see [`crate::dedup`]) on its own thread — one run at a time,
-//! the slot claimed by CAS and released by the same drop-guard pattern as
-//! the scan slot. Hashing runs entirely OUTSIDE the store lock; only the
-//! snapshot read and short batched hash persists take it. One run is also
-//! auto-started 30 seconds after the first successful `ScanFinished` (the
-//! timer holds only a `Weak` to the dedup state, so dropping the engine
-//! cancels a pending kick-off instead of hashing behind the app's back).
+//! Dedup (Task 9, four-gate pipeline since the Task 7 swap):
+//! [`Engine::dedup_start`] runs the staged pipeline (see [`crate::dedup`])
+//! on its own thread — one run at a time, the slot claimed by CAS and
+//! released by the same drop-guard pattern as the scan slot. Hashing runs
+//! entirely OUTSIDE the store lock; only the candidate load and short
+//! batched hash persists take it. The run is cancellable
+//! ([`Engine::dedup_cancel`]): the pipeline stops at its next checkpoint,
+//! keeps what it computed, reports `Cancelled` — and the engine then keeps
+//! serving the last completed run's groups. The settings' `dedup_gear`
+//! ([`crate::settings::DedupGear`]) picks the gates' worker count, with a
+//! below-normal thread priority for the Gentle gear. Dedup is
+//! MANUAL-only (user requirement): scans never kick off hashing — the
+//! dedup view's 启动分析 button is the only trigger.
 //! [`Engine::resolve_absolute`] maps index-relative paths back to real
 //! disk paths — hashing needs them, and trash (Task 10) and reveal
-//! (Task 15) will reuse the same mapping.
+//! (Task 15) reuse the same mapping.
 //!
 //! Heat persistence (v1.4): the tier cache's heat map is snapshotted
 //! into the store's `heat` table every [`HEAT_PERSIST_INTERVAL`] by the
@@ -67,13 +72,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{unbounded, Receiver, Sender};
 
-use crate::dedup::{self, DedupState, DupeGroup, StoredGroup};
+use crate::dedup::{self, DedupPage, DedupState, DupeGroup, StoredGroup};
 use crate::dimensions::{ColdReader, FileDetail};
 use crate::hotindex::HotIndex;
 use crate::model::{FileId, ParsedQuery};
 use crate::query::{self, SearchResult};
 use crate::scanner::{self, effective_roots, root_segment, ScanOptions};
-use crate::settings::{self, Settings};
+use crate::settings::{self, DedupGear, Settings};
 use crate::sizeagg::{self, SizeNode};
 use crate::store::Store;
 use crate::tiers::{self, TierCache};
@@ -81,6 +86,20 @@ use crate::trash;
 use crate::volumes::{match_volume, VolumeInfo};
 use crate::watcher::{self, Watcher};
 use crate::Result;
+
+/// The Gentle gear's thread hint (Task 7): the dedup thread itself runs
+/// below normal priority, so hashing stays out of everything else's way.
+/// Scope: this covers the orchestration thread (candidate load, gate①'s
+/// histogram, the merges/persists between gates). The gates' internal
+/// worker threads (dedup.rs's scope threads) do NOT inherit it — Windows
+/// priorities are per-thread and std spawns them at normal priority — an
+/// accepted limitation: the heavy streaming reads those workers do remain
+/// I/O-bound, and lowering them would need priority plumbing through
+/// every gate spawn.
+#[cfg(windows)]
+use windows::Win32::System::Threading::{
+    GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+};
 
 /// What the engine scans and what it skips. Empty `volumes` means "all
 /// fixed local volumes" (`crate::volumes::fixed_volumes`); `exclusions`
@@ -92,9 +111,14 @@ pub struct EngineOptions {
 }
 
 /// Phase of a dedup run (Task 9). The engine walks `Idle -> Grouping ->
-/// HashingFirst -> HashingFull -> Done` (intermediate stages are skipped
-/// when they have no work); `Grouping` reappears as the in-progress phase
-/// of every new run.
+/// HashingFirst -> Sampling -> HashingFull -> Done` (intermediate stages
+/// are skipped when they have no work); `Grouping` reappears as the
+/// in-progress phase of every new run. `Sampling` is gate③'s phase
+/// between the first probe and the full read. A cancelled run
+/// ([`Engine::dedup_cancel`]) ends at `Cancelled` instead of `Done` —
+/// its final progress report re-carries the last `(done, total)`, no
+/// `DedupFinished` follows, and the served groups stay the last completed
+/// run's.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 // JSON bridges (the app's IPC) spell phases snake_case — the same
@@ -106,8 +130,13 @@ pub enum DedupPhase {
     Idle,
     Grouping,
     HashingFirst,
+    /// Gate③'s sampling pass (pipeline rewrite, Task 6).
+    Sampling,
     HashingFull,
     Done,
+    /// A cancelled run's final state: the run stopped at a checkpoint and
+    /// the last completed run's groups stay on duty.
+    Cancelled,
 }
 
 /// Event broadcast to every subscriber that registered before the event
@@ -134,9 +163,15 @@ pub enum EngineEvent {
     /// no payload — polls of `stats()`/`search()` are the source of truth.
     FsChanged,
     /// Dedup pipeline progress (Task 9): `done`/`total` count the records
-    /// of the current stage, emitted at every stage change and every 500
-    /// records within one. The final event carries `phase: Done` with
-    /// `done == total ==` the hash computations the run performed.
+    /// of the current stage, emitted at every stage transition and at each
+    /// chunk boundary within a stage (65,536-candidate chunks — not
+    /// mid-chunk), plus one final tick at each stage's end. The final
+    /// event carries `phase: Done` with
+    /// `done == total ==` the hash computations the run performed — or,
+    /// for a cancelled run ([`Engine::dedup_cancel`]), ONE final event
+    /// with `phase: Cancelled` re-carrying the last `(done, total)`
+    /// (no `DedupFinished` follows; the served groups stay the previous
+    /// run's).
     DedupProgress {
         phase: DedupPhase,
         done: u64,
@@ -228,6 +263,12 @@ pub struct Engine {
 struct DedupShared {
     /// One dedup run at a time: CAS claim, released by a drop guard.
     running: AtomicBool,
+    /// Set by [`Engine::dedup_cancel`] while a run is going; the gates
+    /// check it at file boundaries (gate④ also at every 64KB read step)
+    /// and the run stops at the next checkpoint, reporting `Cancelled`
+    /// with an empty group list. Cleared by [`launch_dedup`] before each
+    /// spawn, so a cancelled predecessor cannot pre-arm its successor.
+    cancel: AtomicBool,
     /// The state machine behind `dedup_state()` plus the last completed
     /// run's groups.
     book: Mutex<DedupBookkeeping>,
@@ -261,6 +302,17 @@ impl Engine {
         // scans are what hold it for seconds later), so this read costs
         // milliseconds — and every later `settings()` is lock-free.
         let initial_settings = settings::load(&lock_unpoisoned(&store));
+        // Task 9: one-time purge of already-indexed recycle-bin rows,
+        // under the store lock and BEFORE the hot-index load spawns below,
+        // so purged rows never materialize in searches. Failure keeps the
+        // `recycle_purge_done` marker unset — the next launch retries
+        // (the purge is idempotent); meanwhile the matcher's hard rule
+        // and the dedup candidate gate keep recycle-bin content out of
+        // new results.
+        {
+            let mut store = lock_unpoisoned(&store);
+            purge_recycle_bin_once(&mut store);
+        }
         let hot = Arc::new(RwLock::new(HotIndex::cold()));
         let scan_opts = ScanOptions {
             roots: opts.volumes,
@@ -269,6 +321,7 @@ impl Engine {
         let subscribers: Arc<Mutex<Vec<Sender<EngineEvent>>>> = Arc::new(Mutex::new(Vec::new()));
         let dedup = Arc::new(DedupShared {
             running: AtomicBool::new(false),
+            cancel: AtomicBool::new(false),
             book: Mutex::new(DedupBookkeeping {
                 state: DedupState::default(),
                 groups: Arc::new(Vec::new()),
@@ -737,67 +790,117 @@ impl Engine {
     // ---------------- Task 9: dedup state machine ------------------------
 
     /// Starts a dedup run on a background thread; a no-op while one is
-    /// already running. The pipeline (see `crate::dedup`) groups by size,
-    /// hashes first 4 KiB for same-size survivors, then whole files —
-    /// persisted hashes are reused, so repeat runs are incremental.
+    /// already running. The pipeline (see `crate::dedup`) is the four-gate
+    /// chain — size, first-4KiB probe, sampling, full certification — over
+    /// the streamed candidate snapshot; persisted hashes are reused, so
+    /// repeat runs are incremental. The settings' `dedup_gear` picks the
+    /// gates' worker count (and the Gentle gear's thread priority).
     /// `Idle -> Grouping` happens synchronously here; subscribers receive
     /// [`EngineEvent::DedupProgress`] / [`EngineEvent::DedupFinished`] and
-    /// pollers read [`Engine::dedup_state`]. The engine also auto-starts
-    /// one run 30s after the first successful scan finishes.
+    /// pollers read [`Engine::dedup_state`]. A run can be stopped with
+    /// [`Engine::dedup_cancel`].
     pub fn dedup_start(&self) {
-        launch_dedup(&self.dedup);
+        launch_dedup(&self.dedup, Arc::clone(&self.hot), self.settings().dedup_gear);
+    }
+
+    /// Asks the running dedup run to stop at its next checkpoint (the
+    /// gates check at file boundaries; gate④ additionally at every 64KB
+    /// read step, so even a giant file aborts sub-second). The run keeps
+    /// every hash it already computed, reports `Cancelled` as its final
+    /// progress phase, and broadcasts NO `DedupFinished` — the engine
+    /// keeps serving the last completed run's groups. Idempotent, and a
+    /// no-op when no run is going: a cancel pressed while idle must not
+    /// pre-arm the NEXT run ([`launch_dedup`] additionally clears the
+    /// flag before each spawn, so the two guards agree).
+    pub fn dedup_cancel(&self) {
+        if !self.dedup.running.load(Ordering::Acquire) {
+            return;
+        }
+        self.dedup.cancel.store(true, Ordering::Release);
     }
 
     /// Snapshot of the dedup state machine. While a run is going,
     /// `done`/`total` mirror the latest progress event; at
     /// [`DedupPhase::Done`] they equal the hash computations this run
-    /// performed (0 = fully incremental). `groups` is the last COMPLETED
-    /// run's group count; `errors` counts files skipped unreadable or as
-    /// cloud placeholders.
+    /// performed (0 = fully incremental); at [`DedupPhase::Cancelled`]
+    /// they re-carry the last in-run report. `groups` is the last
+    /// COMPLETED run's group count (a cancelled run keeps the previous
+    /// one); `errors` counts files skipped because they could not be
+    /// read, were locked by another handle, are cloud placeholders, or
+    /// were dropped by the final grouping's liveness gate (an index row
+    /// whose file has left the disk) — all "marked skipped, not
+    /// grouped" per the design. The completion
+    /// aggregates `alive_groups`/`wasted_bytes` are computed ONCE at that
+    /// completion instant (an alive-scan over the fresh groups against
+    /// the hot index of the moment) and cached here — this call stays a
+    /// plain copy; a cancelled run carries the previous run's values and
+    /// a fresh engine reports 0/0.
     pub fn dedup_state(&self) -> DedupState {
         lock_unpoisoned(&self.dedup.book).state
     }
 
-    /// The last completed run's groups, `[offset, offset + limit)` of the
-    /// size-descending order, members materialized as search-style
-    /// [`crate::Hit`]s from the hot index. Files deleted since the
-    /// run drop out; a group falling below two surviving members dissolves
-    /// (its slot in the ordering disappears, the other groups keep their
-    /// relative order).
-    pub fn dedup_groups(&self, offset: u32, limit: u32) -> Vec<DupeGroup> {
-        if limit == 0 {
-            return Vec::new();
-        }
+    /// The last completed run's groups as a [`DedupPage`]: the
+    /// `[offset, offset + limit)` slice of the size-descending order,
+    /// members materialized as search-style [`crate::Hit`]s from the hot
+    /// index, plus `total_alive` — the count of groups that still
+    /// materialize (>= 2 surviving members) across ALL pages, scanned
+    /// live against the current hot index (a cancelled run keeps serving
+    /// the previous run's groups; files deleted since any run drop out).
+    /// A group falling below two surviving members dissolves (its slot in
+    /// the ordering disappears, the other groups keep their relative
+    /// order) — the same rule the run-completion aggregates in
+    /// [`Engine::dedup_state`] apply at their completion instant.
+    pub fn dedup_groups(&self, offset: u32, limit: u32) -> DedupPage {
         // Snapshot the stored groups (cheap Arc clone) and release the
         // bookkeeping lock before touching the hot index — the engine's
         // locks never nest.
         let groups = Arc::clone(&lock_unpoisoned(&self.dedup.book).groups);
         let hot = read_unpoisoned(&self.hot);
-        let mut skipped: u32 = 0;
+        // First pass: alive-member count per group (`slot_of_id` presence,
+        // the exact rule the materialization below applies). This is the
+        // total's O(groups) scan the plan budgets per page-granularity
+        // call — and it doubles as the dissolved-group filter, so skipped
+        // groups never materialize their members at all.
+        let alive_counts: Vec<u32> = groups
+            .iter()
+            .map(|group| {
+                group
+                    .members
+                    .iter()
+                    .filter(|id| hot.slot_of_id(**id).is_some())
+                    .count() as u32
+            })
+            .collect();
+        let total_alive = alive_counts.iter().filter(|&&alive| alive >= 2).count() as u32;
         let mut page = Vec::new();
-        for group in groups.iter() {
-            let members: Vec<crate::query::Hit> = group
-                .members
-                .iter()
-                .filter_map(|id| hot.slot_of_id(*id).map(|slot| query::hit_of(&hot, slot)))
-                .collect();
-            if members.len() < 2 {
-                continue;
-            }
-            if skipped < offset {
-                skipped += 1;
-                continue;
-            }
-            page.push(DupeGroup {
-                hash: group.hash,
-                size: group.size,
-                members,
-            });
-            if page.len() == limit as usize {
-                break;
+        if limit > 0 {
+            let mut skipped: u32 = 0;
+            for (group, &alive) in groups.iter().zip(&alive_counts) {
+                if alive < 2 {
+                    continue;
+                }
+                if skipped < offset {
+                    skipped += 1;
+                    continue;
+                }
+                page.push(DupeGroup {
+                    hash: group.hash,
+                    size: group.size,
+                    members: group
+                        .members
+                        .iter()
+                        .filter_map(|id| hot.slot_of_id(*id).map(|slot| query::hit_of(&hot, slot)))
+                        .collect(),
+                });
+                if page.len() == limit as usize {
+                    break;
+                }
             }
         }
-        page
+        DedupPage {
+            groups: page,
+            total_alive,
+        }
     }
 
     /// The absolute disk path of an index-relative path (root segment
@@ -1127,9 +1230,22 @@ fn scan_cycle(
 
 /// Claims the dedup slot, resets the state machine to `Grouping` (the
 /// `Idle -> Grouping` transition `dedup_start` promises — synchronously,
-/// so pollers never miss it) and spawns the worker thread. A no-op when a
-/// run is already going. Returns whether a run was started.
-fn launch_dedup(dedup: &Arc<DedupShared>) -> bool {
+/// so pollers never miss it) and spawns the worker thread at the gear's
+/// worker count. `hot` travels along because the cycle's Done path needs
+/// a hot-index read for the run-completion aggregates. A no-op when a run
+/// is already going. Returns whether a run was started.
+fn launch_dedup(
+    dedup: &Arc<DedupShared>,
+    hot: Arc<RwLock<HotIndex>>,
+    gear: DedupGear,
+) -> bool {
+    // Clear any stale cancel BEFORE the claim: a cancelled predecessor
+    // leaves the flag set, and it must not pre-arm its successor.
+    // `dedup_cancel` is a no-op while idle, so nothing can set the flag
+    // between this store and a successful claim — a cancel arriving after
+    // the claim is honored by the new run, one arriving before it is
+    // (correctly) dropped.
+    dedup.cancel.store(false, Ordering::Release);
     if dedup
         .running
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1139,16 +1255,25 @@ fn launch_dedup(dedup: &Arc<DedupShared>) -> bool {
     }
     {
         let mut book = lock_unpoisoned(&dedup.book);
+        // The completion aggregates carry the previous run's values
+        // through this reset: a run that ends CANCELLED keeps serving the
+        // previous groups, and its final report must not zero their
+        // aggregates (a COMPLETING run recomputes both fresh).
+        let (alive_groups, wasted_bytes) = (book.state.alive_groups, book.state.wasted_bytes);
         book.state = DedupState {
             phase: DedupPhase::Grouping,
+            alive_groups,
+            wasted_bytes,
             ..DedupState::default()
         };
         // `groups` keeps the previous run's list: dedup_groups goes on
         // serving it until the new run finishes.
     }
+    let workers = gear.workers();
+    let gentle = gear == DedupGear::Gentle;
     let spawn = thread::Builder::new().name("synso-dedup".into()).spawn({
         let dedup = Arc::clone(dedup);
-        move || dedup_cycle(dedup)
+        move || dedup_cycle(dedup, hot, workers, gentle)
     });
     match spawn {
         Ok(_) => true,
@@ -1161,16 +1286,41 @@ fn launch_dedup(dedup: &Arc<DedupShared>) -> bool {
     }
 }
 
-/// One dedup cycle on its own thread: run the staged pipeline against the
-/// store (hashing happens outside the lock — only the snapshot read and
-/// short persist batches take it), fold the outcome into the state
-/// machine, then broadcast the final progress and `DedupFinished`. The
-/// slot is released by [`SlotGuard`] on every exit path, panic included.
-/// The cycle is eprintln-free by design: every skip is counted in
-/// [`DedupState::errors`] instead, and store failures merely degrade the
-/// run — they never panic it.
-fn dedup_cycle(dedup: Arc<DedupShared>) {
+/// One dedup cycle on its own thread: run the four-gate pipeline against
+/// the store (hashing happens outside the lock — only the candidate load
+/// and short persist batches take it), fold the outcome into the state
+/// machine, then broadcast the final progress and — for a completed run —
+/// `DedupFinished`. The slot is released by [`SlotGuard`] on every exit
+/// path, panic included. The cycle is eprintln-free by design: every skip
+/// is counted in [`DedupState::errors`] instead, and store failures merely
+/// degrade the run — they never panic it.
+///
+/// `workers` is the gates' worker-pool size ([`DedupGear::workers`]);
+/// `gentle` drops THIS thread below normal priority on Windows — see the
+/// import note for why the gates' internal workers stay normal-priority
+/// (accepted limitation). `hot` is the engine's hot index, read once at
+/// Done for the run-completion aggregates ([`alive_aggregates`]).
+fn dedup_cycle(
+    dedup: Arc<DedupShared>,
+    hot: Arc<RwLock<HotIndex>>,
+    workers: usize,
+    gentle: bool,
+) {
     let _slot = SlotGuard(&dedup.running);
+    // Gentle gear: below-normal priority for the whole run on this thread
+    // (best-effort — a failure would only mean normal priority; there is
+    // nothing to report). One unsafe call: Win32 thread priority.
+    #[cfg(windows)]
+    if gentle {
+        // SAFETY: GetCurrentThread returns the (always valid) pseudo
+        // handle of the calling thread; SetThreadPriority only touches
+        // that thread's scheduler priority.
+        unsafe {
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = gentle; // no thread-priority knobs off Windows (mac port)
     let subscribers = Arc::clone(&dedup.subscribers);
     let progress = |phase: DedupPhase, done: u64, total: u64| {
         {
@@ -1179,18 +1329,86 @@ fn dedup_cycle(dedup: Arc<DedupShared>) {
             book.state.done = done;
             book.state.total = total;
         }
-        broadcast(
-            &subscribers,
-            EngineEvent::DedupProgress { phase, done, total },
-        );
+        // A cancelled run's FINAL report is broadcast by the cycle itself,
+        // AFTER it folds the book (see the cancel branch) — exactly one
+        // event, and only once the state it describes is fully written.
+        if phase != DedupPhase::Cancelled {
+            broadcast(
+                &subscribers,
+                EngineEvent::DedupProgress { phase, done, total },
+            );
+        }
     };
     let reader = dedup::RealFileReader;
     // One snapshot of the live root mapping for this run (the scope can
-    // change mid-run; the next run picks it up).
+    // change mid-run; the next run picks it up). `now` seeds the mtime
+    // grace window.
     let roots = read_unpoisoned(&dedup.roots).clone();
-    let outcome = dedup::run_pipeline(&dedup.store, &roots, &reader, &progress);
+    let outcome = dedup::run_gates(
+        &dedup.store,
+        &roots,
+        &reader,
+        workers,
+        &dedup.cancel,
+        unix_now(),
+        &progress,
+    );
+    let c = &outcome.counters;
+    // ONE summary line per run (the spec's per-gate accounting), on both
+    // exits — completion and cancellation.
+    let tally = format!(
+        "size_gate {}f/{}B head_gate {}f/{}B sample_gate {}f/{}B skips errors {} locked {} fresh {} placeholders {} recycle {} vanished {} hashed first {} full {}",
+        c.size_gate.files,
+        c.size_gate.bytes,
+        c.head_gate.files,
+        c.head_gate.bytes,
+        c.sample_gate.files,
+        c.sample_gate.bytes,
+        c.errors,
+        c.locked,
+        c.fresh,
+        c.placeholders,
+        c.recycle,
+        c.vanished,
+        outcome.hashed_first,
+        outcome.hashed_full,
+    );
+    if outcome.cancelled {
+        log::info!("synso: dedup run cancelled: {tally}");
+        // Fold the book FIRST (only the partial skip count is new: the
+        // closure already wrote the Cancelled phase and the last in-run
+        // counters; `groups` is restored to the still-served list's count
+        // — the launch reset zeroed it, and DedupState.groups is
+        // documented as the last COMPLETED run's group count, which a
+        // cancel does not displace), THEN broadcast the run's ONE final
+        // DedupProgress{Cancelled, done, total} — after the state it
+        // describes is fully written, so a subscriber reacting to it sees
+        // the settled book. NO DedupFinished follows: the UI must not
+        // reload groups on cancel.
+        let final_report = {
+            let mut book = lock_unpoisoned(&dedup.book);
+            book.state.errors = c.errors + c.locked + c.placeholders + c.vanished;
+            book.state.groups = book.groups.len() as u64;
+            EngineEvent::DedupProgress {
+                phase: book.state.phase,
+                done: book.state.done,
+                total: book.state.total,
+            }
+        };
+        broadcast(&subscribers, final_report);
+        return;
+    }
     let groups = outcome.groups.len() as u64;
+    log::info!("synso: dedup run finished: {groups} group(s); {tally}");
     let hashed = outcome.hashed_first + outcome.hashed_full;
+    // The run-completion aggregates: one alive-scan over the fresh groups
+    // against the CURRENT hot index, computed OUTSIDE the bookkeeping
+    // lock (locks never nest) and cached in the state machine, so
+    // `dedup_state()` stays a plain copy.
+    let (alive_groups, wasted_bytes) = {
+        let hot = read_unpoisoned(&hot);
+        alive_aggregates(&hot, &outcome.groups)
+    };
     {
         let mut book = lock_unpoisoned(&dedup.book);
         book.state = DedupState {
@@ -1198,14 +1416,42 @@ fn dedup_cycle(dedup: Arc<DedupShared>) {
             done: hashed,
             total: hashed,
             groups,
-            // Both skip kinds share the public counter (the design's
-            // "marked skipped, not grouped"); the pipeline outcome keeps
-            // them apart for tests.
-            errors: outcome.errors + outcome.placeholders,
+            // All skip kinds share the public counter (the design's
+            // "marked skipped, not grouped" — unreadable, locked by
+            // another handle, a cloud placeholder, or a liveness drop:
+            // an index row whose file left the disk); the outcome
+            // counters keep them apart (fresh/recycle stay internal).
+            errors: c.errors + c.locked + c.placeholders + c.vanished,
+            alive_groups,
+            wasted_bytes,
         };
         book.groups = Arc::new(outcome.groups);
     }
     broadcast(&subscribers, EngineEvent::DedupFinished { groups });
+}
+
+/// The run-completion aggregates (Task 8): alive-member counts per group
+/// against the CURRENT hot index (`slot_of_id` presence — the exact rule
+/// [`Engine::dedup_groups`] materializes by), `alive_groups` counting the
+/// groups that still materialize (>= 2 live members) and `wasted_bytes`
+/// summing `size × (alive − 1)` over exactly those. Free function so the
+/// cycle computes it with no engine lock held — the hot read must never
+/// nest inside the bookkeeping lock.
+fn alive_aggregates(hot: &HotIndex, groups: &[StoredGroup]) -> (u64, u64) {
+    let mut alive_groups = 0u64;
+    let mut wasted_bytes = 0u64;
+    for group in groups {
+        let alive = group
+            .members
+            .iter()
+            .filter(|id| hot.slot_of_id(**id).is_some())
+            .count();
+        if alive >= 2 {
+            alive_groups += 1;
+            wasted_bytes += group.size * (alive as u64 - 1);
+        }
+    }
+    (alive_groups, wasted_bytes)
 }
 
 /// Loads a fresh hot index from the store and swaps it in, under the store
@@ -1219,6 +1465,44 @@ fn reload_hot_index_locked(store: &Store, hot: &Arc<RwLock<HotIndex>>) {
     match HotIndex::load(store) {
         Ok(loaded) => *write_unpoisoned(hot) = loaded,
         Err(err) => log::error!("synso: hot-index load failed: {err}"),
+    }
+}
+
+// ---------------- Task 9: one-time recycle-bin index purge ----------------
+
+/// The `meta` key guarding the startup purge: stamped ONLY after
+/// [`Store::purge_recycle_bin_rows`] succeeded, so a failed purge (marker
+/// absent) retries on the next launch. A `meta` key, not a schema
+/// migration — the store's schema stays untouched.
+const RECYCLE_PURGE_DONE_KEY: &str = "recycle_purge_done";
+
+/// Task 9's once-per-database purge: on a store without the
+/// [`RECYCLE_PURGE_DONE_KEY`] marker, delete every already-indexed
+/// recycle-bin row and stamp the marker. Every failure logs and returns
+/// normally — open must not fail over housekeeping; the marker is
+/// written only on success, so the next launch retries, and a purged
+/// index re-running into `Ok(0)` is harmless. Runs under the store lock
+/// during `open`, before the hot-index load spawns.
+fn purge_recycle_bin_once(store: &mut Store) {
+    match store.get_meta(RECYCLE_PURGE_DONE_KEY) {
+        Ok(Some(_)) => {}
+        Ok(None) => match store.purge_recycle_bin_rows() {
+            Ok(count) => {
+                if let Err(err) = store.set_meta(RECYCLE_PURGE_DONE_KEY, "1") {
+                    log::warn!(
+                        "synso: recycle-bin purge done but the marker write failed \
+                         (it re-runs harmlessly next launch): {err}"
+                    );
+                }
+                log::info!("synso: recycle-bin purge removed {count} indexed rows");
+            }
+            Err(err) => {
+                log::warn!("synso: recycle-bin purge failed; will retry next launch: {err}")
+            }
+        },
+        Err(err) => {
+            log::warn!("synso: recycle purge marker read failed; skipping this launch: {err}")
+        }
     }
 }
 
@@ -1437,12 +1721,30 @@ mod tests {
             "\"hashing_full\""
         );
         assert_eq!(
+            serde_json::to_string(&DedupPhase::Sampling).unwrap(),
+            "\"sampling\"",
+            "gate③'s phase (Task 6) spells snake_case like the rest"
+        );
+        assert_eq!(
+            serde_json::to_string(&DedupPhase::Cancelled).unwrap(),
+            "\"cancelled\"",
+            "a cancelled run's final phase (Task 7) spells snake_case"
+        );
+        assert_eq!(
             serde_json::to_string(&DedupPhase::Done).unwrap(),
             "\"done\""
         );
         assert_eq!(
             serde_json::from_str::<DedupPhase>("\"hashing_first\"").unwrap(),
             DedupPhase::HashingFirst
+        );
+        assert_eq!(
+            serde_json::from_str::<DedupPhase>("\"sampling\"").unwrap(),
+            DedupPhase::Sampling
+        );
+        assert_eq!(
+            serde_json::from_str::<DedupPhase>("\"cancelled\"").unwrap(),
+            DedupPhase::Cancelled
         );
     }
 
@@ -1606,6 +1908,19 @@ mod tests {
         root
     }
 
+    /// Backdates a fixture file's mtime far into the past. The four-gate
+    /// pipeline skips candidates about to be OPENED whose snapshot mtime
+    /// is inside the grace window (`crate::dedup::FRESH_SECS`, 300s — a
+    /// file may still be mid-write), so freshly written dedup fixtures
+    /// must be settled or every run skips them without reading. Content
+    /// is untouched; rescans re-read the settled mtime, so persisted
+    /// hashes survive the upsert conflict path as in production.
+    fn backdate(path: &Path) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+            .unwrap();
+    }
+
     fn open_engine(db: &Path, root: &Path) -> Engine {
         open_engine_with(db, root, Vec::new())
     }
@@ -1698,6 +2013,89 @@ mod tests {
         );
         assert_eq!(stats.dirs, 2);
         assert!(stats.interned_bytes > 0);
+    }
+
+    /// Task 9: `Engine::open` runs the one-time recycle-bin purge BEFORE
+    /// the hot-index load spawns — purged rows never materialize in the
+    /// hot index — and stamps the `recycle_purge_done` meta key so the
+    /// work never repeats. A recycle-bin row that appears after the
+    /// marker survives a second open untouched: the guard holds (the
+    /// matcher hard rule keeps NEW rows out of the index; this marker is
+    /// only about the historical one).
+    #[test]
+    fn recycle_purge_runs_once_before_hot_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = write_fixture(tmp.path());
+
+        let seed = |store: &mut Store, dir_path: &[&str], name: &str, size: u64| {
+            let mut record = crate::model::FileRecord {
+                id: 0,
+                parent: 0,
+                name: name.to_string(),
+                size,
+                mtime: 1_700_000_000,
+                ctime: 1_700_000_000,
+                atime: 1_700_000_000,
+                ext_id: 0,
+                is_dir: false,
+                hash_first: None,
+                hash_full: None,
+                py_full: String::new(),
+                py_init: String::new(),
+            };
+            store.upsert_file(dir_path, &mut record).unwrap();
+        };
+
+        // A historical index that still carries recycle-bin rows (seeded
+        // directly — the production source is a pre-Task-9 scan).
+        {
+            let mut store = Store::open(&db_path).unwrap();
+            seed(&mut store, &["$Recycle.Bin", "S-1-5"], "r1.bin", 7);
+            seed(&mut store, &["docs"], "keep.txt", 1);
+        }
+
+        let engine = open_engine(&db_path, &root);
+        wait_warm(&engine);
+        let stats = engine.stats();
+        assert_eq!(
+            stats.files, 1,
+            "only keep.txt surfaces: the purge ran before the hot load"
+        );
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let marker: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = 'recycle_purge_done'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(marker, "1", "the once-marker is stamped");
+            let left: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM files WHERE name = 'r1.bin'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(left, 0, "the store row is deleted, not just hidden");
+        }
+        drop(engine);
+
+        // A recycle-bin row landing after the marker must survive the
+        // second open: no re-run.
+        {
+            let mut store = Store::open(&db_path).unwrap();
+            seed(&mut store, &["$Recycle.Bin", "S-2"], "sneaky.bin", 9);
+        }
+        let engine = open_engine(&db_path, &root);
+        wait_warm(&engine);
+        assert_eq!(
+            engine.stats().files,
+            2,
+            "the marker is present, so the second open does not re-purge"
+        );
     }
 
     #[test]
@@ -1904,6 +2302,10 @@ mod tests {
         fs::write(root.join("dup_a.txt"), b"alpha bravo").unwrap();
         fs::write(root.join("sub").join("dup_b.txt"), b"alpha bravo").unwrap();
         fs::write(root.join("other.txt"), b"alpha bravO").unwrap(); // same size, last byte differs
+        for f in ["dup_a.txt", "other.txt"] {
+            backdate(&root.join(f));
+        }
+        backdate(&root.join("sub").join("dup_b.txt"));
 
         let engine = open_engine(&db_path, &root);
         let rx = engine.subscribe();
@@ -1921,8 +2323,9 @@ mod tests {
         assert_eq!(state.groups, 1);
 
         let page = engine.dedup_groups(0, 10);
-        assert_eq!(page.len(), 1);
-        let group = &page[0];
+        assert_eq!(page.groups.len(), 1);
+        assert_eq!(page.total_alive, 1);
+        let group = &page.groups[0];
         assert_eq!(group.size, 11, "alpha bravo");
         assert_eq!(group.members.len(), 2);
         let mut names: Vec<&str> = group.members.iter().map(|m| m.name.as_str()).collect();
@@ -1937,10 +2340,112 @@ mod tests {
         // single group yields nothing.
         assert!(engine
             .dedup_groups(0, 10)
+            .groups
             .iter()
             .flat_map(|g| &g.members)
             .all(|m| m.name != "other.txt"));
-        assert!(engine.dedup_groups(1, 10).is_empty());
+        assert!(engine.dedup_groups(1, 10).groups.is_empty());
+    }
+
+    /// THE paged-frontend contract (Task 8): `dedup_groups` returns a
+    /// [`DedupPage`] whose `total_alive` counts every group that still
+    /// materializes against the CURRENT hot index (>= 2 surviving members),
+    /// dissolved groups' members never materialize — and the run-completion
+    /// aggregates (`alive_groups` / `wasted_bytes`) recount ONLY the
+    /// surviving group once its rivals' members leave the store and a
+    /// rerun folds the book. Before any completed run both are 0.
+    #[test]
+    fn dedup_page_total_alive_and_wasted_track_surviving_groups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        // Group A: two 11-byte twins. Group B: two 5-byte twins. The
+        // differing sizes make the wasted arithmetic attributable per
+        // group (each alive pair wastes exactly one redundant copy).
+        fs::write(root.join("a1.txt"), b"alpha bravo").unwrap();
+        fs::write(root.join("a2.txt"), b"alpha bravo").unwrap();
+        fs::write(root.join("b1.txt"), b"bbbbb").unwrap();
+        fs::write(root.join("b2.txt"), b"bbbbb").unwrap();
+        for name in ["a1.txt", "a2.txt", "b1.txt", "b2.txt"] {
+            backdate(&root.join(name));
+        }
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        // No completed run yet: zero aggregates, zero alive total.
+        let state = engine.dedup_state();
+        assert_eq!(
+            (state.alive_groups, state.wasted_bytes),
+            (0, 0),
+            "before any run the aggregates are 0/0"
+        );
+        assert_eq!(engine.dedup_groups(0, 10).total_alive, 0);
+
+        // Run 1: both pairs group.
+        engine.dedup_start();
+        let (groups, _progress) = wait_dedup_finished(&rx);
+        assert_eq!(groups, 2);
+
+        let state = engine.dedup_state();
+        assert_eq!(state.phase, DedupPhase::Done);
+        assert_eq!(state.groups, 2);
+        assert_eq!(
+            state.alive_groups, 2,
+            "both groups fully alive at completion"
+        );
+        assert_eq!(
+            state.wasted_bytes,
+            11 + 5,
+            "each pair wastes one copy of its size"
+        );
+
+        let page = engine.dedup_groups(0, 10);
+        assert_eq!(page.groups.len(), 2);
+        assert_eq!(page.total_alive, 2);
+        // limit 0: an empty page still reports the full alive total.
+        assert_eq!(engine.dedup_groups(0, 0).groups.len(), 0);
+        assert_eq!(engine.dedup_groups(0, 0).total_alive, 2);
+        // Paging past the alive total yields nothing.
+        assert!(engine.dedup_groups(2, 10).groups.is_empty());
+
+        // Group B's members leave the disk; the rescan reconciles the
+        // store and the hot index (the existing fixture deletion pattern).
+        fs::remove_file(root.join("b1.txt")).unwrap();
+        fs::remove_file(root.join("b2.txt")).unwrap();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        // Live view, BEFORE any rerun: the dissolved group's members never
+        // materialize and the alive total recounts only group A.
+        let page = engine.dedup_groups(0, 10);
+        assert_eq!(page.total_alive, 1, "group B dissolved below 2 members");
+        assert_eq!(page.groups.len(), 1);
+        let names: Vec<&str> = page.groups[0]
+            .members
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(
+            names.iter().all(|n| n.starts_with('a')),
+            "only group A materializes: {names:?}"
+        );
+
+        // A rerun folds the book over the post-deletion store: the
+        // aggregates recount ONLY the surviving group.
+        engine.dedup_start();
+        let (groups, _progress) = wait_dedup_finished(&rx);
+        assert_eq!(groups, 1, "group B is gone from the store");
+        let state = engine.dedup_state();
+        assert_eq!(state.alive_groups, 1);
+        assert_eq!(
+            state.wasted_bytes, 11,
+            "wasted counts only the surviving group's one redundant copy"
+        );
     }
 
     #[test]
@@ -1952,6 +2457,7 @@ mod tests {
         fs::write(root.join("empty_a.txt"), b"").unwrap();
         fs::write(root.join("empty_b.txt"), b"").unwrap();
         fs::write(root.join("real.txt"), b"r").unwrap();
+        backdate(&root.join("real.txt"));
 
         let engine = open_engine(&db_path, &root);
         let rx = engine.subscribe();
@@ -1961,7 +2467,7 @@ mod tests {
         engine.dedup_start();
         let (groups, _progress) = wait_dedup_finished(&rx);
         assert_eq!(groups, 0, "zero-size files never group");
-        assert!(engine.dedup_groups(0, 10).is_empty());
+        assert!(engine.dedup_groups(0, 10).groups.is_empty());
         let state = engine.dedup_state();
         assert_eq!(state.phase, DedupPhase::Done);
         assert_eq!(state.errors, 0, "the size-0 filter is not an error");
@@ -1978,6 +2484,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("locked.txt"), b"shared secret").unwrap();
         fs::write(root.join("free.txt"), b"shared secret").unwrap();
+        backdate(&root.join("locked.txt"));
+        backdate(&root.join("free.txt"));
 
         // Hold the file with NO sharing flags: any other open fails.
         let held = fs::OpenOptions::new()
@@ -1994,7 +2502,7 @@ mod tests {
         engine.dedup_start();
         let (groups, _progress) = wait_dedup_finished(&rx);
         assert_eq!(groups, 0, "the locked member cannot confirm a group");
-        assert!(engine.dedup_groups(0, 10).is_empty());
+        assert!(engine.dedup_groups(0, 10).groups.is_empty());
         let state = engine.dedup_state();
         assert_eq!(state.phase, DedupPhase::Done);
         assert!(
@@ -2007,7 +2515,7 @@ mod tests {
         engine.dedup_start();
         let (groups, _progress) = wait_dedup_finished(&rx);
         assert_eq!(groups, 1);
-        assert_eq!(engine.dedup_groups(0, 10)[0].members.len(), 2);
+        assert_eq!(engine.dedup_groups(0, 10).groups[0].members.len(), 2);
         assert_eq!(engine.dedup_state().errors, 0, "errors are per run");
     }
 
@@ -2019,6 +2527,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("keep1.txt"), b"persist me!!").unwrap();
         fs::write(root.join("keep2.txt"), b"persist me!!").unwrap();
+        backdate(&root.join("keep1.txt"));
+        backdate(&root.join("keep2.txt"));
 
         let engine = open_engine(&db_path, &root);
         let rx = engine.subscribe();
@@ -2081,6 +2591,149 @@ mod tests {
         assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
     }
 
+    /// A cancel pressed while idle is a no-op: nothing panics, the state
+    /// stays Idle, and the NEXT run is not pre-armed cancelled — it runs
+    /// to `Done` normally.
+    #[test]
+    fn dedup_cancel_while_idle_is_a_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"twin").unwrap();
+        fs::write(root.join("b.txt"), b"twin").unwrap();
+        backdate(&root.join("a.txt"));
+        backdate(&root.join("b.txt"));
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        engine.dedup_cancel();
+        engine.dedup_cancel(); // idempotent
+        assert_eq!(
+            engine.dedup_state().phase,
+            DedupPhase::Idle,
+            "an idle cancel leaves the state machine alone"
+        );
+
+        // The next run completes normally — the idle cancel pre-armed
+        // nothing.
+        engine.dedup_start();
+        let (groups, _progress) = wait_dedup_finished(&rx);
+        assert_eq!(groups, 1);
+        assert_eq!(engine.dedup_state().phase, DedupPhase::Done);
+    }
+
+    /// THE cancel contract, end to end: a run cancelled mid-flight ends at
+    /// `Cancelled` with exactly ONE final `Cancelled` progress report,
+    /// never broadcasts `DedupFinished`, and the engine keeps serving the
+    /// last completed run's groups.
+    #[test]
+    fn dedup_cancel_mid_run_reports_cancelled_and_keeps_groups() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("index.db");
+        let root = tmp.path().join("fixture");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), b"twin").unwrap();
+        fs::write(root.join("b.txt"), b"twin").unwrap();
+        backdate(&root.join("a.txt"));
+        backdate(&root.join("b.txt"));
+
+        let engine = open_engine(&db_path, &root);
+        let rx = engine.subscribe();
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        // Run 1: small and fast — it must COMPLETE, so "previous groups"
+        // is non-empty for run 2 to keep.
+        engine.dedup_start();
+        let (groups, _progress) = wait_dedup_finished(&rx);
+        assert_eq!(groups, 1);
+        assert_eq!(engine.dedup_groups(0, 10).groups.len(), 1);
+        // Run-completion aggregates (Task 8) for the 4-byte twin pair.
+        let state = engine.dedup_state();
+        assert_eq!(
+            (state.alive_groups, state.wasted_bytes),
+            (1, 4),
+            "one alive pair wastes one redundant 4-byte copy"
+        );
+
+        // Run 2 gets real work: 300 identical unhashed 80KB copies join the
+        // index via a rescan (the unchanged twins keep their hashes — the
+        // new files are the only work). ~50MB of hashing lies between the
+        // run's FIRST progress report and its end, so a cancel armed on
+        // that report lands mid-run with orders of magnitude of margin.
+        // (The copies are backdated: fresh candidates are skipped without
+        // being opened, which would leave the run nothing to do.)
+        fs::create_dir_all(root.join("big")).unwrap();
+        let big = vec![b'e'; 80 * 1024];
+        for i in 0..300 {
+            let path = root.join("big").join(format!("copy{i:03}.bin"));
+            fs::write(&path, &big).unwrap();
+            backdate(&path);
+        }
+        engine.start_full_scan();
+        wait_scan_finished(&rx);
+
+        engine.dedup_start();
+        let mut reports = 0usize;
+        loop {
+            let event = rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the cancelled run still broadcasts its final report");
+            match event {
+                EngineEvent::DedupProgress { phase, done, total } => {
+                    reports += 1;
+                    if phase == DedupPhase::Cancelled {
+                        // The final report re-carries the last in-run
+                        // counters — the run had started real work.
+                        assert!(
+                            done <= total,
+                            "cancelled report carries sane counters: {done}/{total}"
+                        );
+                        break; // the cycle broadcasts nothing after this
+                    }
+                    // Any in-run report: arm the cancel (idempotent).
+                    engine.dedup_cancel();
+                }
+                EngineEvent::DedupFinished { groups } => panic!(
+                    "a cancelled run must NOT broadcast DedupFinished (got groups={groups})"
+                ),
+                other => panic!("unexpected event during dedup cancel: {other:?}"),
+            }
+        }
+        assert!(reports >= 2, "cancel armed on an in-run report, saw {reports}");
+
+        // The state machine landed on Cancelled — not Done — and the last
+        // completed run's groups stay on duty (no reload happened).
+        let state = engine.dedup_state();
+        assert_eq!(state.phase, DedupPhase::Cancelled);
+        assert_eq!(
+            state.groups, 1,
+            "a cancelled run keeps the previous run's group count"
+        );
+        assert_eq!(
+            (state.alive_groups, state.wasted_bytes),
+            (1, 4),
+            "a cancelled run carries the PREVIOUS run's aggregates, not zeroes"
+        );
+        assert_eq!(
+            engine.dedup_groups(0, 10).groups.len(),
+            1,
+            "dedup_groups still serves the previous run's group"
+        );
+
+        // The stream went quiet: the Cancelled report is the cycle's last
+        // broadcast (the run has already ended by the time the state says
+        // Cancelled — the report itself wrote it).
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "no event may follow the Cancelled report (no DedupFinished)"
+        );
+    }
+
     /// User requirement: "mtime unchanged → never recompute" across
     /// RESCANS too — the upsert's conflict path preserves persisted hashes
     /// for unchanged files (the purge+reinsert of a rescan used to wipe
@@ -2093,6 +2746,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("same1.bin"), b"hash cache me").unwrap();
         fs::write(root.join("same2.bin"), b"hash cache me").unwrap();
+        backdate(&root.join("same1.bin"));
+        backdate(&root.join("same2.bin"));
 
         let engine = open_engine(&db_path, &root);
         let rx = engine.subscribe();
@@ -2138,6 +2793,7 @@ mod tests {
         let root = tmp.path().join("fixture");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("mutant.bin"), b"old content").unwrap();
+        backdate(&root.join("mutant.bin")); // settled: the first run really hashes it
 
         let engine = open_engine(&db_path, &root);
         let rx = engine.subscribe();
