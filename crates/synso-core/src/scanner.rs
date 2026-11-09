@@ -15,7 +15,7 @@
 
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 use globset::{GlobBuilder, GlobSet};
 use jwalk::WalkDirGeneric;
@@ -29,12 +29,19 @@ use crate::{Result, SynsoError};
 /// scan (the total is unknown during a walk, so batches are the only unit).
 const PROGRESS_BATCH: usize = 1000;
 
+/// Contention recovery for the batch flush (see `flush_batch`): how many
+/// BUSY retries and how long each waits. A live conflicting write is one
+/// small transaction, so a handful of short waits covers it.
+const BUSY_RETRIES: usize = 10;
+const BUSY_BACKOFF: Duration = Duration::from_millis(25);
+
 /// What to scan. Empty `roots` means "all fixed local volumes"
 /// (see [`crate::volumes::fixed_volumes`]). `exclusions` are globset
 /// patterns matched against the forward-slash full path and against every
 /// individual path segment, so `node_modules` excludes a directory of that
-/// name anywhere in the tree. A match prunes the whole subtree; an empty
-/// list indexes everything.
+/// name anywhere in the tree. A match prunes the whole subtree. An empty
+/// list indexes everything EXCEPT the system exclusion every matcher
+/// carries (`build_matcher`'s `$Recycle.Bin` hard rule, Task 9).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScanOptions {
     pub roots: Vec<String>,
@@ -387,13 +394,57 @@ fn flush_batch(store: &mut Store, batch: &mut Vec<(Vec<String>, FileRecord)>) ->
         return Ok(());
     }
     let scan_gen = store.current_scan_generation();
-    let tx = store.conn_mut().transaction()?;
-    for (segments, mut rec) in batch.drain(..) {
-        let dir_path: Vec<&str> = segments.iter().map(String::as_str).collect();
-        crate::store::upsert_file_on(&tx, scan_gen, &dir_path, &mut rec)?;
+    // A batch's whole upsert set re-runs on contention: the transaction
+    // rolls back atomically, so a retry starts from a clean slate (the
+    // batch is only drained after the commit below succeeded).
+    let mut attempt = 0usize;
+    loop {
+        let tx = store.conn_mut().transaction()?;
+        let mut failure = None;
+        for (segments, rec) in batch.iter_mut() {
+            let dir_path: Vec<&str> = segments.iter().map(String::as_str).collect();
+            if let Err(err) = crate::store::upsert_file_on(&tx, scan_gen, &dir_path, rec) {
+                failure = Some(err);
+                break;
+            }
+        }
+        if failure.is_none() {
+            if let Err(err) = tx.commit() {
+                failure = Some(err.into());
+            }
+        }
+        match failure {
+            None => {
+                batch.clear();
+                return Ok(());
+            }
+            Some(err) if is_busy(&err) && attempt < BUSY_RETRIES => {
+                // The transaction drops here (rolled back). Another
+                // process's writer held the WAL write lock while this
+                // read snapshot tried to upgrade — SQLite returns BUSY
+                // IMMEDIATELY for that upgrade without consulting the
+                // busy timeout, so a short backoff-and-retry is the only
+                // recovery. A live contention window is microseconds
+                // (one small write transaction); a dead-engine writer
+                // (tests opening engines back to back) is the same shape.
+                attempt += 1;
+                std::thread::sleep(BUSY_BACKOFF);
+            }
+            Some(err) => return Err(err),
+        }
     }
-    tx.commit()?;
-    Ok(())
+}
+
+/// True for SQLite BUSY-class failures: `SQLITE_BUSY` and
+/// `SQLITE_BUSY_SNAPSHOT` — the lock-contention errors whose recovery is
+/// "the other writer finished; do it again".
+fn is_busy(err: &SynsoError) -> bool {
+    use rusqlite::ffi::{SQLITE_BUSY, SQLITE_BUSY_SNAPSHOT};
+    matches!(
+        err,
+        SynsoError::Db(rusqlite::Error::SqliteFailure(ffi_err, _))
+            if ffi_err.extended_code == SQLITE_BUSY || ffi_err.extended_code == SQLITE_BUSY_SNAPSHOT
+    )
 }
 
 /// `opts.roots`, or the mount points of all fixed volumes when empty.
@@ -410,12 +461,27 @@ pub fn effective_roots(roots: &[String]) -> Vec<String> {
     }
 }
 
-/// Compiles the exclusion patterns; empty patterns list matches nothing.
-/// On Windows the globs are case-INSENSITIVE — the filesystem is (FOO.TMP
-/// and foo.tmp name the same file), so a user's `*.tmp` must prune every
-/// casing; other platforms keep globset's case-sensitive default.
-/// `pub(crate)`: the watcher (Task 8) compiles the same matcher so events
-/// under excluded paths are ignored exactly like the scan prunes them.
+/// The system-level exclusion appended to EVERY matcher (`build_matcher`
+/// is the single factory for the scan and the watcher alike): any path
+/// segment named `$Recycle.Bin` — in ANY casing, on every platform —
+/// prunes its whole subtree. Case-insensitive even where user patterns
+/// are not (`cfg!(windows)` above): Windows volumes create the folder
+/// variously as `$Recycle.Bin` / `$RECYCLE.BIN` (its per-user SID
+/// children hold the deleted content), and recycle-bin content is system
+/// data no user index should ever carry — the same rule the dedup
+/// candidate loader applies by name (`dedup.rs`'s `RECYCLE_BIN_DIR`).
+/// A bare segment pattern reaches `excluded`'s per-segment check, so it
+/// matches the folder at any depth exactly like a user's bare
+/// `node_modules`.
+const RECYCLE_BIN_PATTERN: &str = "$Recycle.Bin";
+
+/// Compiles the exclusion patterns plus the system-level
+/// [`RECYCLE_BIN_PATTERN`] hard rule. The user patterns keep their own
+/// semantics (case-insensitive on Windows, case-sensitive elsewhere);
+/// the hard rule is always case-insensitive. `pub(crate)`: the watcher
+/// (Task 8) compiles the same matcher so events under excluded paths —
+/// the recycle bin included, automatically — are ignored exactly like
+/// the scan prunes them.
 pub(crate) fn build_matcher(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSet::builder();
     for pattern in patterns {
@@ -427,6 +493,13 @@ pub(crate) fn build_matcher(patterns: &[String]) -> Result<GlobSet> {
             })?;
         builder.add(glob);
     }
+    // Hard rule (Task 9): recycle-bin content never enters the index —
+    // scan or watcher reconcile, regardless of the caller's patterns.
+    let recycle = GlobBuilder::new(RECYCLE_BIN_PATTERN)
+        .case_insensitive(true)
+        .build()
+        .map_err(|err| SynsoError::InvalidPattern(format!("bad recycle-bin rule: {err}")))?;
+    builder.add(recycle);
     builder
         .build()
         .map_err(|err| SynsoError::InvalidPattern(format!("bad exclusion patterns: {err}")))
@@ -619,6 +692,9 @@ mod tests {
         for i in 0..8 {
             fs::write(root.join(format!("f{i}.txt")), b"x").unwrap();
         }
+        // No user patterns — but `build_matcher` always appends the
+        // `$Recycle.Bin` hard rule (Task 9), which this fixture (plain
+        // `f*.txt` under `tree/`) never trips; the cap counts still hold.
         let matcher = build_matcher(&[]).unwrap();
         let mut rows = 0usize;
         let mut stored = |_store: &Store, _rec: &FileRecord| rows += 1;
@@ -881,6 +957,108 @@ mod tests {
             assert_eq!(
                 stats.files, 2,
                 "case-sensitive platforms keep the differently-cased name"
+            );
+        }
+    }
+
+    /// Task 9: the matcher's built-in hard rule prunes any `$Recycle.Bin`
+    /// segment — at the root's first level and nested deep, in every casing
+    /// (Windows volumes spell the folder variously) — while same-ish names
+    /// (`KRECYCLE`, `Recycle.Bin2`) keep indexing normally.
+    #[test]
+    fn scan_prunes_recycle_bin_at_any_depth_and_casing() {
+        let (tmp, db, mut store) = test_store();
+        let root = tmp.path().join("vol");
+        fs::create_dir_all(root.join("$Recycle.Bin").join("S-1-5")).unwrap();
+        fs::write(
+            root.join("$Recycle.Bin").join("S-1-5").join("r1.bin"),
+            b"1",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("keep").join("$recycle.bin")).unwrap();
+        fs::write(
+            root.join("keep").join("$recycle.bin").join("r2.bin"),
+            b"2",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("sub").join("$RECYCLE.BIN").join("deep")).unwrap();
+        fs::write(
+            root.join("sub")
+                .join("$RECYCLE.BIN")
+                .join("deep")
+                .join("r3.bin"),
+            b"3",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("KRECYCLE")).unwrap();
+        fs::write(root.join("KRECYCLE").join("k.txt"), b"k").unwrap();
+        fs::create_dir_all(root.join("Recycle.Bin2")).unwrap();
+        fs::write(root.join("Recycle.Bin2").join("r4.txt"), b"4").unwrap();
+        fs::write(root.join("keep").join("ok.txt"), b"o").unwrap();
+
+        let stats = scan(&mut store, &opts_for(&root), &|_| {}).unwrap();
+
+        assert_eq!(
+            stats.files, 3,
+            "ok.txt, k.txt and r4.txt survive; every recycle-bin file is pruned"
+        );
+        assert_eq!(
+            stats.dirs, 4,
+            "keep, sub, KRECYCLE and Recycle.Bin2 survive (roots of pruned \
+             subtrees do not)"
+        );
+        assert_eq!(stats.errors, 0);
+
+        let names: Vec<String> = all_rows(&db).into_iter().map(|row| row.0).collect();
+        for pruned in [
+            "r1.bin",
+            "r2.bin",
+            "r3.bin",
+            // The pruned directories themselves never become dir entries.
+            "$Recycle.Bin",
+            "$recycle.bin",
+            "$RECYCLE.BIN",
+        ] {
+            assert!(
+                !names.contains(&pruned.to_string()),
+                "{pruned} must be pruned: {names:?}"
+            );
+        }
+        for kept in ["ok.txt", "k.txt", "r4.txt", "keep", "sub", "KRECYCLE", "Recycle.Bin2"] {
+            assert!(
+                names.contains(&kept.to_string()),
+                "{kept} is not recycle-bin content and must survive: {names:?}"
+            );
+        }
+    }
+
+    /// Task 9: `build_matcher` carries the recycle-bin hard rule even with
+    /// NO user patterns — a bare-segment `$Recycle.Bin` match, in any
+    /// casing, on every platform. This is the single factory both the full
+    /// scan and the watcher's reconcile walks share, so one rule covers
+    /// both. Same-ish names must stay exclusion-free.
+    #[test]
+    fn build_matcher_hard_rule_matches_recycle_bin_segments() {
+        let matcher = build_matcher(&[]).unwrap();
+        let root = Path::new("C:/vol");
+        for segment in ["$Recycle.Bin", "$recycle.bin", "$RECYCLE.BIN"] {
+            let path = PathBuf::from(format!("C:/vol/{segment}/S-1-5/f.bin"));
+            assert!(
+                excluded(&matcher, &path, root),
+                "{segment} must be excluded by the hard rule"
+            );
+        }
+        for survivor in [
+            "Recycle.Bin2",
+            "KRECYCLE",
+            "recycle.bin",
+            "my$Recycle.Bin",
+            "docs",
+        ] {
+            let path = PathBuf::from(format!("C:/vol/{survivor}/f.txt"));
+            assert!(
+                !excluded(&matcher, &path, root),
+                "{survivor} is not a recycle-bin segment"
             );
         }
     }

@@ -82,7 +82,7 @@ pub(crate) mod volumes;
 pub(crate) mod watcher;
 
 // The public facade: the ONLY surface embedders program against.
-pub use dedup::{DedupState, DupeGroup};
+pub use dedup::{DedupPage, DedupState, DupeGroup};
 /// The fixed local volumes, under the name the first-run wizard consumes
 /// (`Task 13` facade ruling): a thin re-export of
 /// [`crate::volumes::fixed_volumes`].

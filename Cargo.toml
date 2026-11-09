@@ -27,7 +27,9 @@ pinyin = "0.11"
 sysinfo = { version = "0.36", default-features = false, features = ["disk"] }
 # Pure-Rust, no_std, dependency-free xxHash (verified to build on 1.83).
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
-windows = { version = "0.62", features = ["Win32_Storage_FileSystem"] }
+# Win32_System_Threading: the dedup engine's Gentle-gear thread priority
+# (SetThreadPriority) — see engine.rs.
+windows = { version = "0.62", features = ["Win32_Storage_FileSystem", "Win32_System_Threading"] }
 junction = "=2.0.0"
 tempfile = "=3.23.0"
 # Pinned (`=`): trash 5.2+ declares rust-version 1.85 (> the workspace's

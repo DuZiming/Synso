@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use synso_core::{
-    DedupState, DupeGroup, EngineStats, Hit, ParsedQuery, SearchResult, Settings, SizeNode,
+    DedupPage, DedupState, EngineStats, Hit, ParsedQuery, SearchResult, Settings, SizeNode,
     VolumeInfo,
 };
 use tauri::{AppHandle, State};
@@ -299,14 +299,34 @@ pub fn dedup_state(state: State<'_, AppState>) -> DedupState {
 }
 
 /// One page `[offset, offset + limit)` of the last completed run's dupe
-/// groups, size-descending, members materialized as search-style hits.
-/// Files deleted since the run drop out; a group below two surviving
-/// members dissolves.
+/// groups, size-descending, members materialized as search-style hits —
+/// returned as the engine's [`DedupPage`]: the page's `groups` plus
+/// `total_alive`, the count of groups that still materialize (>= 2
+/// surviving members) across ALL pages, scanned live against the current
+/// hot index — the full alive-filtered total a paged frontend needs
+/// without paging to the end. Files deleted since the run drop out; a
+/// group below two surviving members dissolves (and stops counting
+/// toward `total_alive`); a cancelled run keeps serving the previous
+/// run's groups.
 // Sync is safe: an Arc snapshot of the stored groups plus a hot-index
 // read lock — the store mutex is never taken (v1.1 audit).
 #[tauri::command]
-pub fn dedup_groups(state: State<'_, AppState>, offset: u32, limit: u32) -> Vec<DupeGroup> {
+pub fn dedup_groups(state: State<'_, AppState>, offset: u32, limit: u32) -> DedupPage {
     state.engine.dedup_groups(offset, limit)
+}
+
+/// Asks the running dedup run to stop at its next checkpoint — the
+/// dashboard's stop button. The run keeps every hash it already
+/// computed, reports `Cancelled` as its final `dedup-progress` phase,
+/// broadcasts NO `dedup-finished`, and the engine keeps serving the last
+/// completed run's groups. Idempotent, and a no-op while idle: a stop
+/// pressed before any run must not pre-arm the next one (the engine
+/// clears the flag before each spawn, so the two guards agree).
+// Sync is safe: one atomic load plus one store, no locks held — the
+// same class as `dedup_start`.
+#[tauri::command]
+pub fn dedup_cancel(state: State<'_, AppState>) {
+    state.engine.dedup_cancel();
 }
 
 /// Moves the entries behind `ids` to the OS recycle bin — the engine's
