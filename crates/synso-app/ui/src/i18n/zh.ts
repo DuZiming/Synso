@@ -124,6 +124,12 @@ const zh: Dict = {
     warming: "索引正在预热，结果马上就好。",
     results: "项结果",
     hints: "连按两次 Ctrl 唤起 · 回车打开 · Ctrl+回车 打开所在文件夹 · Esc 关闭",
+    menu: {
+      label: "结果操作",
+      open: "打开",
+      reveal: "打开文件位置",
+      copyPath: "复制文件路径",
+    },
   },
   toast: {
     shortcut:

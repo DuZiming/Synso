@@ -15,6 +15,7 @@
   import {
     engineStats,
     fileDetail,
+    copyToClipboard,
     openPath,
     parsePreview,
     quickHide,
@@ -211,12 +212,61 @@
     selected = index;
   }
 
+  /// The right-click context menu: 打开 / 打开文件位置 / 复制路径.
+  /// Right-click selects the row first (Everything-style), then opens the
+  /// menu at the cursor, clamped into the small quick window.
+  let menu = $state<{ x: number; y: number; index: number } | null>(null);
+
+  function onListContextmenu(event: MouseEvent): void {
+    const index = rowIndexAt(event.currentTarget as HTMLElement, event);
+    if (index < 0) return;
+    event.preventDefault();
+    selected = index;
+    menu = {
+      x: Math.max(0, Math.min(event.clientX, window.innerWidth - 200)),
+      y: Math.max(0, Math.min(event.clientY, window.innerHeight - 120)),
+      index,
+    };
+  }
+
+  /// Any pointerdown outside the menu itself dismisses it (the menu's own
+  /// buttons pass through so their click still fires).
+  function onWindowPointerdown(event: PointerEvent): void {
+    if (menu && !(event.target as HTMLElement).closest(".ctx-menu")) menu = null;
+  }
+
+  /// Menu actions share the activate() error surface; open/reveal hide the
+  /// window (focus belongs to Explorer / the opened app), copy keeps it.
+  async function menuAction(action: "open" | "reveal" | "copy"): Promise<void> {
+    const hit = menu ? hits[menu.index] : undefined;
+    menu = null;
+    if (!hit) return;
+    try {
+      if (action === "open") {
+        await openPath(hit.id);
+        void quickHide();
+      } else if (action === "reveal") {
+        await revealPath(hit.id);
+        void quickHide();
+      } else {
+        await copyToClipboard(hit.path);
+      }
+      openError = null;
+    } catch (err) {
+      openError = String(err);
+    }
+  }
+
   function onKeydown(event: KeyboardEvent): void {
     // IME composition (Chinese input!): Enter/arrows belong to the
     // composer until it ends — never act on them.
     if (event.isComposing) return;
     if (event.key === "Escape") {
       event.preventDefault();
+      if (menu) {
+        menu = null;
+        return;
+      }
       void quickHide();
     } else if (event.key === "ArrowDown") {
       event.preventDefault();
@@ -261,6 +311,7 @@
     const unlisten = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
       if (focused) {
         selected = -1;
+        menu = null;
         openError = null;
         inputEl?.focus();
         inputEl?.select();
@@ -274,7 +325,7 @@
   });
 </script>
 
-<svelte:window onkeydown={onKeydown} />
+<svelte:window onkeydown={onKeydown} onpointerdown={onWindowPointerdown} />
 
 <div class="quick">
   <div class="searchbox">
@@ -369,8 +420,12 @@
       aria-label={$t("a11y.resultsList")}
       bind:this={listEl}
       bind:clientHeight={viewportH}
-      onscroll={(event) => (scrollTop = event.currentTarget.scrollTop)}
+      onscroll={(event) => {
+        scrollTop = event.currentTarget.scrollTop;
+        menu = null;
+      }}
       onclick={onListClick}
+      oncontextmenu={onListContextmenu}
       onmousemove={onListMousemove}
     >
       <div class="rows" style="height: {hits.length * ROW_H}px">
@@ -421,6 +476,28 @@
         {/each}
       </div>
     </div>
+
+    {#if menu}
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+      <div
+        class="ctx-menu"
+        style="left: {menu.x}px; top: {menu.y}px"
+        role="menu"
+        tabindex="-1"
+        aria-label={$t("quick.menu.label")}
+        onpointerdown={(event) => event.stopPropagation()}
+      >
+        <button role="menuitem" onclick={() => void menuAction("open")}>
+          {$t("quick.menu.open")}
+        </button>
+        <button role="menuitem" onclick={() => void menuAction("reveal")}>
+          {$t("quick.menu.reveal")}
+        </button>
+        <button role="menuitem" onclick={() => void menuAction("copy")}>
+          {$t("quick.menu.copyPath")}
+        </button>
+      </div>
+    {/if}
   {/if}
 </div>
 
@@ -525,6 +602,38 @@
   .list {
     flex: 1;
     overflow-y: auto;
+  }
+
+  /* Fixed (window-relative: the cursor coords are clientX/Y) so the quick
+     container's overflow:hidden cannot clip it. */
+  .ctx-menu {
+    position: fixed;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    min-width: 160px;
+    padding: 4px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 4px 16px rgb(0 0 0 / 25%);
+  }
+
+  .ctx-menu button {
+    text-align: left;
+    font: inherit;
+    color: var(--text);
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 6px 10px;
+    cursor: pointer;
+  }
+
+  .ctx-menu button:hover,
+  .ctx-menu button:focus-visible {
+    background: var(--bg);
+    outline: none;
   }
 
   .rows {
