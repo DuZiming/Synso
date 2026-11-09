@@ -119,6 +119,12 @@ const en = {
     warming: "The index is warming up — results appear in a moment.",
     results: "results",
     hints: "Double-tap Ctrl to summon · Enter open · Ctrl+Enter reveal · Esc close",
+    menu: {
+      label: "Result actions",
+      open: "Open",
+      reveal: "Reveal in file manager",
+      copyPath: "Copy file path",
+    },
   },
   toast: {
     shortcut:
